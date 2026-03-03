@@ -4,7 +4,7 @@ import pkg from "pg";
 const { Pool } = pkg;
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL

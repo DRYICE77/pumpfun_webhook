@@ -1,12 +1,14 @@
 {
-  "name": "pumpfun-webhook",
+  "name": "pumpfun-scanner",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Pump.fun token and wallet scanner using Helius WebSocket",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0",
     "express": "^4.19.2",
     "pg": "^8.11.3"
   }

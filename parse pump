@@ -305,7 +305,7 @@ function parsePumpTrade(tx, signature) {
       ts,
       signature,
       slot: tx.slot || null,
-      raw: JSON.stringify(tx),
+      raw: null,
     },
   };
 }

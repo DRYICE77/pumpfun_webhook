@@ -246,7 +246,7 @@ function parsePumpTradeFromPayload(row) {
       ts: getBlockTime(payload),
       signature: row.signature,
       slot: row.slot,
-      raw: JSON.stringify(payload),
+      raw: null,
     },
   };
 }

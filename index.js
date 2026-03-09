@@ -1,441 +1,296 @@
-import express from "express";
-import pkg from "pg";
+// index.js
+require("dotenv").config();
 
-const { Pool } = pkg;
+const WebSocket = require("ws");
 
-const app = express();
-app.use(express.json({ limit: "2mb" }));
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const PORT = process.env.PORT || 8080;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Optional: avoids some SSL headaches on managed DBs
-  ssl: process.env.PGSSLMODE ? undefined : { rejectUnauthorized: false },
-});
+// Pump AMM program from Helius docs
+const PUMP_AMM_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-// --------------------
-// Configurable table names (helps if you have "Tokens" capitalized)
-// --------------------
-const TABLE_RAW = process.env.TABLE_RAW_WEBHOOK_EVENTS || "raw_webhook_events";
-const TABLE_TOKENS = process.env.TABLE_TOKENS || "Tokens"; // try "tokens" if yours is lowercase
-const TABLE_WALLET_TRADES = process.env.TABLE_WALLET_TRADES || "wallet_trades";
-const TABLE_WALLET_POSITIONS =
-  process.env.TABLE_WALLET_TOKEN_POSITIONS || "wallet_token_positions";
+// Standard Helius WSS endpoint
+const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-// --------------------
-// Auth
-// --------------------
-function requireHeliusAuth(req, res) {
-  const expected = process.env.HELIUS_WEBHOOK_SECRET;
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-
-  if (!expected || token !== expected) {
-    res.status(401).send("unauthorized");
-    return false;
-  }
-  return true;
+if (!HELIUS_API_KEY) {
+  console.error("Missing HELIUS_API_KEY in environment variables.");
+  process.exit(1);
 }
 
-// --------------------
-// Health
-// --------------------
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.post("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).send("server alive"));
+let ws = null;
+let pingInterval = null;
+let reconnectTimeout = null;
+let retryCount = 0;
 
-// --------------------
-// Schema introspection (prevents “column does not exist”)
-// --------------------
-const columnsCache = new Map();
+const MAX_RETRIES = Infinity;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 30000;
 
-/**
- * Returns a Set of columns for a table in the current schema.
- * Works for mixed-case tables too IF they exist with that exact name.
- */
-async function getTableColumns(tableName) {
-  if (columnsCache.has(tableName)) return columnsCache.get(tableName);
+// Prevent duplicate processing after reconnects
+const seenSignatures = new Set();
+const SEEN_SIGNATURE_LIMIT = 10000;
 
-  // Try as-is, and also try lowercase fallback.
-  // NOTE: information_schema stores table_name case-sensitive as created.
-  const candidates = [tableName, tableName.toLowerCase()];
-
-  for (const candidate of candidates) {
-    const { rows } = await pool.query(
-      `
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
-      `,
-      [candidate]
-    );
-
-    if (rows?.length) {
-      const set = new Set(rows.map((r) => r.column_name));
-      columnsCache.set(tableName, set);
-      // Also cache the actual found name so we can use it later
-      columnsCache.set(`__resolved__:${tableName}`, candidate);
-      return set;
-    }
+function addSeenSignature(sig) {
+  seenSignatures.add(sig);
+  if (seenSignatures.size > SEEN_SIGNATURE_LIMIT) {
+    const first = seenSignatures.values().next().value;
+    seenSignatures.delete(first);
   }
-
-  // Cache empty so we don't spam queries
-  const empty = new Set();
-  columnsCache.set(tableName, empty);
-  return empty;
 }
 
-async function resolveTableName(tableName) {
-  await getTableColumns(tableName);
-  return columnsCache.get(`__resolved__:${tableName}`) || tableName;
+function backoffDelay(attempt) {
+  return Math.min(INITIAL_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
 }
 
-function hasAll(colsSet, neededCols = []) {
-  return neededCols.every((c) => colsSet.has(c));
-}
-
-// --------------------
-// Helpers: safe inserts based on existing columns
-// --------------------
-async function insertRawWebhookEvent(e) {
-  const signature = e?.signature;
-  if (!signature) return;
-
-  const rawCols = await getTableColumns(TABLE_RAW);
-  const rawTable = await resolveTableName(TABLE_RAW);
-
-  // Your schema from earlier: (signature, timestamp, slot, type, payload, created_at)
-  if (!hasAll(rawCols, ["signature", "payload", "created_at"])) {
-    console.log(`[raw] table ${rawTable} missing expected columns, skipping raw insert`);
-    return;
-  }
-
-  // timestamp/slot/type are optional
-  const tsVal = e?.timestamp ?? null;
-  const slotVal = e?.slot ?? null;
-  const typeVal = e?.type ?? null;
-
-  await pool.query(
-    `
-    INSERT INTO "${rawTable}"
-      (signature, timestamp, slot, type, payload, created_at)
-    VALUES
-      ($1, $2, $3, $4, $5, NOW())
-    ON CONFLICT (signature) DO NOTHING
-    `,
-    [signature, tsVal, slotVal, typeVal, e]
-  );
-}
-
-/**
- * Upsert token row and return token id if the table supports it.
- * Supports either:
- * - Tokens(id, token_address, chain, source, launch_time, name, symbol, creator_wallet)
- */
-async function upsertTokenAndGetId({ tokenAddress, chain, source, launchTime }) {
-  if (!tokenAddress) return null;
-
-  const tokenCols = await getTableColumns(TABLE_TOKENS);
-  const tokenTable = await resolveTableName(TABLE_TOKENS);
-
-  // Must have token_address; id is optional but needed to return a token_id
-  if (!tokenCols.has("token_address")) {
-    console.log(`[tokens] table ${tokenTable} missing token_address, skipping upsert`);
-    return null;
-  }
-
-  // Build dynamic insert/upsert based on columns you actually have
-  const insertCols = ["token_address"];
-  const insertVals = ["$1"];
-  const updates = [];
-  const args = [tokenAddress];
-  let argi = 2;
-
-  function addCol(col, value) {
-    if (!tokenCols.has(col)) return;
-    insertCols.push(col);
-    insertVals.push(`$${argi}`);
-    args.push(value);
-    // on conflict update: set col = excluded.col (for non-nullable metadata)
-    updates.push(`${col} = EXCLUDED.${col}`);
-    argi++;
-  }
-
-  addCol("chain", chain ?? "solana");
-  addCol("source", source ?? "pumpfun");
-  addCol("launch_time", launchTime ?? null);
-
-  // If you have name/symbol later, you can add them too
-  // addCol("name", name ?? null);
-  // addCol("symbol", symbol ?? null);
-  // addCol("creator_wallet", creatorWallet ?? null);
-
-  // If table doesn't have id, we can still upsert but can't return id
-  const canReturnId = tokenCols.has("id");
-
-  const sql = `
-    INSERT INTO "${tokenTable}" (${insertCols.join(", ")})
-    VALUES (${insertVals.join(", ")})
-    ON CONFLICT (token_address) DO UPDATE
-      SET ${updates.length ? updates.join(", ") : "token_address = EXCLUDED.token_address"}
-    ${canReturnId ? "RETURNING id" : ""}
-  `;
-
-  const result = await pool.query(sql, args);
-  if (canReturnId) return result.rows?.[0]?.id ?? null;
-  return null;
-}
-
-/**
- * Extract a pump.fun-like trade from a Helius Enhanced SWAP event.
- * Heuristics:
- * - trader wallet = feePayer (or account)
- * - token mint picked from tokenTransfers where wallet receives or sends
- * - SOL delta from nativeTransfers affecting the trader
- */
-function parseTradeFromHeliusEvent(e) {
-  if (!e) return null;
-  if (e.type !== "SWAP") return null;
-
-  const wallet =
-    e.feePayer ||
-    e.feePayerAccount ||
-    e?.transaction?.feePayer ||
-    e?.accountData?.[0]?.account ||
-    null;
-
-  if (!wallet) return null;
-
-  const tokenTransfers = Array.isArray(e.tokenTransfers) ? e.tokenTransfers : [];
-  const nativeTransfers = Array.isArray(e.nativeTransfers) ? e.nativeTransfers : [];
-
-  // SOL delta for wallet (lamports)
-  let lamportsIn = 0;
-  let lamportsOut = 0;
-
-  for (const t of nativeTransfers) {
-    const from = t?.fromUserAccount || t?.fromAccount;
-    const to = t?.toUserAccount || t?.toAccount;
-    const amt = Number(t?.amount ?? 0);
-    if (!amt) continue;
-    if (to === wallet) lamportsIn += amt;
-    if (from === wallet) lamportsOut += amt;
-  }
-
-  const solDelta = (lamportsIn - lamportsOut) / 1e9; // + means received SOL
-
-  // Find token delta for wallet:
-  // If wallet receives tokens => buy
-  // If wallet sends tokens => sell
-  let tokenMint = null;
-  let tokenAmount = 0;
-
-  // prefer transfers where wallet is involved
-  const involved = tokenTransfers.filter((t) => {
-    const from = t?.fromUserAccount || t?.fromAccount;
-    const to = t?.toUserAccount || t?.toAccount;
-    return from === wallet || to === wallet;
+async function heliusRpc(method, params) {
+  const res = await fetch(RPC_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: `${method}-${Date.now()}`,
+      method,
+      params,
+    }),
   });
 
-  // Pick the biggest absolute token transfer involving wallet
-  for (const t of involved) {
-    const mint = t?.mint;
-    if (!mint) continue;
-
-    const rawAmt =
-      typeof t?.tokenAmount === "number"
-        ? t.tokenAmount
-        : Number(t?.tokenAmount ?? t?.rawTokenAmount?.tokenAmount ?? 0);
-
-    if (!rawAmt) continue;
-
-    const from = t?.fromUserAccount || t?.fromAccount;
-    const to = t?.toUserAccount || t?.toAccount;
-
-    // wallet receives => + ; wallet sends => -
-    const signed = to === wallet ? Math.abs(rawAmt) : -Math.abs(rawAmt);
-
-    if (Math.abs(signed) > Math.abs(tokenAmount)) {
-      tokenMint = mint;
-      tokenAmount = signed;
-    }
+  if (!res.ok) {
+    throw new Error(`RPC HTTP error: ${res.status}`);
   }
 
-  if (!tokenMint || tokenAmount === 0) return null;
+  const json = await res.json();
 
-  // Determine side and solSpent/solReceived magnitude
-  // For buys: wallet spends SOL (solDelta negative) and receives tokens (tokenAmount positive)
-  // For sells: wallet receives SOL (solDelta positive) and sends tokens (tokenAmount negative)
-  const side =
-    tokenAmount > 0 && solDelta < 0 ? "BUY" :
-    tokenAmount < 0 && solDelta > 0 ? "SELL" :
-    // fallback heuristic: token direction
-    tokenAmount > 0 ? "BUY" : "SELL";
+  if (json.error) {
+    throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+  }
 
-  const solAmountAbs = Math.abs(solDelta);
-  const tokenAmountAbs = Math.abs(tokenAmount);
+  return json.result;
+}
 
-  const priceSolPerToken =
-    tokenAmountAbs > 0 ? solAmountAbs / tokenAmountAbs : null;
+async function fetchFullTransaction(signature) {
+  return heliusRpc("getTransaction", [
+    signature,
+    {
+      encoding: "jsonParsed",
+      maxSupportedTransactionVersion: 0,
+      commitment: "confirmed",
+    },
+  ]);
+}
+
+// TODO: replace this with your real DB insert/upsert
+async function saveTradeEvent(event) {
+  console.log("SAVE EVENT:", JSON.stringify(event, null, 2));
+}
+
+// Lightweight parser to classify buy/sell-ish activity.
+// This is intentionally conservative for v1.
+function parseTradeFromTransaction(tx, signature) {
+  if (!tx || !tx.meta || !tx.transaction) return null;
+
+  const accountKeys =
+    tx.transaction?.message?.accountKeys?.map((k) =>
+      typeof k === "string" ? k : k.pubkey
+    ) || [];
+
+  const logMessages = tx.meta?.logMessages || [];
+  const blockTime = tx.blockTime || null;
+  const slot = tx.slot || null;
+
+  const preTokenBalances = tx.meta?.preTokenBalances || [];
+  const postTokenBalances = tx.meta?.postTokenBalances || [];
 
   return {
-    wallet_address: wallet,
-    token_address: tokenMint,
-    side,
-    sol_amount: solAmountAbs,
-    token_amount: tokenAmountAbs,
-    price_sol_per_token: priceSolPerToken,
+    signature,
+    slot,
+    blockTime,
+    success: tx.meta?.err == null,
+    accounts: accountKeys,
+    logMessages,
+    preTokenBalances,
+    postTokenBalances,
+    raw: tx,
   };
 }
 
-async function insertWalletTrade({ tokenId, trade, signature, slot, timestamp, source }) {
-  const cols = await getTableColumns(TABLE_WALLET_TRADES);
-  const table = await resolveTableName(TABLE_WALLET_TRADES);
+async function processSignature(signature) {
+  if (!signature || seenSignatures.has(signature)) return;
 
-  // We support either schema:
-  // A) token_id + wallet_address ...
-  // B) token_address + wallet_address ...
-  const hasTokenId = cols.has("token_id");
-  const hasTokenAddress = cols.has("token_address");
+  addSeenSignature(signature);
 
-  if (!cols.has("wallet_address")) {
-    console.log(`[wallet_trades] missing wallet_address, skipping`);
-    return;
-  }
-
-  // Basic required fields we try to write if present
-  const insertCols = [];
-  const insertVals = [];
-  const args = [];
-  let i = 1;
-
-  function add(col, val) {
-    if (!cols.has(col)) return;
-    insertCols.push(col);
-    insertVals.push(`$${i}`);
-    args.push(val);
-    i++;
-  }
-
-  add("wallet_address", trade.wallet_address);
-
-  if (hasTokenId) add("token_id", tokenId);
-  else if (hasTokenAddress) add("token_address", trade.token_address);
-  else {
-    console.log(`[wallet_trades] no token_id or token_address column, skipping`);
-    return;
-  }
-
-  add("side", trade.side);
-  add("sol_amount", trade.sol_amount);
-  add("token_amount", trade.token_amount);
-  add("price_sol_per_token", trade.price_sol_per_token);
-
-  add("signature", signature);
-  add("slot", slot ?? null);
-  add("ts", timestamp ? new Date(timestamp * 1000) : null);
-  add("source", source ?? "pumpfun");
-
-  // Choose a conflict target if your table has one
-  // (If none exists, inserts will still work but may duplicate)
-  let conflictClause = "";
-  if (cols.has("signature") && cols.has("wallet_address")) {
-    // Best if you make a UNIQUE(signature, wallet_address) or UNIQUE(signature, wallet_address, token_id)
-    conflictClause = "ON CONFLICT DO NOTHING";
-  }
-
-  const sql = `
-    INSERT INTO "${table}" (${insertCols.join(", ")})
-    VALUES (${insertVals.join(", ")})
-    ${conflictClause}
-  `;
-
-  await pool.query(sql, args);
-}
-
-async function upsertWalletPosition({ tokenId, trade }) {
-  const cols = await getTableColumns(TABLE_WALLET_POSITIONS);
-  const table = await resolveTableName(TABLE_WALLET_POSITIONS);
-
-  if (!cols.has("wallet_address")) return;
-  if (!cols.has("token_id")) return;
-  if (!cols.has("qty")) {
-    // If you named it something else, we can adapt later
-    return;
-  }
-
-  // qty delta: + on buy, - on sell
-  const qtyDelta = trade.side === "BUY" ? trade.token_amount : -trade.token_amount;
-
-  // Basic upsert: increments qty, updates last_seen_ts if present
-  const hasLast = cols.has("last_seen_ts");
-  const hasUpdatedAt = cols.has("updated_at");
-
-  const sql = `
-    INSERT INTO "${table}" (wallet_address, token_id, qty${hasLast ? ", last_seen_ts" : ""}${hasUpdatedAt ? ", updated_at" : ""})
-    VALUES ($1, $2, $3${hasLast ? ", NOW()" : ""}${hasUpdatedAt ? ", NOW()" : ""})
-    ON CONFLICT (wallet_address, token_id) DO UPDATE
-      SET qty = "${table}".qty + EXCLUDED.qty
-      ${hasLast ? ", last_seen_ts = NOW()" : ""}
-      ${hasUpdatedAt ? ", updated_at = NOW()" : ""}
-  `;
-
-  await pool.query(sql, [trade.wallet_address, tokenId, qtyDelta]);
-}
-
-// --------------------
-// Webhook handler
-// --------------------
-app.post("/webhooks/helius", async (req, res) => {
   try {
-    if (!requireHeliusAuth(req, res)) return;
+    const tx = await fetchFullTransaction(signature);
 
-    const events = Array.isArray(req.body) ? req.body : [req.body];
-    console.log(`Received ${events.length} Helius event(s)`);
-
-    // Always store raw first
-    for (const e of events) {
-      await insertRawWebhookEvent(e);
+    if (!tx) {
+      console.log(`No transaction found yet for signature ${signature}`);
+      return;
     }
 
-    // Then parse + insert derived data
-    for (const e of events) {
-      const signature = e?.signature;
-      if (!signature) continue;
+    const parsed = parseTradeFromTransaction(tx, signature);
+    if (!parsed) return;
 
-      const trade = parseTradeFromHeliusEvent(e);
-      if (!trade) continue;
-
-      // Upsert token
-      const tokenId = await upsertTokenAndGetId({
-        tokenAddress: trade.token_address,
-        chain: "solana",
-        source: "pumpfun",
-        launchTime: e?.timestamp ? new Date(e.timestamp * 1000) : null,
-      });
-
-      // Insert trade (supports either token_id or token_address schemas)
-      await insertWalletTrade({
-        tokenId,
-        trade,
-        signature,
-        slot: e?.slot ?? null,
-        timestamp: e?.timestamp ?? null,
-        source: e?.source ?? "pumpfun",
-      });
-
-      // Update positions if your schema supports it (wallet_address, token_id, qty)
-      if (tokenId) {
-        await upsertWalletPosition({ tokenId, trade });
-      }
-    }
-
-    return res.status(200).json({ success: true });
+    await saveTradeEvent(parsed);
+    console.log(`Processed transaction ${signature}`);
   } catch (err) {
-    console.error("Webhook error:", err);
-    return res.status(500).send("server error");
+    console.error(`Failed to process signature ${signature}:`, err.message);
   }
-});
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+function startPing() {
+  stopPing();
+
+  pingInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+      console.log("Ping sent");
+    }
+  }, 30000);
+}
+
+function stopPing() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+  }
+}
+
+function subscribe() {
+  const request = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "logsSubscribe",
+    params: [
+      {
+        mentions: [PUMP_AMM_PROGRAM_ID],
+      },
+      {
+        commitment: "confirmed",
+      },
+    ],
+  };
+
+  ws.send(JSON.stringify(request));
+  console.log("Sent logsSubscribe request");
+}
+
+function connect() {
+  console.log(`Connecting to ${WSS_URL}`);
+  ws = new WebSocket(WSS_URL);
+
+  ws.on("open", () => {
+    console.log("WebSocket opened");
+    retryCount = 0;
+    subscribe();
+    startPing();
+  });
+
+  ws.on("message", async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+
+      // Subscription confirmation
+      if (typeof msg.result === "number" && msg.id === 1) {
+        console.log(`Subscribed successfully. Subscription ID: ${msg.result}`);
+        return;
+      }
+
+      // Logs notification
+      const value = msg?.params?.result?.value;
+      if (!value) return;
+
+      const signature = value.signature;
+      const logs = value.logs || [];
+      const err = value.err;
+
+      if (err) {
+        return;
+      }
+
+      // Optional extra filtering at log level before expensive RPC hydration
+      const looksRelevant =
+        logs.some((l) => l.toLowerCase().includes("buy")) ||
+        logs.some((l) => l.toLowerCase().includes("sell")) ||
+        logs.some((l) => l.toLowerCase().includes("swap")) ||
+        true; // keep broad for now
+
+      if (!looksRelevant) return;
+
+      await processSignature(signature);
+    } catch (err) {
+      console.error("Failed to parse/process message:", err.message);
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error("WebSocket error:", err.message);
+  });
+
+  ws.on("close", () => {
+    console.log("WebSocket closed");
+    stopPing();
+    reconnect();
+  });
+}
+
+function reconnect() {
+  if (reconnectTimeout) return;
+  if (retryCount >= MAX_RETRIES) return;
+
+  const delay = backoffDelay(retryCount);
+  console.log(`Reconnecting in ${delay}ms...`);
+
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    retryCount += 1;
+    connect();
+  }, delay);
+}
+
+// Simple health server for Railway
+const http = require("http");
+http
+  .createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          websocketState: ws ? ws.readyState : null,
+          retryCount,
+        })
+      );
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("pumpfun scanner running");
+  })
+  .listen(PORT, () => {
+    console.log(`HTTP health server listening on port ${PORT}`);
+  });
+
+connect();
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+function shutdown() {
+  console.log("Shutting down...");
+  stopPing();
+
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  if (ws) {
+    try {
+      ws.close();
+    } catch (_) {}
+  }
+
+  process.exit(0);
+}

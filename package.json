@@ -1,7 +1,6 @@
 {
   "name": "pumpfun-scanner",
   "version": "1.0.0",
-  "description": "Pump.fun wallet scanner with Helius websocket + Postgres",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

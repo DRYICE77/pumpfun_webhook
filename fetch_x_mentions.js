@@ -102,7 +102,7 @@ async function searchTweetsForAddress(address) {
 
   const body = {
     searchTerms: [address],
-    maxTweets: 20,
+    maxTweets: 5,
     sort: "Latest",
   };
 
@@ -282,7 +282,7 @@ async function fetchMentions() {
   await ensureTables();
   console.log("X tables ready");
 
-  const tokens = await getRecentTokens(50);
+  const tokens = await getRecentTokens(10);
   console.log("tokens found:", tokens.length);
 
   if (tokens.length === 0) {

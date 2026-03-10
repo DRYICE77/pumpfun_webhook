@@ -1,18 +1,17 @@
 import pg from "pg";
 
-
 const { Pool } = pg;
 
 const DATABASE_URL = process.env.DATABASE_URL;
-const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
+const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL");
   process.exit(1);
 }
 
-if (!X_BEARER_TOKEN) {
-  console.error("Missing X_BEARER_TOKEN");
+if (!APIFY_API_TOKEN) {
+  console.error("Missing APIFY_API_TOKEN");
   process.exit(1);
 }
 
@@ -36,7 +35,7 @@ async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS token_x_mentions (
       id BIGSERIAL PRIMARY KEY,
-      token_id INTEGER NOT NULL,
+      token_id TEXT NOT NULL,
       tweet_id TEXT NOT NULL,
       match_value TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
@@ -46,7 +45,7 @@ async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS token_social_snapshots (
       id BIGSERIAL PRIMARY KEY,
-      token_id INTEGER NOT NULL,
+      token_id TEXT NOT NULL,
       ts TIMESTAMPTZ NOT NULL,
       window_minutes INTEGER NOT NULL,
       mentions_count INTEGER NOT NULL DEFAULT 0,
@@ -65,11 +64,6 @@ async function ensureTables() {
   `);
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_token_x_mentions_token_id
-    ON token_x_mentions (token_id);
-  `);
-
-  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_x_raw_tweets_created_at
     ON x_raw_tweets (created_at DESC);
   `);
@@ -84,17 +78,17 @@ async function getRecentTokens(limit = 50) {
   const result = await pool.query(
     `
     SELECT
-      token_id AS id,
+      token_id,
       token_address
     FROM tracked_tokens
     WHERE token_address IS NOT NULL
       AND token_address <> ''
       AND (
-        buys_5m > 0
-        OR sells_5m > 0
-        OR volume_5m > 0
+        COALESCE(buys_5m, 0) > 0
+        OR COALESCE(sells_5m, 0) > 0
+        OR COALESCE(volume_5m, 0) > 0
       )
-    ORDER BY last_updated DESC
+    ORDER BY last_updated DESC NULLS LAST
     LIMIT $1
     `,
     [limit]
@@ -104,20 +98,20 @@ async function getRecentTokens(limit = 50) {
 }
 
 async function searchTweetsForAddress(address) {
-  const params = new URLSearchParams({
-    query: `"${address}"`,
-    "tweet.fields": "author_id,created_at,public_metrics",
-    max_results: "10",
-  });
+  const url = `https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
 
-  const url = `https://api.twitter.com/2/tweets/search/recent?${params.toString()}`;
+  const body = {
+    searchTerms: [address],
+    maxTweets: 20,
+    sort: "Latest",
+  };
 
   const res = await fetch(url, {
-    method: "GET",
+    method: "POST",
     headers: {
-      Authorization: `Bearer ${X_BEARER_TOKEN}`,
       "Content-Type": "application/json",
     },
+    body: JSON.stringify(body),
   });
 
   const text = await res.text();
@@ -126,19 +120,89 @@ async function searchTweetsForAddress(address) {
   try {
     json = JSON.parse(text);
   } catch (err) {
-    console.error(`Failed to parse X response for ${address}:`, text.slice(0, 500));
-    return { ok: false, status: res.status, json: null };
+    console.error(`Failed to parse Apify response for ${address}:`, text.slice(0, 500));
+    return { ok: false, tweets: [] };
   }
 
   if (!res.ok) {
-    console.error(`X API error for ${address}: status=${res.status}`, JSON.stringify(json).slice(0, 500));
-    return { ok: false, status: res.status, json };
+    console.error(`Apify error for ${address}: status=${res.status}`, JSON.stringify(json).slice(0, 500));
+    return { ok: false, tweets: [] };
   }
 
-  return { ok: true, status: res.status, json };
+  if (!Array.isArray(json)) {
+    console.log(`Apify returned non-array response for ${address}:`, JSON.stringify(json).slice(0, 500));
+    return { ok: false, tweets: [] };
+  }
+
+  return { ok: true, tweets: json };
+}
+
+function extractMetrics(tweet) {
+  return {
+    like_count:
+      tweet.likeCount ??
+      tweet.likes ??
+      tweet.favoriteCount ??
+      0,
+    retweet_count:
+      tweet.retweetCount ??
+      tweet.retweets ??
+      0,
+    reply_count:
+      tweet.replyCount ??
+      tweet.replies ??
+      0,
+    quote_count:
+      tweet.quoteCount ??
+      tweet.quotes ??
+      0,
+  };
+}
+
+function extractTweetId(tweet) {
+  return String(
+    tweet.id ??
+    tweet.tweetId ??
+    ""
+  );
+}
+
+function extractAuthorId(tweet) {
+  return String(
+    tweet.authorId ??
+    tweet.user?.id ??
+    tweet.author?.id ??
+    ""
+  );
+}
+
+function extractText(tweet) {
+  return (
+    tweet.text ??
+    tweet.fullText ??
+    ""
+  );
+}
+
+function extractCreatedAt(tweet) {
+  return (
+    tweet.createdAt ??
+    tweet.created_at ??
+    new Date().toISOString()
+  );
 }
 
 async function insertRawTweet(tweet) {
+  const tweetId = extractTweetId(tweet);
+  const authorId = extractAuthorId(tweet);
+  const text = extractText(tweet);
+  const createdAt = extractCreatedAt(tweet);
+  const publicMetrics = extractMetrics(tweet);
+
+  if (!tweetId) {
+    throw new Error("Missing tweet id");
+  }
+
   await pool.query(
     `
     INSERT INTO x_raw_tweets (
@@ -152,13 +216,15 @@ async function insertRawTweet(tweet) {
     ON CONFLICT (tweet_id) DO NOTHING
     `,
     [
-      tweet.id,
-      tweet.author_id || null,
-      tweet.text || null,
-      tweet.created_at || null,
-      JSON.stringify(tweet.public_metrics || {}),
+      tweetId,
+      authorId || null,
+      text || null,
+      createdAt,
+      JSON.stringify(publicMetrics),
     ]
   );
+
+  return tweetId;
 }
 
 async function insertTokenMention(tokenId, tweetId, matchValue) {
@@ -176,6 +242,40 @@ async function insertTokenMention(tokenId, tweetId, matchValue) {
   );
 }
 
+async function updateSocialSnapshots(windowMinutes = 5) {
+  await pool.query(
+    `
+    INSERT INTO token_social_snapshots (
+      token_id,
+      ts,
+      window_minutes,
+      mentions_count,
+      unique_authors,
+      likes_total,
+      rts_total,
+      replies_total,
+      quotes_total
+    )
+    SELECT
+      txm.token_id,
+      NOW(),
+      $1,
+      COUNT(*)::INT AS mentions_count,
+      COUNT(DISTINCT x.author_id)::INT AS unique_authors,
+      COALESCE(SUM((x.public_metrics->>'like_count')::INT), 0)::INT AS likes_total,
+      COALESCE(SUM((x.public_metrics->>'retweet_count')::INT), 0)::INT AS rts_total,
+      COALESCE(SUM((x.public_metrics->>'reply_count')::INT), 0)::INT AS replies_total,
+      COALESCE(SUM((x.public_metrics->>'quote_count')::INT), 0)::INT AS quotes_total
+    FROM token_x_mentions txm
+    JOIN x_raw_tweets x
+      ON x.tweet_id = txm.tweet_id
+    WHERE x.created_at > NOW() - ($1 || ' minutes')::INTERVAL
+    GROUP BY txm.token_id
+    `,
+    [windowMinutes]
+  );
+}
+
 async function fetchMentions() {
   console.log("X worker started");
 
@@ -186,7 +286,7 @@ async function fetchMentions() {
   console.log("tokens found:", tokens.length);
 
   if (tokens.length === 0) {
-    console.log("No tokens found. Exiting.");
+    console.log("No tracked tokens found. Exiting.");
     return;
   }
 
@@ -194,7 +294,7 @@ async function fetchMentions() {
   let totalMentionsInserted = 0;
 
   for (const token of tokens) {
-    const tokenId = token.id;
+    const tokenId = token.token_id;
     const address = token.token_address;
 
     if (!address) {
@@ -211,32 +311,36 @@ async function fetchMentions() {
       continue;
     }
 
-    const json = result.json;
-    console.log("x response preview:", JSON.stringify(json).slice(0, 300));
-
-    const tweets = json.data || [];
+    const tweets = result.tweets;
+    console.log(`Apify tweets found for ${address}: ${tweets.length}`);
 
     if (tweets.length === 0) {
-      console.log(`No tweets found for ${address}`);
       continue;
     }
 
-    console.log(`Found ${tweets.length} tweets for ${address}`);
-
     for (const tweet of tweets) {
       try {
-        await insertRawTweet(tweet);
-        totalTweetsInserted += 1;
+        const tweetText = extractText(tweet);
 
-        await insertTokenMention(tokenId, tweet.id, address);
+        if (!tweetText.includes(address)) {
+          continue;
+        }
+
+        const tweetId = await insertRawTweet(tweet);
+        await insertTokenMention(tokenId, tweetId, address);
+
+        totalTweetsInserted += 1;
         totalMentionsInserted += 1;
 
-        console.log(`Stored tweet ${tweet.id} for token ${tokenId}`);
+        console.log(`Stored tweet ${tweetId} for token ${tokenId}`);
       } catch (err) {
-        console.error(`Failed storing tweet ${tweet.id} for token ${tokenId}:`, err.message);
+        console.error(`Failed storing tweet for token ${tokenId}:`, err.message);
       }
     }
   }
+
+  await updateSocialSnapshots(5);
+  console.log("Updated token_social_snapshots");
 
   console.log("X worker complete");
   console.log("total raw tweets processed:", totalTweetsInserted);
@@ -255,5 +359,3 @@ fetchMentions()
     } catch (_) {}
     process.exit(1);
   });
-
-fetchMentions();

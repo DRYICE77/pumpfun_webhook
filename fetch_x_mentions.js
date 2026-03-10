@@ -83,11 +83,18 @@ async function ensureTables() {
 async function getRecentTokens(limit = 50) {
   const result = await pool.query(
     `
-    SELECT id, token_address
-    FROM tokens
+    SELECT
+      token_id AS id,
+      token_address
+    FROM tracked_tokens
     WHERE token_address IS NOT NULL
       AND token_address <> ''
-    ORDER BY id DESC
+      AND (
+        buys_5m > 0
+        OR sells_5m > 0
+        OR volume_5m > 0
+      )
+    ORDER BY last_updated DESC
     LIMIT $1
     `,
     [limit]

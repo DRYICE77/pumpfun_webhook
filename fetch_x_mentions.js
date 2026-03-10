@@ -320,14 +320,12 @@ async function fetchMentions() {
 
     for (const tweet of tweets) {
       try {
-        const tweetText = extractText(tweet);
+    const tweetText = extractText(tweet);
+const tweetId = await insertRawTweet(tweet);
+await insertTokenMention(tokenId, tweetId, address);
 
-        if (!tweetText.includes(address)) {
-          continue;
-        }
-
-        const tweetId = await insertRawTweet(tweet);
-        await insertTokenMention(tokenId, tweetId, address);
+console.log(`Stored tweet ${tweetId} for token ${tokenId}`);
+console.log(`Tweet text preview: ${(tweetText || "").slice(0, 200)}`);
 
         totalTweetsInserted += 1;
         totalMentionsInserted += 1;

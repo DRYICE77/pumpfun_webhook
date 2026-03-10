@@ -160,13 +160,21 @@ function extractMetrics(tweet) {
 }
 
 function extractTweetId(tweet) {
-  return String(
+  const id =
     tweet.id ??
+    tweet.id_str ??
     tweet.tweetId ??
-    ""
-  );
-}
+    tweet.postId ??
+    tweet.conversationId ??
+    (tweet.url ? tweet.url.split("/").pop() : null) ??
+    (tweet.tweetUrl ? tweet.tweetUrl.split("/").pop() : null);
 
+  if (!id) {
+    console.log("Tweet object with missing id:", JSON.stringify(tweet).slice(0,300));
+  }
+
+  return id ? String(id) : null;
+}
 function extractAuthorId(tweet) {
   return String(
     tweet.authorId ??
@@ -199,9 +207,10 @@ async function insertRawTweet(tweet) {
   const createdAt = extractCreatedAt(tweet);
   const publicMetrics = extractMetrics(tweet);
 
-  if (!tweetId) {
-    throw new Error("Missing tweet id");
-  }
+ if (!tweetId) {
+  console.log("Skipping tweet with no id");
+  return null;
+}
 
   await pool.query(
     `

@@ -38,9 +38,22 @@ let ws = null;
 let pingInterval = null;
 let reconnectTimeout = null;
 let retryCount = 0;
+let intentionalShutdown = false;
+let currentSocketId = 0;
+let last429At = null;
 
 const seenSignatures = new Set();
 const SEEN_SIGNATURE_LIMIT = 20000;
+
+function logInfo(message, extra = {}) {
+  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
+  console.log(`[pump-ws] ${message}${payload}`);
+}
+
+function logError(message, extra = {}) {
+  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
+  console.error(`[pump-ws] ${message}${payload}`);
+}
 
 function addSeenSignature(sig) {
   seenSignatures.add(sig);
@@ -54,8 +67,14 @@ function alreadySeen(sig) {
   return seenSignatures.has(sig);
 }
 
-function backoffDelay(attempt) {
-  return Math.min(1000 * 2 ** attempt, 30000);
+function backoffDelay(attempt, wasRateLimited = false) {
+  if (wasRateLimited) {
+    // Slower backoff for 429s: 60s, 120s, 240s, capped at 10m
+    return Math.min(60000 * 2 ** Math.min(attempt, 4), 600000);
+  }
+
+  // Normal backoff: 2s, 4s, 8s... capped at 60s
+  return Math.min(2000 * 2 ** Math.min(attempt, 5), 60000);
 }
 
 async function heliusRpc(method, params) {
@@ -289,8 +308,6 @@ function parsePumpTrade(tx, signature) {
     };
   }
 
-  const ts = getTs(tx);
-
   return {
     ok: true,
     trade: {
@@ -302,7 +319,7 @@ function parsePumpTrade(tx, signature) {
       fee_sol: getFeeSol(tx),
       bonding_progress: 0,
       sol_in_curve: 0,
-      ts,
+      ts: getTs(tx),
       signature,
       slot: tx.slot || null,
       raw: null,
@@ -450,10 +467,7 @@ async function processSignature(signature, fallbackSlot = null, fallbackBlockTim
 
   try {
     const tx = await fetchFullTransaction(signature);
-    if (!tx) {
-      console.log(`No tx yet for ${signature}`);
-      return;
-    }
+    if (!tx) return;
 
     await insertRawWebhookEvent({
       signature,
@@ -464,47 +478,45 @@ async function processSignature(signature, fallbackSlot = null, fallbackBlockTim
     });
 
     const parsed = parsePumpTrade(tx, signature);
-    if (!parsed.ok) {
-      console.log(`Skipped ${signature}: ${parsed.reason}`);
-      return;
-    }
+    if (!parsed.ok) return;
 
     await insertWalletTrade(parsed.trade);
-
-    console.log(
-      `Inserted ${parsed.trade.side} | wallet=${parsed.trade.wallet_address} | token=${parsed.trade.token_id} | sol=${parsed.trade.sol_amount.toFixed(
-        4
-      )}`
-    );
   } catch (err) {
-    console.error(`Failed processing ${signature}:`, err.message);
+    logError("Failed processing signature", {
+      signature,
+      error: err.message,
+    });
   }
 }
 
-function subscribe() {
+function subscribe(socket) {
   const request = {
     jsonrpc: "2.0",
     id: 1,
     method: "logsSubscribe",
     params: [
-      {
-        mentions: [PUMP_AMM_PROGRAM_ID],
-      },
-      {
-        commitment: "confirmed",
-      },
+      { mentions: [PUMP_AMM_PROGRAM_ID] },
+      { commitment: "confirmed" },
     ],
   };
 
-  ws.send(JSON.stringify(request));
-  console.log("Sent logsSubscribe");
+  socket.send(JSON.stringify(request));
+  logInfo("Sent logsSubscribe");
 }
 
-function startPing() {
+function startPing(socketId) {
   stopPing();
   pingInterval = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.ping();
+    if (
+      ws &&
+      ws.readyState === WebSocket.OPEN &&
+      socketId === currentSocketId
+    ) {
+      try {
+        ws.ping();
+      } catch (err) {
+        logError("Ping failed", { error: err.message });
+      }
     }
   }, 30000);
 }
@@ -516,11 +528,18 @@ function stopPing() {
   }
 }
 
-function reconnect() {
+function scheduleReconnect(reason = "unknown", wasRateLimited = false) {
+  if (intentionalShutdown) return;
   if (reconnectTimeout) return;
 
-  const delay = backoffDelay(retryCount);
-  console.log(`Reconnecting in ${delay}ms`);
+  const delay = backoffDelay(retryCount, wasRateLimited);
+
+  logInfo("Scheduling reconnect", {
+    reason,
+    retryCount,
+    delayMs: delay,
+    wasRateLimited,
+  });
 
   reconnectTimeout = setTimeout(() => {
     reconnectTimeout = null;
@@ -529,23 +548,58 @@ function reconnect() {
   }, delay);
 }
 
-function connect() {
-  console.log(`Connecting to ${WSS_URL}`);
-  ws = new WebSocket(WSS_URL);
+function cleanupSocket(socket) {
+  try {
+    socket.removeAllListeners();
+  } catch (_) {}
 
-  ws.on("open", () => {
-    console.log("WebSocket opened");
-    retryCount = 0;
-    subscribe();
-    startPing();
+  try {
+    if (
+      socket.readyState === WebSocket.OPEN ||
+      socket.readyState === WebSocket.CONNECTING
+    ) {
+      socket.terminate();
+    }
+  } catch (_) {}
+}
+
+function connect() {
+  if (intentionalShutdown) return;
+
+  currentSocketId += 1;
+  const socketId = currentSocketId;
+  const socket = new WebSocket(WSS_URL);
+  ws = socket;
+
+  logInfo("Connecting websocket", {
+    socketId,
+    url: "wss://mainnet.helius-rpc.com/?api-key=***",
   });
 
-  ws.on("message", async (data) => {
+  socket.on("open", () => {
+    if (socketId !== currentSocketId) {
+      cleanupSocket(socket);
+      return;
+    }
+
+    retryCount = 0;
+    last429At = null;
+    logInfo("WebSocket opened", { socketId });
+    subscribe(socket);
+    startPing(socketId);
+  });
+
+  socket.on("message", async (data) => {
+    if (socketId !== currentSocketId) return;
+
     try {
       const msg = JSON.parse(data.toString());
 
       if (typeof msg.result === "number" && msg.id === 1) {
-        console.log(`Subscribed successfully: ${msg.result}`);
+        logInfo("Subscribed successfully", {
+          socketId,
+          subscriptionId: msg.result,
+        });
         return;
       }
 
@@ -559,18 +613,53 @@ function connect() {
         value?.blockTime || null
       );
     } catch (err) {
-      console.error("WS message parse error:", err.message);
+      logError("WS message parse error", {
+        socketId,
+        error: err.message,
+      });
     }
   });
 
-  ws.on("error", (err) => {
-    console.error("WebSocket error:", err.message);
+  socket.on("error", (err) => {
+    if (socketId !== currentSocketId) return;
+
+    const message = err?.message || "unknown websocket error";
+    const wasRateLimited = message.includes("429");
+
+    if (wasRateLimited) {
+      last429At = new Date().toISOString();
+    }
+
+    logError("WebSocket error", {
+      socketId,
+      error: message,
+      wasRateLimited,
+    });
   });
 
-  ws.on("close", () => {
-    console.log("WebSocket closed");
+  socket.on("close", (code, reasonBuffer) => {
+    if (socketId !== currentSocketId) return;
+
     stopPing();
-    reconnect();
+
+    const reason =
+      reasonBuffer && reasonBuffer.length
+        ? reasonBuffer.toString()
+        : "no reason";
+
+    const wasRateLimited =
+      reason.includes("429") ||
+      Boolean(last429At);
+
+    logInfo("WebSocket closed", {
+      socketId,
+      code,
+      reason,
+      wasRateLimited,
+    });
+
+    cleanupSocket(socket);
+    scheduleReconnect("socket_closed", wasRateLimited);
   });
 }
 
@@ -585,6 +674,7 @@ http
             ok: true,
             websocketState: ws ? ws.readyState : null,
             retryCount,
+            last429At,
             dbTime: db.rows[0].now,
           })
         );
@@ -599,28 +689,28 @@ http
     res.end("pumpfun scanner running");
   })
   .listen(PORT, () => {
-    console.log(`HTTP server listening on ${PORT}`);
+    logInfo("HTTP server listening", { port: PORT });
   });
 
 async function boot() {
   try {
     const test = await pool.query("SELECT now()");
-    console.log("DB connected:", test.rows[0].now);
+    logInfo("DB connected", { dbTime: test.rows[0].now });
 
     await createTables();
-    console.log("Tables ready");
+    logInfo("Tables ready");
 
     if (STORE_RAW_EVENTS) {
       setInterval(() => {
         trimRawEvents().catch((err) =>
-          console.error("Raw trim error:", err.message)
+          logError("Raw trim error", { error: err.message })
         );
       }, 5 * 60 * 1000);
     }
 
     connect();
   } catch (err) {
-    console.error("Boot failed:", err.message);
+    logError("Boot failed", { error: err.message });
     process.exit(1);
   }
 }
@@ -629,7 +719,9 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 async function shutdown() {
-  console.log("Shutting down...");
+  intentionalShutdown = true;
+  logInfo("Shutting down");
+
   stopPing();
 
   if (reconnectTimeout) {
@@ -638,9 +730,8 @@ async function shutdown() {
   }
 
   if (ws) {
-    try {
-      ws.close();
-    } catch (_) {}
+    cleanupSocket(ws);
+    ws = null;
   }
 
   try {

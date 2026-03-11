@@ -9,12 +9,20 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const PORT = Number(process.env.PORT || 8080);
 
 const CHAIN = "solana";
-const STORE_RAW_EVENTS = String(process.env.STORE_RAW_EVENTS || "true") === "true";
-const RAW_RETENTION_COUNT = Number(process.env.RAW_RETENTION_COUNT || 5000);
+const STORE_RAW_EVENTS = String(process.env.STORE_RAW_EVENTS || "false") === "true";
+const RAW_RETENTION_COUNT = Number(process.env.RAW_RETENTION_COUNT || 2000);
 
 const PUMP_AMM_PROGRAM_ID =
   process.env.PUMP_AMM_PROGRAM_ID ||
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+/**
+ * Core throttle controls
+ */
+const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 2);
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 5000);
+const SIGNATURE_MAX_AGE_MS = Number(process.env.SIGNATURE_MAX_AGE_MS || 3 * 60 * 1000);
+const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 30000);
 
 const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -42,8 +50,28 @@ let intentionalShutdown = false;
 let currentSocketId = 0;
 let last429At = null;
 
+/**
+ * Signature dedupe + queue
+ */
 const seenSignatures = new Set();
-const SEEN_SIGNATURE_LIMIT = 20000;
+const SEEN_SIGNATURE_LIMIT = 50000;
+
+const queuedSignatures = new Set();
+const signatureQueue = [];
+
+let queueWorkerTimer = null;
+let queueLogTimer = null;
+
+const stats = {
+  queued: 0,
+  droppedQueueFull: 0,
+  droppedStale: 0,
+  droppedDuplicate: 0,
+  processed: 0,
+  insertedTrades: 0,
+  skippedParsed: 0,
+  txFetchErrors: 0,
+};
 
 function logInfo(message, extra = {}) {
   const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
@@ -69,12 +97,13 @@ function alreadySeen(sig) {
 
 function backoffDelay(attempt, wasRateLimited = false) {
   if (wasRateLimited) {
-    // Slower backoff for 429s: 60s, 120s, 240s, capped at 10m
     return Math.min(60000 * 2 ** Math.min(attempt, 4), 600000);
   }
-
-  // Normal backoff: 2s, 4s, 8s... capped at 60s
   return Math.min(2000 * 2 ** Math.min(attempt, 5), 60000);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function heliusRpc(method, params) {
@@ -322,7 +351,7 @@ function parsePumpTrade(tx, signature) {
       ts: getTs(tx),
       signature,
       slot: tx.slot || null,
-      raw: null,
+      raw: STORE_RAW_EVENTS ? tx : null,
     },
   };
 }
@@ -421,7 +450,7 @@ async function trimRawEvents() {
 }
 
 async function insertWalletTrade(trade) {
-  await pool.query(
+  const result = await pool.query(
     `
     INSERT INTO wallet_trades (
       wallet_address,
@@ -442,6 +471,7 @@ async function insertWalletTrade(trade) {
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
     )
     ON CONFLICT (signature, wallet_address, side) DO NOTHING
+    RETURNING id
     `,
     [
       trade.wallet_address,
@@ -459,10 +489,50 @@ async function insertWalletTrade(trade) {
       CHAIN,
     ]
   );
+
+  if (result.rowCount > 0) {
+    stats.insertedTrades += 1;
+  }
 }
 
-async function processSignature(signature, fallbackSlot = null, fallbackBlockTime = null) {
-  if (!signature || alreadySeen(signature)) return;
+function enqueueSignature(signature, slot = null, blockTime = null) {
+  if (!signature) return;
+
+  if (alreadySeen(signature) || queuedSignatures.has(signature)) {
+    stats.droppedDuplicate += 1;
+    return;
+  }
+
+  if (signatureQueue.length >= MAX_QUEUE_SIZE) {
+    stats.droppedQueueFull += 1;
+    return;
+  }
+
+  queuedSignatures.add(signature);
+  signatureQueue.push({
+    signature,
+    slot,
+    blockTime,
+    enqueuedAt: Date.now(),
+  });
+
+  stats.queued += 1;
+}
+
+async function processQueuedSignature(item) {
+  const { signature, slot, blockTime, enqueuedAt } = item;
+
+  queuedSignatures.delete(signature);
+
+  if (!signature || alreadySeen(signature)) {
+    return;
+  }
+
+  if (Date.now() - enqueuedAt > SIGNATURE_MAX_AGE_MS) {
+    stats.droppedStale += 1;
+    return;
+  }
+
   addSeenSignature(signature);
 
   try {
@@ -471,21 +541,82 @@ async function processSignature(signature, fallbackSlot = null, fallbackBlockTim
 
     await insertRawWebhookEvent({
       signature,
-      slot: tx.slot || fallbackSlot,
-      timestamp: tx.blockTime || fallbackBlockTime,
+      slot: tx.slot || slot,
+      timestamp: tx.blockTime || blockTime,
       type: "helius_ws_tx",
       payload: tx,
     });
 
     const parsed = parsePumpTrade(tx, signature);
-    if (!parsed.ok) return;
+    if (!parsed.ok) {
+      stats.skippedParsed += 1;
+      return;
+    }
 
     await insertWalletTrade(parsed.trade);
+    stats.processed += 1;
   } catch (err) {
+    stats.txFetchErrors += 1;
     logError("Failed processing signature", {
       signature,
       error: err.message,
     });
+  }
+}
+
+function startQueueWorker() {
+  if (queueWorkerTimer) return;
+
+  const intervalMs = Math.max(1000 / MAX_TX_PER_SECOND, 250);
+
+  queueWorkerTimer = setInterval(async () => {
+    if (signatureQueue.length === 0) return;
+
+    const item = signatureQueue.shift();
+    if (!item) return;
+
+    try {
+      await processQueuedSignature(item);
+    } catch (err) {
+      logError("Queue worker error", { error: err.message });
+    }
+  }, intervalMs);
+
+  logInfo("Queue worker started", {
+    maxTxPerSecond: MAX_TX_PER_SECOND,
+    intervalMs,
+  });
+}
+
+function stopQueueWorker() {
+  if (queueWorkerTimer) {
+    clearInterval(queueWorkerTimer);
+    queueWorkerTimer = null;
+  }
+}
+
+function startQueueLogger() {
+  if (queueLogTimer) return;
+
+  queueLogTimer = setInterval(() => {
+    logInfo("Queue stats", {
+      queueSize: signatureQueue.length,
+      queued: stats.queued,
+      processed: stats.processed,
+      insertedTrades: stats.insertedTrades,
+      droppedQueueFull: stats.droppedQueueFull,
+      droppedStale: stats.droppedStale,
+      droppedDuplicate: stats.droppedDuplicate,
+      skippedParsed: stats.skippedParsed,
+      txFetchErrors: stats.txFetchErrors,
+    });
+  }, QUEUE_LOG_EVERY_MS);
+}
+
+function stopQueueLogger() {
+  if (queueLogTimer) {
+    clearInterval(queueLogTimer);
+    queueLogTimer = null;
   }
 }
 
@@ -507,11 +638,7 @@ function subscribe(socket) {
 function startPing(socketId) {
   stopPing();
   pingInterval = setInterval(() => {
-    if (
-      ws &&
-      ws.readyState === WebSocket.OPEN &&
-      socketId === currentSocketId
-    ) {
+    if (ws && ws.readyState === WebSocket.OPEN && socketId === currentSocketId) {
       try {
         ws.ping();
       } catch (err) {
@@ -589,7 +716,7 @@ function connect() {
     startPing(socketId);
   });
 
-  socket.on("message", async (data) => {
+  socket.on("message", (data) => {
     if (socketId !== currentSocketId) return;
 
     try {
@@ -607,7 +734,7 @@ function connect() {
       if (!value) return;
       if (value.err) return;
 
-      await processSignature(
+      enqueueSignature(
         value.signature,
         msg?.params?.result?.context?.slot || null,
         value?.blockTime || null
@@ -676,6 +803,8 @@ http
             retryCount,
             last429At,
             dbTime: db.rows[0].now,
+            queueSize: signatureQueue.length,
+            stats,
           })
         );
       } catch (err) {
@@ -708,6 +837,8 @@ async function boot() {
       }, 5 * 60 * 1000);
     }
 
+    startQueueWorker();
+    startQueueLogger();
     connect();
   } catch (err) {
     logError("Boot failed", { error: err.message });
@@ -723,6 +854,8 @@ async function shutdown() {
   logInfo("Shutting down");
 
   stopPing();
+  stopQueueWorker();
+  stopQueueLogger();
 
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);

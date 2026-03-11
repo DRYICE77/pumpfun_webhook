@@ -8,14 +8,15 @@ const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
 const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 10);
 const MAX_TWEETS_PER_TOKEN = Number(process.env.X_MAX_TWEETS_PER_TOKEN || 5);
 const SNAPSHOT_WINDOW_MINUTES = Number(process.env.X_SNAPSHOT_WINDOW_MINUTES || 5);
+const LOOP_SLEEP_MS = Number(process.env.X_LOOP_SLEEP_MS || 60000);
 
 if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL");
+  console.error("[x-worker] Missing DATABASE_URL");
   process.exit(1);
 }
 
 if (!APIFY_API_TOKEN) {
-  console.error("Missing APIFY_API_TOKEN");
+  console.error("[x-worker] Missing APIFY_API_TOKEN");
   process.exit(1);
 }
 
@@ -32,6 +33,10 @@ function logInfo(message, extra = {}) {
 function logError(message, extra = {}) {
   const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
   console.error(`[x-worker] ${message}${payload}`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureTables() {
@@ -97,11 +102,6 @@ async function getRecentTokens(limit = TOKEN_LIMIT) {
     FROM tracked_tokens
     WHERE token_address IS NOT NULL
       AND token_address <> ''
-      AND (
-        COALESCE(buys_5m, 0) > 0
-        OR COALESCE(sells_5m, 0) > 0
-        OR COALESCE(volume_5m, 0) > 0
-      )
     ORDER BY last_updated DESC NULLS LAST
     LIMIT $1
     `,
@@ -163,28 +163,6 @@ async function searchTweetsForAddress(address) {
   return { ok: true, tweets: json };
 }
 
-function extractMetrics(tweet) {
-  return {
-    like_count:
-      tweet.likeCount ??
-      tweet.likes ??
-      tweet.favoriteCount ??
-      0,
-    retweet_count:
-      tweet.retweetCount ??
-      tweet.retweets ??
-      0,
-    reply_count:
-      tweet.replyCount ??
-      tweet.replies ??
-      0,
-    quote_count:
-      tweet.quoteCount ??
-      tweet.quotes ??
-      0,
-  };
-}
-
 function extractTweetId(tweet) {
   const rawId =
     tweet.id ??
@@ -221,6 +199,15 @@ function extractCreatedAt(tweet) {
   }
 
   return parsed.toISOString();
+}
+
+function extractMetrics(tweet) {
+  return {
+    like_count: tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0,
+    retweet_count: tweet.retweetCount ?? tweet.retweets ?? 0,
+    reply_count: tweet.replyCount ?? tweet.replies ?? 0,
+    quote_count: tweet.quoteCount ?? tweet.quotes ?? 0,
+  };
 }
 
 async function insertRawTweet(tweet) {
@@ -319,33 +306,32 @@ async function updateSocialSnapshots(windowMinutes = SNAPSHOT_WINDOW_MINUTES) {
   return result.rowCount;
 }
 
-async function processToken(token) {
+async function processToken(token, index, total) {
   const tokenId = token.token_id;
   const address = token.token_address;
 
   if (!address) {
+    logError("Token missing address", { index, total, tokenId });
     return {
+      ok: false,
       tokenId,
-      address: null,
       tweetsFetched: 0,
       rawInserted: 0,
       mentionsInserted: 0,
       skippedNoId: 0,
-      ok: false,
-      reason: "missing token_address",
+      reason: "missing_token_address",
     };
   }
 
-  const result = await searchTweetsForAddress(address);
-  if (!result.ok) {
+  const searchResult = await searchTweetsForAddress(address);
+  if (!searchResult.ok) {
     return {
+      ok: false,
       tokenId,
-      address,
       tweetsFetched: 0,
       rawInserted: 0,
       mentionsInserted: 0,
       skippedNoId: 0,
-      ok: false,
       reason: "apify_error",
     };
   }
@@ -354,7 +340,7 @@ async function processToken(token) {
   let mentionsInserted = 0;
   let skippedNoId = 0;
 
-  for (const tweet of result.tweets) {
+  for (const tweet of searchResult.tweets) {
     try {
       const rawResult = await insertRawTweet(tweet);
 
@@ -374,86 +360,86 @@ async function processToken(token) {
     } catch (err) {
       logError("Failed storing tweet", {
         tokenId,
-        address,
         error: err.message,
       });
     }
   }
 
-  return {
+  logInfo("Token processed", {
+    index,
+    total,
     tokenId,
-    address,
-    tweetsFetched: result.tweets.length,
+    tweetsFetched: searchResult.tweets.length,
     rawInserted,
     mentionsInserted,
     skippedNoId,
+  });
+
+  return {
     ok: true,
+    tokenId,
+    tweetsFetched: searchResult.tweets.length,
+    rawInserted,
+    mentionsInserted,
+    skippedNoId,
   };
 }
 
-async function fetchMentions() {
+async function fetchMentionsCycle() {
   const startedAt = Date.now();
-
-  logInfo("Worker started", {
-    tokenLimit: TOKEN_LIMIT,
-    maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
-    snapshotWindowMinutes: SNAPSHOT_WINDOW_MINUTES,
-  });
-
-  await ensureTables();
-  logInfo("Tables ready");
 
   const tokens = await getRecentTokens(TOKEN_LIMIT);
   logInfo("Loaded tracked tokens", { count: tokens.length });
 
   if (tokens.length === 0) {
-    logInfo("No tracked tokens found, exiting");
+    logInfo("No tracked tokens found");
     return;
   }
 
+  let successCount = 0;
+  let failureCount = 0;
   let totalFetched = 0;
   let totalRawInserted = 0;
   let totalMentionsInserted = 0;
   let totalSkippedNoId = 0;
-  let successCount = 0;
-  let failureCount = 0;
 
   for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    const result = await processToken(token);
+    try {
+      const result = await processToken(tokens[i], i + 1, tokens.length);
 
-    totalFetched += result.tweetsFetched;
-    totalRawInserted += result.rawInserted;
-    totalMentionsInserted += result.mentionsInserted;
-    totalSkippedNoId += result.skippedNoId;
+      totalFetched += result.tweetsFetched;
+      totalRawInserted += result.rawInserted;
+      totalMentionsInserted += result.mentionsInserted;
+      totalSkippedNoId += result.skippedNoId;
 
-    if (result.ok) {
-      successCount += 1;
-      logInfo("Token processed", {
-        index: i + 1,
-        total: tokens.length,
-        tokenId: result.tokenId,
-        tweetsFetched: result.tweetsFetched,
-        rawInserted: result.rawInserted,
-        mentionsInserted: result.mentionsInserted,
-        skippedNoId: result.skippedNoId,
-      });
-    } else {
+      if (result.ok) {
+        successCount += 1;
+      } else {
+        failureCount += 1;
+        logError("Token failed", {
+          index: i + 1,
+          total: tokens.length,
+          tokenId: result.tokenId,
+          reason: result.reason,
+        });
+      }
+    } catch (err) {
       failureCount += 1;
-      logError("Token failed", {
+      logError("Unhandled token processing failure", {
         index: i + 1,
         total: tokens.length,
-        tokenId: result.tokenId,
-        reason: result.reason,
+        tokenId: tokens[i]?.token_id ?? null,
+        error: err.message,
       });
     }
+
+    await sleep(1000);
   }
 
   const snapshotsInserted = await updateSocialSnapshots(SNAPSHOT_WINDOW_MINUTES);
 
-  logInfo("Worker complete", {
+  logInfo("Cycle complete", {
     durationSeconds: Math.round((Date.now() - startedAt) / 1000),
-    tokensProcessed: tokens.length,
     tokenSuccesses: successCount,
     tokenFailures: failureCount,
     tweetsFetched: totalFetched,
@@ -464,15 +450,40 @@ async function fetchMentions() {
   });
 }
 
-fetchMentions()
-  .then(async () => {
-    await pool.end();
-    process.exit(0);
-  })
-  .catch(async (err) => {
-    logError("Worker failed", { error: err.message });
-    try {
-      await pool.end();
-    } catch (_) {}
-    process.exit(1);
+async function mainLoop() {
+  logInfo("Continuous worker starting", {
+    tokenLimit: TOKEN_LIMIT,
+    maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
+    snapshotWindowMinutes: SNAPSHOT_WINDOW_MINUTES,
+    loopSleepMs: LOOP_SLEEP_MS,
   });
+
+  await ensureTables();
+  logInfo("Tables ready");
+
+  while (true) {
+    try {
+      await fetchMentionsCycle();
+    } catch (err) {
+      logError("Cycle failed", { error: err.message });
+    }
+
+    logInfo("Sleeping before next cycle", {
+      sleepSeconds: Math.round(LOOP_SLEEP_MS / 1000),
+    });
+
+    await sleep(LOOP_SLEEP_MS);
+  }
+}
+
+mainLoop().catch(async (err) => {
+  logError("Fatal worker error", { error: err.message });
+
+  try {
+    await pool.end();
+  } catch (_) {
+    // ignore
+  }
+
+  process.exit(1);
+});

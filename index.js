@@ -277,7 +277,9 @@ function buildTokenMap(rows) {
   return map;
 }
 
-function findWalletTokenDelta(tx, walletAddress) {
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
+function findWalletTokenDelta(tx, walletAddress, expectedSide = null) {
   const preRows = parseTokenBalances(tx?.meta?.preTokenBalances || []);
   const postRows = parseTokenBalances(tx?.meta?.postTokenBalances || []);
 
@@ -285,7 +287,7 @@ function findWalletTokenDelta(tx, walletAddress) {
   const postMap = buildTokenMap(postRows);
 
   const keys = new Set([...preMap.keys(), ...postMap.keys()]);
-  let best = null;
+  const candidates = [];
 
   for (const key of keys) {
     const pre = preMap.get(key);
@@ -299,14 +301,26 @@ function findWalletTokenDelta(tx, walletAddress) {
 
     if (!owner || !mint) continue;
     if (owner !== walletAddress) continue;
-    if (Math.abs(delta) === 0) continue;
+    if (mint === WSOL_MINT) continue;
+    if (delta === 0) continue;
 
-    if (!best || Math.abs(delta) > Math.abs(best.delta)) {
-      best = { mint, delta };
-    }
+    candidates.push({ mint, delta, absDelta: Math.abs(delta) });
   }
 
-  return best;
+  if (!candidates.length) return null;
+
+  let filtered = candidates;
+
+  if (expectedSide === "buy") {
+    filtered = candidates.filter((c) => c.delta > 0);
+  } else if (expectedSide === "sell") {
+    filtered = candidates.filter((c) => c.delta < 0);
+  }
+
+  if (!filtered.length) filtered = candidates;
+
+  filtered.sort((a, b) => b.absDelta - a.absDelta);
+  return { mint: filtered[0].mint, delta: filtered[0].delta };
 }
 
 function getFeeSol(tx) {
@@ -340,7 +354,7 @@ function parsePumpTrade(tx, signature) {
     return { ok: false, reason: "no signer wallet" };
   }
 
-  const tokenDelta = findWalletTokenDelta(tx, walletAddress);
+const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
   if (!tokenDelta) {
     return { ok: false, reason: "no wallet token delta" };
   }

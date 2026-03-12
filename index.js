@@ -16,9 +16,6 @@ const PUMP_AMM_PROGRAM_ID =
   process.env.PUMP_AMM_PROGRAM_ID ||
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-/**
- * Ingestion throughput controls
- */
 const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 40);
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 100000);
 const SIGNATURE_MAX_AGE_MS = Number(
@@ -27,14 +24,9 @@ const SIGNATURE_MAX_AGE_MS = Number(
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 20);
 
-/**
- * Trade quality controls
- */
-const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
+// raised from 0.1 -> 0.25
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.25);
 
-/**
- * Retry controls
- */
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
 
@@ -64,9 +56,6 @@ let intentionalShutdown = false;
 let currentSocketId = 0;
 let last429At = null;
 
-/**
- * Signature dedupe + queue
- */
 const seenSignatures = new Set();
 const SEEN_SIGNATURE_LIMIT = 100000;
 
@@ -77,9 +66,8 @@ let queueLogTimer = null;
 let workerRunning = false;
 const workerPromises = [];
 
-/**
- * Stats
- */
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
+
 const stats = {
   queued: 0,
   dequeued: 0,
@@ -94,6 +82,10 @@ const stats = {
   rpcRetries: 0,
   emptyTx: 0,
   belowMinSol: 0,
+  skippedNoPumpLog: 0,
+  skippedNoBuySellLog: 0,
+  skippedNoPumpInstructionHint: 0,
+  sideMismatch: 0,
 };
 
 function logInfo(message, extra = {}) {
@@ -146,7 +138,6 @@ async function heliusRpc(method, params) {
   }
 
   const json = await res.json();
-
   if (json.error) {
     throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
   }
@@ -169,7 +160,6 @@ async function fetchFullTransaction(signature) {
       ]);
     } catch (err) {
       lastErr = err;
-
       if (attempt < RPC_RETRY_COUNT) {
         stats.rpcRetries += 1;
         await sleep(RPC_RETRY_DELAY_MS * (attempt + 1));
@@ -201,17 +191,29 @@ function txTouchesPumpAmm(tx) {
 
   const instructions = tx?.transaction?.message?.instructions || [];
   for (const ix of instructions) {
-    if (ix.programId === PUMP_AMM_PROGRAM_ID) return true;
+    const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+    if (pid === PUMP_AMM_PROGRAM_ID) return true;
   }
 
   const inner = tx?.meta?.innerInstructions || [];
   for (const group of inner) {
     for (const ix of group.instructions || []) {
-      if (ix.programId === PUMP_AMM_PROGRAM_ID) return true;
+      const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+      if (pid === PUMP_AMM_PROGRAM_ID) return true;
     }
   }
 
   return false;
+}
+
+function looksRelevantFromLogs(value) {
+  const logs = value?.logs || [];
+  if (!Array.isArray(logs) || !logs.length) return false;
+  return logs.some((l) =>
+    l.includes(PUMP_AMM_PROGRAM_ID) ||
+    l.includes("Instruction: Buy") ||
+    l.includes("Instruction: Sell")
+  );
 }
 
 function getSideFromLogs(tx) {
@@ -277,8 +279,8 @@ function buildTokenMap(rows) {
   return map;
 }
 
-const WSOL_MINT = "So11111111111111111111111111111111111111112";
-
+// More deterministic: prefer token deltas owned by signer wallet,
+// then side-aligned delta, then biggest abs delta.
 function findWalletTokenDelta(tx, walletAddress, expectedSide = null) {
   const preRows = parseTokenBalances(tx?.meta?.preTokenBalances || []);
   const postRows = parseTokenBalances(tx?.meta?.postTokenBalances || []);
@@ -304,23 +306,30 @@ function findWalletTokenDelta(tx, walletAddress, expectedSide = null) {
     if (mint === WSOL_MINT) continue;
     if (delta === 0) continue;
 
-    candidates.push({ mint, delta, absDelta: Math.abs(delta) });
+    const side =
+      delta > 0 ? "buy" :
+      delta < 0 ? "sell" :
+      null;
+
+    candidates.push({
+      owner,
+      mint,
+      delta,
+      absDelta: Math.abs(delta),
+      side,
+    });
   }
 
   if (!candidates.length) return null;
 
   let filtered = candidates;
-
-  if (expectedSide === "buy") {
-    filtered = candidates.filter((c) => c.delta > 0);
-  } else if (expectedSide === "sell") {
-    filtered = candidates.filter((c) => c.delta < 0);
+  if (expectedSide) {
+    const sideMatches = candidates.filter((c) => c.side === expectedSide);
+    if (sideMatches.length) filtered = sideMatches;
   }
 
-  if (!filtered.length) filtered = candidates;
-
   filtered.sort((a, b) => b.absDelta - a.absDelta);
-  return { mint: filtered[0].mint, delta: filtered[0].delta };
+  return filtered[0];
 }
 
 function getFeeSol(tx) {
@@ -354,7 +363,7 @@ function parsePumpTrade(tx, signature) {
     return { ok: false, reason: "no signer wallet" };
   }
 
-const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
+  const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
   if (!tokenDelta) {
     return { ok: false, reason: "no wallet token delta" };
   }
@@ -383,15 +392,13 @@ const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
       ? "sell"
       : null;
 
-  if (!inferredSide) {
-    return { ok: false, reason: "could not infer side" };
-  }
+  // Important: don't hard reject here. Keep the log-side trade,
+  // but mark mismatch for inspection.
+  const finalSide = inferredSide || sideFromLogs;
+  const sideMismatch = inferredSide && sideFromLogs !== inferredSide;
 
-  if (sideFromLogs !== inferredSide) {
-    return {
-      ok: false,
-      reason: `log side ${sideFromLogs} != inferred side ${inferredSide}`,
-    };
+  if (sideMismatch) {
+    stats.sideMismatch += 1;
   }
 
   return {
@@ -399,7 +406,7 @@ const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
     trade: {
       wallet_address: walletAddress,
       token_id: tokenDelta.mint,
-      side: inferredSide,
+      side: finalSide,
       sol_amount: solAmount,
       token_amount: tokenAmount,
       fee_sol: getFeeSol(tx),
@@ -408,7 +415,9 @@ const tokenDelta = findWalletTokenDelta(tx, walletAddress, sideFromLogs);
       ts: getTs(tx),
       signature,
       slot: tx.slot || null,
-      raw: STORE_RAW_EVENTS ? tx : null,
+      raw: STORE_RAW_EVENTS
+        ? { ...tx, parser_debug: { sideFromLogs, inferredSide, sideMismatch } }
+        : null,
     },
   };
 }
@@ -524,9 +533,7 @@ async function insertWalletTrade(trade) {
       raw,
       chain
     )
-    VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
-    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     ON CONFLICT (signature, wallet_address, side) DO NOTHING
     RETURNING id
     `,
@@ -582,9 +589,7 @@ async function processQueuedSignature(item) {
   queuedSignatures.delete(signature);
   stats.dequeued += 1;
 
-  if (!signature || alreadySeen(signature)) {
-    return;
-  }
+  if (!signature || alreadySeen(signature)) return;
 
   if (Date.now() - enqueuedAt > SIGNATURE_MAX_AGE_MS) {
     stats.droppedStale += 1;
@@ -704,6 +709,7 @@ function startQueueLogger() {
       droppedDuplicate: stats.droppedDuplicate,
       skippedParsed: stats.skippedParsed,
       belowMinSol: stats.belowMinSol,
+      sideMismatch: stats.sideMismatch,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
       emptyTx: stats.emptyTx,
@@ -732,6 +738,109 @@ function subscribe(socket) {
 
   socket.send(JSON.stringify(request));
   logInfo("Sent logsSubscribe");
+}
+
+function connect() {
+  if (intentionalShutdown) return;
+
+  currentSocketId += 1;
+  const socketId = currentSocketId;
+  const socket = new WebSocket(WSS_URL);
+  ws = socket;
+
+  logInfo("Connecting websocket", {
+    socketId,
+    url: "wss://mainnet.helius-rpc.com/?api-key=***",
+  });
+
+  socket.on("open", () => {
+    if (socketId !== currentSocketId) {
+      cleanupSocket(socket);
+      return;
+    }
+
+    retryCount = 0;
+    last429At = null;
+    logInfo("WebSocket opened", { socketId });
+    subscribe(socket);
+    startPing(socketId);
+  });
+
+  socket.on("message", (data) => {
+    if (socketId !== currentSocketId) return;
+
+    try {
+      const msg = JSON.parse(data.toString());
+
+      if (typeof msg.result === "number" && msg.id === 1) {
+        logInfo("Subscribed successfully", {
+          socketId,
+          subscriptionId: msg.result,
+        });
+        return;
+      }
+
+      const value = msg?.params?.result?.value;
+      if (!value || value.err) return;
+
+      // pre-queue noise filter
+      if (!looksRelevantFromLogs(value)) {
+        stats.skippedNoPumpLog += 1;
+        return;
+      }
+
+      enqueueSignature(
+        value.signature,
+        msg?.params?.result?.context?.slot || null,
+        value?.blockTime || null
+      );
+    } catch (err) {
+      logError("WS message parse error", {
+        socketId,
+        error: err.message,
+      });
+    }
+  });
+
+  socket.on("error", (err) => {
+    if (socketId !== currentSocketId) return;
+
+    const message = err?.message || "unknown websocket error";
+    const wasRateLimited = message.includes("429");
+
+    if (wasRateLimited) {
+      last429At = new Date().toISOString();
+    }
+
+    logError("WebSocket error", {
+      socketId,
+      error: message,
+      wasRateLimited,
+    });
+  });
+
+  socket.on("close", (code, reasonBuffer) => {
+    if (socketId !== currentSocketId) return;
+
+    stopPing();
+
+    const reason =
+      reasonBuffer && reasonBuffer.length
+        ? reasonBuffer.toString()
+        : "no reason";
+
+    const wasRateLimited = reason.includes("429") || Boolean(last429At);
+
+    logInfo("WebSocket closed", {
+      socketId,
+      code,
+      reason,
+      wasRateLimited,
+    });
+
+    cleanupSocket(socket);
+    scheduleReconnect("socket_closed", wasRateLimited);
+  });
 }
 
 function startPing(socketId) {
@@ -787,104 +896,6 @@ function cleanupSocket(socket) {
       socket.terminate();
     }
   } catch (_) {}
-}
-
-function connect() {
-  if (intentionalShutdown) return;
-
-  currentSocketId += 1;
-  const socketId = currentSocketId;
-  const socket = new WebSocket(WSS_URL);
-  ws = socket;
-
-  logInfo("Connecting websocket", {
-    socketId,
-    url: "wss://mainnet.helius-rpc.com/?api-key=***",
-  });
-
-  socket.on("open", () => {
-    if (socketId !== currentSocketId) {
-      cleanupSocket(socket);
-      return;
-    }
-
-    retryCount = 0;
-    last429At = null;
-    logInfo("WebSocket opened", { socketId });
-    subscribe(socket);
-    startPing(socketId);
-  });
-
-  socket.on("message", (data) => {
-    if (socketId !== currentSocketId) return;
-
-    try {
-      const msg = JSON.parse(data.toString());
-
-      if (typeof msg.result === "number" && msg.id === 1) {
-        logInfo("Subscribed successfully", {
-          socketId,
-          subscriptionId: msg.result,
-        });
-        return;
-      }
-
-      const value = msg?.params?.result?.value;
-      if (!value) return;
-      if (value.err) return;
-
-      enqueueSignature(
-        value.signature,
-        msg?.params?.result?.context?.slot || null,
-        value?.blockTime || null
-      );
-    } catch (err) {
-      logError("WS message parse error", {
-        socketId,
-        error: err.message,
-      });
-    }
-  });
-
-  socket.on("error", (err) => {
-    if (socketId !== currentSocketId) return;
-
-    const message = err?.message || "unknown websocket error";
-    const wasRateLimited = message.includes("429");
-
-    if (wasRateLimited) {
-      last429At = new Date().toISOString();
-    }
-
-    logError("WebSocket error", {
-      socketId,
-      error: message,
-      wasRateLimited,
-    });
-  });
-
-  socket.on("close", (code, reasonBuffer) => {
-    if (socketId !== currentSocketId) return;
-
-    stopPing();
-
-    const reason =
-      reasonBuffer && reasonBuffer.length
-        ? reasonBuffer.toString()
-        : "no reason";
-
-    const wasRateLimited = reason.includes("429") || Boolean(last429At);
-
-    logInfo("WebSocket closed", {
-      socketId,
-      code,
-      reason,
-      wasRateLimited,
-    });
-
-    cleanupSocket(socket);
-    scheduleReconnect("socket_closed", wasRateLimited);
-  });
 }
 
 http

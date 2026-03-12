@@ -26,6 +26,7 @@ const SIGNATURE_MAX_AGE_MS = Number(
 );
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
 
 /**
  * Retry controls
@@ -343,13 +344,17 @@ function parsePumpTrade(tx, signature) {
   const solAmount = Math.abs(walletSolDelta);
   const tokenAmount = Math.abs(tokenDelta.delta);
 
-  if (solAmount <= 0) {
-    return { ok: false, reason: "zero sol amount" };
-  }
+if (solAmount <= 0) {
+  return { ok: false, reason: "zero sol amount" };
+}
 
-  if (tokenAmount <= 0) {
-    return { ok: false, reason: "zero token amount" };
-  }
+if (solAmount < MIN_SOL_AMOUNT) {
+  return { ok: false, reason: "below min sol threshold" };
+}
+
+if (tokenAmount <= 0) {
+  return { ok: false, reason: "zero token amount" };
+}
 
   const inferredSide =
     tokenDelta.delta > 0 && walletSolDelta < 0

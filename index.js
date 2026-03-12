@@ -19,13 +19,17 @@ const PUMP_AMM_PROGRAM_ID =
 /**
  * Ingestion throughput controls
  */
-const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 25);
-const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 50000);
+const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 40);
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 100000);
 const SIGNATURE_MAX_AGE_MS = Number(
   process.env.SIGNATURE_MAX_AGE_MS || 30 * 60 * 1000
 );
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 20);
+
+/**
+ * Trade quality controls
+ */
 const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
 
 /**
@@ -89,6 +93,7 @@ const stats = {
   workerErrors: 0,
   rpcRetries: 0,
   emptyTx: 0,
+  belowMinSol: 0,
 };
 
 function logInfo(message, extra = {}) {
@@ -344,17 +349,18 @@ function parsePumpTrade(tx, signature) {
   const solAmount = Math.abs(walletSolDelta);
   const tokenAmount = Math.abs(tokenDelta.delta);
 
-if (solAmount <= 0) {
-  return { ok: false, reason: "zero sol amount" };
-}
+  if (solAmount <= 0) {
+    return { ok: false, reason: "zero sol amount" };
+  }
 
-if (solAmount < MIN_SOL_AMOUNT) {
-  return { ok: false, reason: "below min sol threshold" };
-}
+  if (solAmount < MIN_SOL_AMOUNT) {
+    stats.belowMinSol += 1;
+    return { ok: false, reason: "below min sol threshold" };
+  }
 
-if (tokenAmount <= 0) {
-  return { ok: false, reason: "zero token amount" };
-}
+  if (tokenAmount <= 0) {
+    return { ok: false, reason: "zero token amount" };
+  }
 
   const inferredSide =
     tokenDelta.delta > 0 && walletSolDelta < 0
@@ -655,6 +661,7 @@ function startQueueWorker() {
     maxTxPerSecond: MAX_TX_PER_SECOND,
     maxQueueSize: MAX_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
+    minSolAmount: MIN_SOL_AMOUNT,
   });
 }
 
@@ -682,6 +689,7 @@ function startQueueLogger() {
       droppedStale: stats.droppedStale,
       droppedDuplicate: stats.droppedDuplicate,
       skippedParsed: stats.skippedParsed,
+      belowMinSol: stats.belowMinSol,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
       emptyTx: stats.emptyTx,

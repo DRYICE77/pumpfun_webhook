@@ -24,8 +24,8 @@ const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 5000);
 const SIGNATURE_MAX_AGE_MS = Number(process.env.SIGNATURE_MAX_AGE_MS || 3 * 60 * 1000);
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 30000);
 
-const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${14f9a6df-8d4d-460e-b1d8-9010c4ead6e1}`;
+const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${14f9a6df-8d4d-460e-b1d8-9010c4ead6e1}`;
 
 if (!HELIUS_API_KEY) {
   console.error("Missing HELIUS_API_KEY");

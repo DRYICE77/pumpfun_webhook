@@ -1,53 +1,52 @@
-import pg from "pg";
+require("dotenv").config();
+const { Pool } = require("pg");
 
-const { Pool } = pg;
-
-const DATABASE_URL = process.env.DATABASE_URL;
-const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN;
-
-const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 10);
-const MAX_TWEETS_PER_TOKEN = Number(process.env.X_MAX_TWEETS_PER_TOKEN || 5);
-const SNAPSHOT_WINDOW_MINUTES = Number(process.env.X_SNAPSHOT_WINDOW_MINUTES || 5);
-const LOOP_SLEEP_MS = Number(process.env.X_LOOP_SLEEP_MS || 60000);
-
-if (!DATABASE_URL) {
-  console.error("[x-worker] Missing DATABASE_URL");
-  process.exit(1);
-}
-
-if (!APIFY_API_TOKEN) {
-  console.error("[x-worker] Missing APIFY_API_TOKEN");
-  process.exit(1);
-}
+// Node 18+ has global fetch. If needed, uncomment next line for older runtimes.
+// const fetch = require("node-fetch");
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.PGSSLMODE === "disable"
+      ? false
+      : { rejectUnauthorized: false },
 });
 
-function logInfo(message, extra = {}) {
-  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
-  console.log(`[x-worker] ${message}${payload}`);
+const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || "";
+const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 5);
+const MAX_TWEETS_PER_TOKEN = Number(process.env.X_MAX_TWEETS_PER_TOKEN || 5);
+const SNAPSHOT_WINDOW_MINUTES = Number(
+  process.env.X_SNAPSHOT_WINDOW_MINUTES || 5
+);
+const LOOP_SLEEP_MS = Number(process.env.X_LOOP_SLEEP_MS || 60000);
+const MIN_QUALITY_SCORE = Number(process.env.X_MIN_QUALITY_SCORE || 60);
+const MIN_VOLUME_5M = Number(process.env.X_MIN_VOLUME_5M || 200);
+const MIN_BUYS_5M = Number(process.env.X_MIN_BUYS_5M || 25);
+const RESCRAPE_COOLDOWN_MINUTES = Number(
+  process.env.X_RESCRAPE_COOLDOWN_MINUTES || 10
+);
+
+function logInfo(message, meta = {}) {
+  console.log(`[x-worker] ${message} ${JSON.stringify(meta)}`);
 }
 
-function logError(message, extra = {}) {
-  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
-  console.error(`[x-worker] ${message}${payload}`);
+function logError(message, meta = {}) {
+  console.error(`[x-worker] ${message} ${JSON.stringify(meta)}`);
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function ensureTables() {
+async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS x_raw_tweets (
       tweet_id TEXT PRIMARY KEY,
       author_id TEXT,
       text TEXT,
-      created_at TIMESTAMPTZ,
-      ingested_at TIMESTAMPTZ DEFAULT NOW(),
-      public_metrics JSONB
+      created_at TIMESTAMPTZ NOT NULL,
+      public_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_row_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -57,7 +56,7 @@ async function ensureTables() {
       token_id TEXT NOT NULL,
       tweet_id TEXT NOT NULL,
       match_value TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -73,7 +72,7 @@ async function ensureTables() {
       rts_total INTEGER NOT NULL DEFAULT 0,
       replies_total INTEGER NOT NULL DEFAULT 0,
       quotes_total INTEGER NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -91,27 +90,92 @@ async function ensureTables() {
     CREATE INDEX IF NOT EXISTS idx_token_social_snapshots_token_ts
     ON token_social_snapshots (token_id, ts DESC);
   `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_token_x_mentions_token_id
+    ON token_x_mentions (token_id);
+  `);
 }
 
-async function getRecentTokens(limit = TOKEN_LIMIT) {
+async function getSocialCandidates(limit = TOKEN_LIMIT) {
   const result = await pool.query(
     `
+    WITH scored_tokens AS (
+      SELECT
+        tt.token_id,
+        tt.token_address,
+        tt.volume_5m,
+        tt.buys_5m,
+        tt.sells_5m,
+        tt.last_updated,
+        ROUND(
+          LEAST(tt.volume_5m / 50.0, 40) +
+          LEAST(tt.buys_5m / 5.0, 40) +
+          CASE
+            WHEN tt.buys_5m = 0 THEN 0
+            WHEN tt.sells_5m = 0 THEN 20
+            WHEN tt.buys_5m::numeric / NULLIF(tt.sells_5m, 0) >= 3 THEN 20
+            WHEN tt.buys_5m::numeric / NULLIF(tt.sells_5m, 0) >= 2 THEN 15
+            WHEN tt.buys_5m > tt.sells_5m THEN 10
+            ELSE 0
+          END,
+          2
+        ) AS quality_score
+      FROM tracked_tokens tt
+      WHERE tt.token_address IS NOT NULL
+        AND tt.token_address <> ''
+    ),
+    last_scrape AS (
+      SELECT
+        token_id,
+        MAX(ts) AS last_snapshot_ts
+      FROM token_social_snapshots
+      GROUP BY token_id
+    )
     SELECT
-      token_id,
-      token_address
-    FROM tracked_tokens
-    WHERE token_address IS NOT NULL
-      AND token_address <> ''
-    ORDER BY last_updated DESC NULLS LAST
-    LIMIT $1
+      s.token_id,
+      s.token_address,
+      s.quality_score,
+      s.volume_5m,
+      s.buys_5m,
+      s.sells_5m,
+      s.last_updated,
+      ls.last_snapshot_ts
+    FROM scored_tokens s
+    LEFT JOIN last_scrape ls
+      ON ls.token_id = s.token_id
+    WHERE s.quality_score >= $1::numeric
+      AND s.volume_5m >= $2::numeric
+      AND s.buys_5m >= $3::int
+      AND (
+        ls.last_snapshot_ts IS NULL
+        OR ls.last_snapshot_ts < NOW() - make_interval(mins => $4::int)
+      )
+    ORDER BY
+      s.quality_score DESC,
+      s.volume_5m DESC,
+      s.buys_5m DESC,
+      s.last_updated DESC NULLS LAST
+    LIMIT $5::int
     `,
-    [limit]
+    [
+      MIN_QUALITY_SCORE,
+      MIN_VOLUME_5M,
+      MIN_BUYS_5M,
+      RESCRAPE_COOLDOWN_MINUTES,
+      limit,
+    ]
   );
 
   return result.rows;
 }
 
 async function searchTweetsForAddress(address) {
+  if (!APIFY_API_TOKEN) {
+    logError("Missing APIFY_API_TOKEN");
+    return { ok: false, tweets: [], reason: "missing_apify_token" };
+  }
+
   const url = `https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
 
   const body = {
@@ -120,13 +184,22 @@ async function searchTweetsForAddress(address) {
     sort: "Latest",
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    logError("Apify network error", {
+      address,
+      error: err.message,
+    });
+    return { ok: false, tweets: [], reason: "network_error" };
+  }
 
   const text = await res.text();
 
@@ -139,16 +212,27 @@ async function searchTweetsForAddress(address) {
       status: res.status,
       preview: text.slice(0, 300),
     });
-    return { ok: false, tweets: [] };
+    return { ok: false, tweets: [], reason: "bad_json" };
   }
 
   if (!res.ok) {
+    const preview = JSON.stringify(json).slice(0, 300);
+
+    if (res.status === 403) {
+      logError("Apify access denied or usage capped", {
+        address,
+        status: res.status,
+        preview,
+      });
+      return { ok: false, tweets: [], reason: "apify_403" };
+    }
+
     logError("Apify returned non-200 response", {
       address,
       status: res.status,
-      preview: JSON.stringify(json).slice(0, 300),
+      preview,
     });
-    return { ok: false, tweets: [] };
+    return { ok: false, tweets: [], reason: "apify_error" };
   }
 
   if (!Array.isArray(json)) {
@@ -157,7 +241,7 @@ async function searchTweetsForAddress(address) {
       payloadType: typeof json,
       preview: JSON.stringify(json).slice(0, 300),
     });
-    return { ok: false, tweets: [] };
+    return { ok: false, tweets: [], reason: "unexpected_payload" };
   }
 
   return { ok: true, tweets: json };
@@ -203,10 +287,10 @@ function extractCreatedAt(tweet) {
 
 function extractMetrics(tweet) {
   return {
-    like_count: tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0,
-    retweet_count: tweet.retweetCount ?? tweet.retweets ?? 0,
-    reply_count: tweet.replyCount ?? tweet.replies ?? 0,
-    quote_count: tweet.quoteCount ?? tweet.quotes ?? 0,
+    like_count: Number(tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0),
+    retweet_count: Number(tweet.retweetCount ?? tweet.retweets ?? 0),
+    reply_count: Number(tweet.replyCount ?? tweet.replies ?? 0),
+    quote_count: Number(tweet.quoteCount ?? tweet.quotes ?? 0),
   };
 }
 
@@ -230,7 +314,7 @@ async function insertRawTweet(tweet) {
       created_at,
       public_metrics
     )
-    VALUES ($1, $2, $3, $4, $5)
+    VALUES ($1, $2, $3, $4, $5::jsonb)
     ON CONFLICT (tweet_id) DO NOTHING
     RETURNING tweet_id
     `,
@@ -260,11 +344,11 @@ async function insertTokenMention(tokenId, tweetId, matchValue) {
       tweet_id,
       match_value
     )
-    VALUES ($1, $2, $3)
+    VALUES ($1::text, $2::text, $3::text)
     ON CONFLICT (token_id, tweet_id) DO NOTHING
     RETURNING id
     `,
-    [tokenId, tweetId, matchValue]
+    [String(tokenId), String(tweetId), matchValue ? String(matchValue) : null]
   );
 
   return { inserted: result.rowCount > 0 };
@@ -287,7 +371,7 @@ async function updateSocialSnapshots(windowMinutes = SNAPSHOT_WINDOW_MINUTES) {
     SELECT
       txm.token_id,
       NOW(),
-      $1,
+      $1::int,
       COUNT(*)::INT AS mentions_count,
       COUNT(DISTINCT x.author_id)::INT AS unique_authors,
       COALESCE(SUM((x.public_metrics->>'like_count')::INT), 0)::INT AS likes_total,
@@ -297,7 +381,7 @@ async function updateSocialSnapshots(windowMinutes = SNAPSHOT_WINDOW_MINUTES) {
     FROM token_x_mentions txm
     JOIN x_raw_tweets x
       ON x.tweet_id = txm.tweet_id
-    WHERE x.created_at > NOW() - ($1 || ' minutes')::INTERVAL
+    WHERE x.created_at > NOW() - make_interval(mins => $1::int)
     GROUP BY txm.token_id
     `,
     [windowMinutes]
@@ -324,6 +408,7 @@ async function processToken(token, index, total) {
   }
 
   const searchResult = await searchTweetsForAddress(address);
+
   if (!searchResult.ok) {
     return {
       ok: false,
@@ -332,7 +417,7 @@ async function processToken(token, index, total) {
       rawInserted: 0,
       mentionsInserted: 0,
       skippedNoId: 0,
-      reason: "apify_error",
+      reason: searchResult.reason || "apify_error",
     };
   }
 
@@ -353,13 +438,19 @@ async function processToken(token, index, total) {
         rawInserted += 1;
       }
 
-      const mentionResult = await insertTokenMention(tokenId, rawResult.tweetId, address);
+      const mentionResult = await insertTokenMention(
+        tokenId,
+        rawResult.tweetId,
+        address
+      );
+
       if (mentionResult.inserted) {
         mentionsInserted += 1;
       }
     } catch (err) {
       logError("Failed storing tweet", {
         tokenId,
+        address,
         error: err.message,
       });
     }
@@ -369,10 +460,15 @@ async function processToken(token, index, total) {
     index,
     total,
     tokenId,
+    address,
     tweetsFetched: searchResult.tweets.length,
     rawInserted,
     mentionsInserted,
     skippedNoId,
+    qualityScore: token.quality_score,
+    volume5m: token.volume_5m,
+    buys5m: token.buys_5m,
+    sells5m: token.sells_5m,
   });
 
   return {
@@ -388,11 +484,11 @@ async function processToken(token, index, total) {
 async function fetchMentionsCycle() {
   const startedAt = Date.now();
 
-  const tokens = await getRecentTokens(TOKEN_LIMIT);
-  logInfo("Loaded tracked tokens", { count: tokens.length });
+  const tokens = await getSocialCandidates(TOKEN_LIMIT);
+  logInfo("Loaded social candidates", { count: tokens.length });
 
   if (tokens.length === 0) {
-    logInfo("No tracked tokens found");
+    logInfo("No social candidates found");
     return;
   }
 
@@ -402,6 +498,7 @@ async function fetchMentionsCycle() {
   let totalRawInserted = 0;
   let totalMentionsInserted = 0;
   let totalSkippedNoId = 0;
+  let apify403Count = 0;
 
   for (let i = 0; i < tokens.length; i += 1) {
     try {
@@ -416,6 +513,11 @@ async function fetchMentionsCycle() {
         successCount += 1;
       } else {
         failureCount += 1;
+
+        if (result.reason === "apify_403") {
+          apify403Count += 1;
+        }
+
         logError("Token failed", {
           index: i + 1,
           total: tokens.length,
@@ -436,7 +538,14 @@ async function fetchMentionsCycle() {
     await sleep(1000);
   }
 
-  const snapshotsInserted = await updateSocialSnapshots(SNAPSHOT_WINDOW_MINUTES);
+  let snapshotsInserted = 0;
+  try {
+    snapshotsInserted = await updateSocialSnapshots(SNAPSHOT_WINDOW_MINUTES);
+  } catch (err) {
+    logError("Failed updating social snapshots", {
+      error: err.message,
+    });
+  }
 
   logInfo("Cycle complete", {
     durationSeconds: Math.round((Date.now() - startedAt) / 1000),
@@ -447,43 +556,53 @@ async function fetchMentionsCycle() {
     mentionsInserted: totalMentionsInserted,
     skippedNoId: totalSkippedNoId,
     snapshotsInserted,
+    apify403Count,
   });
 }
 
-async function mainLoop() {
-  logInfo("Continuous worker starting", {
-    tokenLimit: TOKEN_LIMIT,
-    maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
-    snapshotWindowMinutes: SNAPSHOT_WINDOW_MINUTES,
-    loopSleepMs: LOOP_SLEEP_MS,
-  });
-
-  await ensureTables();
-  logInfo("Tables ready");
-
-  while (true) {
-    try {
-      await fetchMentionsCycle();
-    } catch (err) {
-      logError("Cycle failed", { error: err.message });
-    }
-
-    logInfo("Sleeping before next cycle", {
-      sleepSeconds: Math.round(LOOP_SLEEP_MS / 1000),
+async function main() {
+  try {
+    await ensureSchema();
+    logInfo("X mentions worker started", {
+      tokenLimit: TOKEN_LIMIT,
+      maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
+      snapshotWindowMinutes: SNAPSHOT_WINDOW_MINUTES,
+      loopSleepMs: LOOP_SLEEP_MS,
+      minQualityScore: MIN_QUALITY_SCORE,
+      minVolume5m: MIN_VOLUME_5M,
+      minBuys5m: MIN_BUYS_5M,
+      rescrapeCooldownMinutes: RESCRAPE_COOLDOWN_MINUTES,
     });
 
-    await sleep(LOOP_SLEEP_MS);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        await fetchMentionsCycle();
+      } catch (err) {
+        logError("Cycle failed", { error: err.message });
+      }
+
+      logInfo("Sleeping before next cycle", {
+        sleepSeconds: Math.round(LOOP_SLEEP_MS / 1000),
+      });
+      await sleep(LOOP_SLEEP_MS);
+    }
+  } catch (err) {
+    logError("Fatal worker error", { error: err.message });
+    process.exit(1);
   }
 }
 
-mainLoop().catch(async (err) => {
-  logError("Fatal worker error", { error: err.message });
-
-  try {
-    await pool.end();
-  } catch (_) {
-    // ignore
-  }
-
-  process.exit(1);
+process.on("SIGINT", async () => {
+  logInfo("SIGINT received, closing pool");
+  await pool.end();
+  process.exit(0);
 });
+
+process.on("SIGTERM", async () => {
+  logInfo("SIGTERM received, closing pool");
+  await pool.end();
+  process.exit(0);
+});
+
+main();

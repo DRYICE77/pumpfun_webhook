@@ -685,12 +685,23 @@ function startQueueWorker() {
 function stopQueueWorker() {
   workerRunning = false;
 }
+let lastQueued = 0;
+let lastDequeued = 0;
+let lastInserted = 0;
+let lastLogTime = Date.now();
 
 function startQueueLogger() {
   if (queueLogTimer) return;
 
   queueLogTimer = setInterval(() => {
     const now = Date.now();
+
+    const seconds = (now - lastLogTime) / 1000;
+
+    const incomingRate = (stats.queued - lastQueued) / seconds;
+    const drainRate = (stats.dequeued - lastDequeued) / seconds;
+    const insertRate = (stats.insertedTrades - lastInserted) / seconds;
+
     const oldestAgeMs = signatureQueue.length
       ? now - signatureQueue[0].enqueuedAt
       : 0;
@@ -698,10 +709,16 @@ function startQueueLogger() {
     logInfo("Queue stats", {
       queueSize: signatureQueue.length,
       oldestAgeMs,
+
       queued: stats.queued,
       dequeued: stats.dequeued,
       processed: stats.processed,
       insertedTrades: stats.insertedTrades,
+
+      incomingPerSec: incomingRate.toFixed(2),
+      drainedPerSec: drainRate.toFixed(2),
+      insertedPerSec: insertRate.toFixed(2),
+
       droppedQueueFull: stats.droppedQueueFull,
       droppedStale: stats.droppedStale,
       droppedDuplicate: stats.droppedDuplicate,
@@ -713,9 +730,14 @@ function startQueueLogger() {
       emptyTx: stats.emptyTx,
       rpcRetries: stats.rpcRetries,
     });
+
+    lastQueued = stats.queued;
+    lastDequeued = stats.dequeued;
+    lastInserted = stats.insertedTrades;
+    lastLogTime = now;
+
   }, QUEUE_LOG_EVERY_MS);
 }
-
 function stopQueueLogger() {
   if (queueLogTimer) {
     clearInterval(queueLogTimer);

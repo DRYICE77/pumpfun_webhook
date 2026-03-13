@@ -23,9 +23,9 @@ const SIGNATURE_MAX_AGE_MS = Number(
 );
 
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 40);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 30);
 
-const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 2.5 );
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.36 );
 
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
@@ -74,18 +74,17 @@ const stats = {
   processed: 0,
   insertedTrades: 0,
   droppedQueueFull: 0,
-  droppedStale: 0,
   droppedDuplicate: 0,
+  droppedBackpressure: 0,
   skippedParsed: 0,
+  skippedStaleWs: 0,
+  skippedNoRelevantLog: 0,
+  belowMinSol: 0,
+  sideMismatch: 0,
   txFetchErrors: 0,
   workerErrors: 0,
-  rpcRetries: 0,
   emptyTx: 0,
-  belowMinSol: 0,
-  skippedNoRelevantLog: 0,
-  skippedNoBuySellLog: 0,
-  skippedNoPumpInstructionHint: 0,
-  sideMismatch: 0,
+  rpcRetries: 0
 };
 
 function logInfo(message, extra = {}) {
@@ -205,7 +204,12 @@ function txTouchesPumpAmm(tx) {
 
   return false;
 }
+function isFreshEnough(blockTime) {
+  if (!blockTime) return true;
 
+  const eventAgeMs = Date.now() - (blockTime * 1000);
+  return eventAgeMs <= 30 * 1000; // 30s
+}
 function looksRelevantFromLogs(value) {
   const logs = value?.logs || [];
   if (!Array.isArray(logs) || !logs.length) return false;
@@ -842,6 +846,11 @@ function connect() {
 
     const signature = value.signature;
     if (!signature) return;
+
+    if (!isFreshEnough(value.blockTime)) {
+  stats.skippedStaleWs = (stats.skippedStaleWs || 0) + 1;
+  return;
+}
 
     // pre-queue noise filter (Buy/Sell logs only)
     if (!looksRelevantFromLogs(value)) {

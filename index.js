@@ -211,9 +211,15 @@ function looksRelevantFromLogs(value) {
   if (!Array.isArray(logs) || !logs.length) return false;
 
   return logs.some(
-    (l) => l.includes("Instruction: Buy") || l.includes("Instruction: Sell")
+    l =>
+      l.includes("Instruction: Buy") ||
+      l.includes("Instruction: Sell")
   );
 }
+
+
+
+enqueueSignature(signature);
 function getSideFromLogs(tx) {
   const logs = getLogMessages(tx);
 
@@ -787,40 +793,48 @@ function connect() {
   });
 
   socket.on("message", (data) => {
-    if (socketId !== currentSocketId) return;
+  if (socketId !== currentSocketId) return;
 
-    try {
-      const msg = JSON.parse(data.toString());
+  try {
+    const msg = JSON.parse(data.toString());
 
-      if (typeof msg.result === "number" && msg.id === 1) {
-        logInfo("Subscribed successfully", {
-          socketId,
-          subscriptionId: msg.result,
-        });
-        return;
-      }
-
-      const value = msg?.params?.result?.value;
-      if (!value || value.err) return;
-
-      // pre-queue noise filter
-      if (!looksRelevantFromLogs(value)) {
-        stats.skippedNoPumpLog += 1;
-        return;
-      }
-
-      enqueueSignature(
-        value.signature,
-        msg?.params?.result?.context?.slot || null,
-        value?.blockTime || null
-      );
-    } catch (err) {
-      logError("WS message parse error", {
+    // subscription confirmation
+    if (typeof msg.result === "number" && msg.id === 1) {
+      logInfo("Subscribed successfully", {
         socketId,
-        error: err.message,
+        subscriptionId: msg.result,
       });
+      return;
     }
-  });
+
+    const result = msg?.params?.result;
+    const value = result?.value;
+    const context = result?.context;
+
+    if (!value || value.err) return;
+
+    const signature = value.signature;
+    if (!signature) return;
+
+    // pre-queue noise filter (Buy/Sell logs only)
+    if (!looksRelevantFromLogs(value)) {
+      stats.skippedNoPumpLog = (stats.skippedNoPumpLog || 0) + 1;
+      return;
+    }
+
+    enqueueSignature(
+      signature,
+      context?.slot || null,
+      value.blockTime || null
+    );
+
+  } catch (err) {
+    logError("WS message parse error", {
+      socketId,
+      error: err.message,
+    });
+  }
+});
 
   socket.on("error", (err) => {
     if (socketId !== currentSocketId) return;

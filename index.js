@@ -83,7 +83,7 @@ const stats = {
   rpcRetries: 0,
   emptyTx: 0,
   belowMinSol: 0,
-  skippedNoPumpLog: 0,
+  skippedNoRelevantLog: 0,
   skippedNoBuySellLog: 0,
   skippedNoPumpInstructionHint: 0,
   sideMismatch: 0,
@@ -211,15 +211,24 @@ function looksRelevantFromLogs(value) {
   const logs = value?.logs || [];
   if (!Array.isArray(logs) || !logs.length) return false;
 
-  const hasBuySell = logs.some(
-    (l) => l.includes("Instruction: Buy") || l.includes("Instruction: Sell")
-  );
+  let hasBuySell = false;
+  let hasPumpProgram = false;
 
-  const hasPumpProgram = logs.some(
-    (l) => l.includes(PUMP_AMM_PROGRAM_ID)
-  );
+  for (const l of logs) {
+    if (!hasBuySell && (l.includes("Instruction: Buy") || l.includes("Instruction: Sell"))) {
+      hasBuySell = true;
+    }
 
-  return hasBuySell && hasPumpProgram;
+    if (!hasPumpProgram && l.includes(PUMP_AMM_PROGRAM_ID)) {
+      hasPumpProgram = true;
+    }
+
+    if (hasBuySell && hasPumpProgram) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 
@@ -823,7 +832,7 @@ function connect() {
 
     // pre-queue noise filter (Buy/Sell logs only)
     if (!looksRelevantFromLogs(value)) {
-      stats.skippedNoPumpLog = (stats.skippedNoPumpLog || 0) + 1;
+      stats.skippedNoRelevantLog = (stats.skippedNoRelevantLog || 0) + 1;
       return;
     }
 

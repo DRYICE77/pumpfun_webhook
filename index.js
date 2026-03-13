@@ -16,17 +16,16 @@ const PUMP_AMM_PROGRAM_ID =
   process.env.PUMP_AMM_PROGRAM_ID ||
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 26);
-const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 100000);
+const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 70);
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 250000);
 const SIGNATURE_MAX_AGE_MS = Number(
-  process.env.SIGNATURE_MAX_AGE_MS || 120 * 1000
+  process.env.SIGNATURE_MAX_AGE_MS || 60 * 1000
 );
 
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 12);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 40);
 
-// raised from 0.1 -> 0.25
-const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.5);
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.35);
 
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);

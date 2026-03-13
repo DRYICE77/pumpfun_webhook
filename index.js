@@ -219,7 +219,7 @@ function looksRelevantFromLogs(value) {
 
 
 
-enqueueSignature(signature);
+
 function getSideFromLogs(tx) {
   const logs = getLogMessages(tx);
 

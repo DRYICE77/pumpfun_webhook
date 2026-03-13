@@ -584,6 +584,20 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
     return;
   }
 
+  const now = Date.now();
+
+  // If queue is already very backed up, prefer fresh flow over completeness.
+  if (signatureQueue.length > 5000) {
+    const oldestAgeMs = now - signatureQueue[0].enqueuedAt;
+
+    // Once backlog is meaningfully stale, start dropping new arrivals
+    // instead of feeding an already-lagging queue.
+    if (oldestAgeMs > 60 * 1000) {
+      stats.droppedBackpressure = (stats.droppedBackpressure || 0) + 1;
+      return;
+    }
+  }
+
   if (signatureQueue.length >= MAX_QUEUE_SIZE) {
     stats.droppedQueueFull += 1;
     return;
@@ -594,12 +608,11 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
     signature,
     slot,
     blockTime,
-    enqueuedAt: Date.now(),
+    enqueuedAt: now,
   });
 
   stats.queued += 1;
 }
-
 async function processQueuedSignature(item) {
   const { signature, slot, blockTime, enqueuedAt } = item;
 
@@ -697,6 +710,7 @@ function startQueueWorker() {
     maxTxPerSecond: MAX_TX_PER_SECOND,
     maxQueueSize: MAX_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
+    droppedBackpressure: stats.droppedBackpressure,
     minSolAmount: MIN_SOL_AMOUNT,
   });
 }

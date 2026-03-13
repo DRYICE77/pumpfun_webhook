@@ -19,7 +19,8 @@ const PUMP_AMM_PROGRAM_ID =
 const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 26);
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 100000);
 const SIGNATURE_MAX_AGE_MS = Number(
-  process.env.SIGNATURE_MAX_AGE_MS || 30 * 60 * 1000
+  process.env.SIGNATURE_MAX_AGE_MS || 60 * 1000
+);
 );
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 12);

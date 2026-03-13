@@ -211,11 +211,15 @@ function looksRelevantFromLogs(value) {
   const logs = value?.logs || [];
   if (!Array.isArray(logs) || !logs.length) return false;
 
-  return logs.some(
-    l =>
-      l.includes("Instruction: Buy") ||
-      l.includes("Instruction: Sell")
+  const hasBuySell = logs.some(
+    (l) => l.includes("Instruction: Buy") || l.includes("Instruction: Sell")
   );
+
+  const hasPumpProgram = logs.some(
+    (l) => l.includes(PUMP_AMM_PROGRAM_ID)
+  );
+
+  return hasBuySell && hasPumpProgram;
 }
 
 

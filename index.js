@@ -25,7 +25,7 @@ const SIGNATURE_MAX_AGE_MS = Number(
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 40);
 
-const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.35);
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 2.5 );
 
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);

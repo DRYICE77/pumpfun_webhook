@@ -25,10 +25,31 @@ const SIGNATURE_MAX_AGE_MS = Number(
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 30);
 
-const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.36 );
+const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.36);
 
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
+
+// -----------------------------
+// Regime / schedule controls
+// -----------------------------
+const MANUAL_RUN_MODE = String(process.env.MANUAL_RUN_MODE || "AUTO").toUpperCase(); // AUTO | OFF | LIMITED | FULL
+const DEFAULT_REGIME_SCORE = Number(process.env.DEFAULT_REGIME_SCORE || 50);
+
+const REGIME_MIN_LIMITED = Number(process.env.REGIME_MIN_LIMITED || 55);
+const REGIME_MIN_FULL = Number(process.env.REGIME_MIN_FULL || 65);
+
+const ET_PAUSE_START_HOUR = Number(process.env.ET_PAUSE_START_HOUR || 3);   // 3am ET
+const ET_PAUSE_END_HOUR = Number(process.env.ET_PAUSE_END_HOUR || 10);      // 10am ET
+const MODE_CHECK_INTERVAL_MS = Number(process.env.MODE_CHECK_INTERVAL_MS || 60 * 1000);
+
+const LIMITED_SAMPLE_RATE = Number(process.env.LIMITED_SAMPLE_RATE || 0.25); // 25% of signatures in LIMITED mode
+const LIMITED_MIN_SOL_AMOUNT = Number(process.env.LIMITED_MIN_SOL_AMOUNT || 0.75);
+
+const CONTROL_QUERY_ENABLED =
+  String(process.env.CONTROL_QUERY_ENABLED || "false") === "true";
+
+const CONTROL_TABLE = process.env.CONTROL_TABLE || "system_control";
 
 const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -55,6 +76,11 @@ let retryCount = 0;
 let intentionalShutdown = false;
 let currentSocketId = 0;
 let last429At = null;
+let modeCheckTimer = null;
+
+let currentRunMode = "BOOT";
+let currentRegimeScore = DEFAULT_REGIME_SCORE;
+let currentControlSource = "default";
 
 const seenSignatures = new Set();
 const SEEN_SIGNATURE_LIMIT = 100000;
@@ -76,15 +102,20 @@ const stats = {
   droppedQueueFull: 0,
   droppedDuplicate: 0,
   droppedBackpressure: 0,
+  droppedStale: 0,
   skippedParsed: 0,
   skippedStaleWs: 0,
   skippedNoRelevantLog: 0,
+  skippedLimitedSample: 0,
+  skippedOffMode: 0,
+  skippedLimitedSmallTrade: 0,
   belowMinSol: 0,
   sideMismatch: 0,
   txFetchErrors: 0,
   workerErrors: 0,
   emptyTx: 0,
-  rpcRetries: 0
+  rpcRetries: 0,
+  regimeModeChanges: 0
 };
 
 function logInfo(message, extra = {}) {
@@ -118,6 +149,217 @@ function backoffDelay(attempt, wasRateLimited = false) {
     return Math.min(60000 * 2 ** Math.min(attempt, 4), 600000);
   }
   return Math.min(2000 * 2 ** Math.min(attempt, 5), 60000);
+}
+
+function isValidIdentifier(name) {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
+}
+
+function getEasternHour() {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    hour12: false,
+  });
+
+  return Number(formatter.format(new Date()));
+}
+
+function isWithinEtPauseWindow() {
+  const hour = getEasternHour();
+
+  if (ET_PAUSE_START_HOUR === ET_PAUSE_END_HOUR) return false;
+
+  if (ET_PAUSE_START_HOUR < ET_PAUSE_END_HOUR) {
+    return hour >= ET_PAUSE_START_HOUR && hour < ET_PAUSE_END_HOUR;
+  }
+
+  // Handles wraparound windows like 22 -> 6
+  return hour >= ET_PAUSE_START_HOUR || hour < ET_PAUSE_END_HOUR;
+}
+
+function normalizeMode(value) {
+  const mode = String(value || "").toUpperCase();
+  if (mode === "OFF" || mode === "LIMITED" || mode === "FULL" || mode === "AUTO") {
+    return mode;
+  }
+  return "AUTO";
+}
+
+function resolveRunMode({ manualOverride = "AUTO", heliusEnabled = true, regimeScore = DEFAULT_REGIME_SCORE }) {
+  const normalizedManual = normalizeMode(manualOverride);
+
+  if (normalizedManual !== "AUTO") {
+    return normalizedManual;
+  }
+
+  if (!heliusEnabled) {
+    return "OFF";
+  }
+
+  if (isWithinEtPauseWindow()) {
+    return "OFF";
+  }
+
+  if (regimeScore < REGIME_MIN_LIMITED) {
+    return "OFF";
+  }
+
+  if (regimeScore < REGIME_MIN_FULL) {
+    return "LIMITED";
+  }
+
+  return "FULL";
+}
+
+function signatureSample(signature, sampleRate) {
+  if (sampleRate >= 1) return true;
+  if (sampleRate <= 0) return false;
+
+  let hash = 0;
+  for (let i = 0; i < signature.length; i += 1) {
+    hash = (hash * 31 + signature.charCodeAt(i)) >>> 0;
+  }
+
+  const bucket = hash % 10000;
+  return bucket < Math.floor(sampleRate * 10000);
+}
+
+function purgeQueue(reason = "unknown") {
+  const dropped = signatureQueue.length;
+  signatureQueue.length = 0;
+  queuedSignatures.clear();
+
+  if (dropped > 0) {
+    logInfo("Purged queue", { reason, dropped });
+  }
+}
+
+function disconnectWebsocket(reason = "unknown") {
+  stopPing();
+
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  if (ws) {
+    logInfo("Disconnecting websocket", { reason });
+    cleanupSocket(ws);
+    ws = null;
+  }
+}
+
+async function fetchRunControl() {
+  // Manual mode wins immediately.
+  if (MANUAL_RUN_MODE !== "AUTO") {
+    return {
+      manualOverride: MANUAL_RUN_MODE,
+      heliusEnabled: true,
+      regimeScore: DEFAULT_REGIME_SCORE,
+      source: "env_manual",
+    };
+  }
+
+  if (!CONTROL_QUERY_ENABLED) {
+    return {
+      manualOverride: "AUTO",
+      heliusEnabled: true,
+      regimeScore: DEFAULT_REGIME_SCORE,
+      source: "env_default",
+    };
+  }
+
+  if (!isValidIdentifier(CONTROL_TABLE)) {
+    throw new Error(`Invalid CONTROL_TABLE: ${CONTROL_TABLE}`);
+  }
+
+  const sql = `
+    SELECT
+      COALESCE(manual_override, 'AUTO') AS manual_override,
+      COALESCE(helius_enabled, true) AS helius_enabled,
+      COALESCE(regime_score, $1) AS regime_score
+    FROM ${CONTROL_TABLE}
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `;
+
+  const result = await pool.query(sql, [DEFAULT_REGIME_SCORE]);
+
+  if (!result.rows.length) {
+    return {
+      manualOverride: "AUTO",
+      heliusEnabled: true,
+      regimeScore: DEFAULT_REGIME_SCORE,
+      source: "db_empty_fallback",
+    };
+  }
+
+  const row = result.rows[0];
+
+  return {
+    manualOverride: normalizeMode(row.manual_override),
+    heliusEnabled: Boolean(row.helius_enabled),
+    regimeScore: Number(row.regime_score ?? DEFAULT_REGIME_SCORE),
+    source: "db_control",
+  };
+}
+
+async function refreshRunMode() {
+  try {
+    const control = await fetchRunControl();
+    const newMode = resolveRunMode(control);
+
+    const modeChanged = newMode !== currentRunMode;
+    const regimeChanged = Number(control.regimeScore) !== Number(currentRegimeScore);
+
+    currentRunMode = newMode;
+    currentRegimeScore = Number(control.regimeScore);
+    currentControlSource = control.source;
+
+    if (modeChanged || regimeChanged) {
+      stats.regimeModeChanges += 1;
+
+      logInfo("Run mode updated", {
+        runMode: currentRunMode,
+        regimeScore: currentRegimeScore,
+        source: currentControlSource,
+        etHour: getEasternHour(),
+      });
+    }
+
+    if (currentRunMode === "OFF") {
+      disconnectWebsocket("run_mode_off");
+      purgeQueue("run_mode_off");
+      return;
+    }
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      connect();
+    }
+  } catch (err) {
+    logError("Failed refreshing run mode", { error: err.message });
+
+    // Fail safe: if we cannot verify controls, do not force reconnect here.
+    // Keep existing mode.
+  }
+}
+
+function startModeChecker() {
+  if (modeCheckTimer) return;
+
+  modeCheckTimer = setInterval(() => {
+    refreshRunMode().catch((err) =>
+      logError("Mode checker error", { error: err.message })
+    );
+  }, MODE_CHECK_INTERVAL_MS);
+}
+
+function stopModeChecker() {
+  if (modeCheckTimer) {
+    clearInterval(modeCheckTimer);
+    modeCheckTimer = null;
+  }
 }
 
 async function heliusRpc(method, params) {
@@ -190,26 +432,29 @@ function txTouchesPumpAmm(tx) {
 
   const instructions = tx?.transaction?.message?.instructions || [];
   for (const ix of instructions) {
-    const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+    const pid =
+      typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
     if (pid === PUMP_AMM_PROGRAM_ID) return true;
   }
 
   const inner = tx?.meta?.innerInstructions || [];
   for (const group of inner) {
     for (const ix of group.instructions || []) {
-      const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+      const pid =
+        typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
       if (pid === PUMP_AMM_PROGRAM_ID) return true;
     }
   }
 
   return false;
 }
+
 function isFreshEnough(blockTime) {
   if (!blockTime) return true;
-
-  const eventAgeMs = Date.now() - (blockTime * 1000);
-  return eventAgeMs <= 30 * 1000; // 30s
+  const eventAgeMs = Date.now() - blockTime * 1000;
+  return eventAgeMs <= 30 * 1000;
 }
+
 function looksRelevantFromLogs(value) {
   const logs = value?.logs || [];
   if (!Array.isArray(logs) || !logs.length) return false;
@@ -233,9 +478,6 @@ function looksRelevantFromLogs(value) {
 
   return false;
 }
-
-
-
 
 function getSideFromLogs(tx) {
   const logs = getLogMessages(tx);
@@ -317,8 +559,6 @@ function buildTokenMap(rows) {
   return map;
 }
 
-// More deterministic: prefer token deltas owned by signer wallet,
-// then side-aligned delta, then biggest abs delta.
 function findWalletTokenDelta(tx, walletAddress, expectedSide = null) {
   const preRows = parseTokenBalances(tx?.meta?.preTokenBalances || []);
   const postRows = parseTokenBalances(tx?.meta?.postTokenBalances || []);
@@ -344,10 +584,7 @@ function findWalletTokenDelta(tx, walletAddress, expectedSide = null) {
     if (mint === WSOL_MINT) continue;
     if (delta === 0) continue;
 
-    const side =
-      delta > 0 ? "buy" :
-      delta < 0 ? "sell" :
-      null;
+    const side = delta > 0 ? "buy" : delta < 0 ? "sell" : null;
 
     candidates.push({
       owner,
@@ -430,8 +667,6 @@ function parsePumpTrade(tx, signature) {
       ? "sell"
       : null;
 
-  // Important: don't hard reject here. Keep the log-side trade,
-  // but mark mismatch for inspection.
   const finalSide = inferredSide || sideFromLogs;
   const sideMismatch = inferredSide && sideFromLogs !== inferredSide;
 
@@ -600,6 +835,16 @@ async function insertWalletTrade(trade) {
 function enqueueSignature(signature, slot = null, blockTime = null) {
   if (!signature) return;
 
+  if (currentRunMode === "OFF") {
+    stats.skippedOffMode += 1;
+    return;
+  }
+
+  if (currentRunMode === "LIMITED" && !signatureSample(signature, LIMITED_SAMPLE_RATE)) {
+    stats.skippedLimitedSample += 1;
+    return;
+  }
+
   if (alreadySeen(signature) || queuedSignatures.has(signature)) {
     stats.droppedDuplicate += 1;
     return;
@@ -607,14 +852,11 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
 
   const now = Date.now();
 
-  // If queue is already very backed up, prefer fresh flow over completeness.
   if (signatureQueue.length > 5000) {
     const oldestAgeMs = now - signatureQueue[0].enqueuedAt;
 
-    // Once backlog is meaningfully stale, start dropping new arrivals
-    // instead of feeding an already-lagging queue.
     if (oldestAgeMs > 60 * 1000) {
-      stats.droppedBackpressure = (stats.droppedBackpressure || 0) + 1;
+      stats.droppedBackpressure += 1;
       return;
     }
   }
@@ -634,6 +876,7 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
 
   stats.queued += 1;
 }
+
 async function processQueuedSignature(item) {
   const { signature, slot, blockTime, enqueuedAt } = item;
 
@@ -641,6 +884,11 @@ async function processQueuedSignature(item) {
   stats.dequeued += 1;
 
   if (!signature || alreadySeen(signature)) return;
+
+  if (currentRunMode === "OFF") {
+    stats.skippedOffMode += 1;
+    return;
+  }
 
   if (Date.now() - enqueuedAt > SIGNATURE_MAX_AGE_MS) {
     stats.droppedStale += 1;
@@ -670,6 +918,11 @@ async function processQueuedSignature(item) {
       return;
     }
 
+    if (currentRunMode === "LIMITED" && parsed.trade.sol_amount < LIMITED_MIN_SOL_AMOUNT) {
+      stats.skippedLimitedSmallTrade += 1;
+      return;
+    }
+
     await insertWalletTrade(parsed.trade);
     stats.processed += 1;
   } catch (err) {
@@ -688,6 +941,11 @@ async function queueWorkerLoop(workerId) {
   );
 
   while (workerRunning) {
+    if (currentRunMode === "OFF") {
+      await sleep(500);
+      continue;
+    }
+
     const item = signatureQueue.shift();
 
     if (!item) {
@@ -731,14 +989,16 @@ function startQueueWorker() {
     maxTxPerSecond: MAX_TX_PER_SECOND,
     maxQueueSize: MAX_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
-    droppedBackpressure: stats.droppedBackpressure,
     minSolAmount: MIN_SOL_AMOUNT,
+    limitedMinSolAmount: LIMITED_MIN_SOL_AMOUNT,
+    limitedSampleRate: LIMITED_SAMPLE_RATE,
   });
 }
 
 function stopQueueWorker() {
   workerRunning = false;
 }
+
 let lastQueued = 0;
 let lastDequeued = 0;
 let lastInserted = 0;
@@ -761,6 +1021,11 @@ function startQueueLogger() {
       : 0;
 
     logInfo("Queue stats", {
+      runMode: currentRunMode,
+      regimeScore: currentRegimeScore,
+      controlSource: currentControlSource,
+      etHour: getEasternHour(),
+
       queueSize: signatureQueue.length,
       oldestAgeMs,
 
@@ -776,22 +1041,29 @@ function startQueueLogger() {
       droppedQueueFull: stats.droppedQueueFull,
       droppedStale: stats.droppedStale,
       droppedDuplicate: stats.droppedDuplicate,
+      droppedBackpressure: stats.droppedBackpressure,
       skippedParsed: stats.skippedParsed,
+      skippedStaleWs: stats.skippedStaleWs,
+      skippedNoRelevantLog: stats.skippedNoRelevantLog,
+      skippedLimitedSample: stats.skippedLimitedSample,
+      skippedOffMode: stats.skippedOffMode,
+      skippedLimitedSmallTrade: stats.skippedLimitedSmallTrade,
       belowMinSol: stats.belowMinSol,
       sideMismatch: stats.sideMismatch,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
       emptyTx: stats.emptyTx,
       rpcRetries: stats.rpcRetries,
+      regimeModeChanges: stats.regimeModeChanges,
     });
 
     lastQueued = stats.queued;
     lastDequeued = stats.dequeued;
     lastInserted = stats.insertedTrades;
     lastLogTime = now;
-
   }, QUEUE_LOG_EVERY_MS);
 }
+
 function stopQueueLogger() {
   if (queueLogTimer) {
     clearInterval(queueLogTimer);
@@ -811,11 +1083,16 @@ function subscribe(socket) {
   };
 
   socket.send(JSON.stringify(request));
-  logInfo("Sent logsSubscribe");
+  logInfo("Sent logsSubscribe", { runMode: currentRunMode });
 }
 
 function connect() {
   if (intentionalShutdown) return;
+  if (currentRunMode === "OFF") return;
+
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
 
   currentSocketId += 1;
   const socketId = currentSocketId;
@@ -824,6 +1101,8 @@ function connect() {
 
   logInfo("Connecting websocket", {
     socketId,
+    runMode: currentRunMode,
+    regimeScore: currentRegimeScore,
     url: "wss://mainnet.helius-rpc.com/?api-key=***",
   });
 
@@ -833,61 +1112,65 @@ function connect() {
       return;
     }
 
+    if (currentRunMode === "OFF") {
+      cleanupSocket(socket);
+      return;
+    }
+
     retryCount = 0;
     last429At = null;
-    logInfo("WebSocket opened", { socketId });
+    logInfo("WebSocket opened", { socketId, runMode: currentRunMode });
     subscribe(socket);
     startPing(socketId);
   });
 
   socket.on("message", (data) => {
-  if (socketId !== currentSocketId) return;
+    if (socketId !== currentSocketId) return;
+    if (currentRunMode === "OFF") return;
 
-  try {
-    const msg = JSON.parse(data.toString());
+    try {
+      const msg = JSON.parse(data.toString());
 
-    // subscription confirmation
-    if (typeof msg.result === "number" && msg.id === 1) {
-      logInfo("Subscribed successfully", {
+      if (typeof msg.result === "number" && msg.id === 1) {
+        logInfo("Subscribed successfully", {
+          socketId,
+          subscriptionId: msg.result,
+          runMode: currentRunMode,
+        });
+        return;
+      }
+
+      const result = msg?.params?.result;
+      const value = result?.value;
+      const context = result?.context;
+
+      if (!value || value.err) return;
+
+      const signature = value.signature;
+      if (!signature) return;
+
+      if (!isFreshEnough(value.blockTime)) {
+        stats.skippedStaleWs += 1;
+        return;
+      }
+
+      if (!looksRelevantFromLogs(value)) {
+        stats.skippedNoRelevantLog += 1;
+        return;
+      }
+
+      enqueueSignature(
+        signature,
+        context?.slot || null,
+        value.blockTime || null
+      );
+    } catch (err) {
+      logError("WS message parse error", {
         socketId,
-        subscriptionId: msg.result,
+        error: err.message,
       });
-      return;
     }
-
-    const result = msg?.params?.result;
-    const value = result?.value;
-    const context = result?.context;
-
-    if (!value || value.err) return;
-
-    const signature = value.signature;
-    if (!signature) return;
-
-    if (!isFreshEnough(value.blockTime)) {
-  stats.skippedStaleWs = (stats.skippedStaleWs || 0) + 1;
-  return;
-}
-
-    // pre-queue noise filter (Buy/Sell logs only)
-    if (!looksRelevantFromLogs(value)) {
-      stats.skippedNoRelevantLog = (stats.skippedNoRelevantLog || 0) + 1;
-      return;
-    }
-
-    enqueueSignature(
-      signature,
-      context?.slot || null,
-      value.blockTime || null
-    );
-
-  } catch (err) {
-    logError("WS message parse error", {
-      socketId,
-      error: err.message,
-    });
-  }
-});
+  });
 
   socket.on("error", (err) => {
     if (socketId !== currentSocketId) return;
@@ -903,6 +1186,7 @@ function connect() {
       socketId,
       error: message,
       wasRateLimited,
+      runMode: currentRunMode,
     });
   });
 
@@ -923,9 +1207,16 @@ function connect() {
       code,
       reason,
       wasRateLimited,
+      runMode: currentRunMode,
     });
 
     cleanupSocket(socket);
+
+    // If mode is OFF now, do not reconnect.
+    if (currentRunMode === "OFF") {
+      return;
+    }
+
     scheduleReconnect("socket_closed", wasRateLimited);
   });
 }
@@ -952,6 +1243,7 @@ function stopPing() {
 
 function scheduleReconnect(reason = "unknown", wasRateLimited = false) {
   if (intentionalShutdown) return;
+  if (currentRunMode === "OFF") return;
   if (reconnectTimeout) return;
 
   const delay = backoffDelay(retryCount, wasRateLimited);
@@ -961,6 +1253,7 @@ function scheduleReconnect(reason = "unknown", wasRateLimited = false) {
     retryCount,
     delayMs: delay,
     wasRateLimited,
+    runMode: currentRunMode,
   });
 
   reconnectTimeout = setTimeout(() => {
@@ -1000,6 +1293,11 @@ http
             dbTime: db.rows[0].now,
             queueSize: signatureQueue.length,
             workerRunning,
+            runMode: currentRunMode,
+            regimeScore: currentRegimeScore,
+            controlSource: currentControlSource,
+            etHour: getEasternHour(),
+            inEtPauseWindow: isWithinEtPauseWindow(),
             stats,
           })
         );
@@ -1007,6 +1305,20 @@ http
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: err.message }));
       }
+      return;
+    }
+
+    if (req.url === "/mode") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          runMode: currentRunMode,
+          regimeScore: currentRegimeScore,
+          controlSource: currentControlSource,
+          etHour: getEasternHour(),
+          inEtPauseWindow: isWithinEtPauseWindow(),
+        })
+      );
       return;
     }
 
@@ -1035,7 +1347,18 @@ async function boot() {
 
     startQueueWorker();
     startQueueLogger();
-    connect();
+
+    await refreshRunMode();
+    startModeChecker();
+
+    if (currentRunMode !== "OFF") {
+      connect();
+    } else {
+      logInfo("Booted in OFF mode", {
+        regimeScore: currentRegimeScore,
+        etHour: getEasternHour(),
+      });
+    }
   } catch (err) {
     logError("Boot failed", { error: err.message });
     process.exit(1);
@@ -1052,6 +1375,7 @@ async function shutdown() {
   stopPing();
   stopQueueWorker();
   stopQueueLogger();
+  stopModeChecker();
 
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);

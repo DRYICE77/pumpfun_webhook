@@ -239,9 +239,26 @@ function looksRelevantFromLogs(value) {
 
 function getSideFromLogs(tx) {
   const logs = getLogMessages(tx);
+  if (!Array.isArray(logs) || logs.length === 0) return null;
 
-  if (logs.some((l) => l.includes("Instruction: Buy"))) return "buy";
-  if (logs.some((l) => l.includes("Instruction: Sell"))) return "sell";
+  const normalized = logs.map((l) => String(l).toLowerCase());
+
+  const hasBuy = normalized.some(
+    (l) =>
+      l.includes("instruction: buy") ||
+      l.includes("swapin") ||
+      l.includes("exactin")
+  );
+
+  const hasSell = normalized.some(
+    (l) =>
+      l.includes("instruction: sell") ||
+      l.includes("swapout") ||
+      l.includes("exactout")
+  );
+
+  if (hasBuy && !hasSell) return "buy";
+  if (hasSell && !hasBuy) return "sell";
 
   return null;
 }

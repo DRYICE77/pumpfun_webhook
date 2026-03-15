@@ -16,6 +16,10 @@ const PUMP_AMM_PROGRAM_ID =
   process.env.PUMP_AMM_PROGRAM_ID ||
   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
+const TOKEN_PROGRAM_ID =
+  process.env.TOKEN_PROGRAM_ID ||
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
 const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 70);
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 250000);
 const SIGNATURE_MAX_AGE_MS = Number(
@@ -31,6 +35,28 @@ const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
 
 // -----------------------------
+// Holder enrichment controls
+// -----------------------------
+const HOLDER_ENRICHMENT_ENABLED =
+  String(process.env.HOLDER_ENRICHMENT_ENABLED || "true") === "true";
+
+const HOLDER_REFRESH_COOLDOWN_MS = Number(
+  process.env.HOLDER_REFRESH_COOLDOWN_MS || 10 * 60 * 1000
+);
+
+const HOLDER_MIN_TOP1_RISK_PCT = Number(
+  process.env.HOLDER_MIN_TOP1_RISK_PCT || 15
+);
+
+const HOLDER_MIN_TOP5_RISK_PCT = Number(
+  process.env.HOLDER_MIN_TOP5_RISK_PCT || 50
+);
+
+const HOLDER_MIN_TOP10_RISK_PCT = Number(
+  process.env.HOLDER_MIN_TOP10_RISK_PCT || 80
+);
+
+// -----------------------------
 // Regime / schedule controls
 // -----------------------------
 const MANUAL_RUN_MODE = String(process.env.MANUAL_RUN_MODE || "AUTO").toUpperCase(); // AUTO | OFF | LIMITED | FULL
@@ -39,11 +65,11 @@ const DEFAULT_REGIME_SCORE = Number(process.env.DEFAULT_REGIME_SCORE || 50);
 const REGIME_MIN_LIMITED = Number(process.env.REGIME_MIN_LIMITED || 55);
 const REGIME_MIN_FULL = Number(process.env.REGIME_MIN_FULL || 65);
 
-const ET_PAUSE_START_HOUR = Number(process.env.ET_PAUSE_START_HOUR || 3);   // 3am ET
-const ET_PAUSE_END_HOUR = Number(process.env.ET_PAUSE_END_HOUR || 10);      // 10am ET
+const ET_PAUSE_START_HOUR = Number(process.env.ET_PAUSE_START_HOUR || 3);
+const ET_PAUSE_END_HOUR = Number(process.env.ET_PAUSE_END_HOUR || 10);
 const MODE_CHECK_INTERVAL_MS = Number(process.env.MODE_CHECK_INTERVAL_MS || 60 * 1000);
 
-const LIMITED_SAMPLE_RATE = Number(process.env.LIMITED_SAMPLE_RATE || 0.25); // 25% of signatures in LIMITED mode
+const LIMITED_SAMPLE_RATE = Number(process.env.LIMITED_SAMPLE_RATE || 0.25);
 const LIMITED_MIN_SOL_AMOUNT = Number(process.env.LIMITED_MIN_SOL_AMOUNT || 0.75);
 
 const CONTROL_QUERY_ENABLED =
@@ -94,6 +120,9 @@ const workerPromises = [];
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
+const tokenEnrichmentInFlight = new Map();
+const tokenLastEnrichedAt = new Map();
+
 const stats = {
   queued: 0,
   dequeued: 0,
@@ -115,7 +144,10 @@ const stats = {
   workerErrors: 0,
   emptyTx: 0,
   rpcRetries: 0,
-  regimeModeChanges: 0
+  regimeModeChanges: 0,
+  enrichmentRuns: 0,
+  enrichmentSkippedCooldown: 0,
+  enrichmentErrors: 0,
 };
 
 function logInfo(message, extra = {}) {
@@ -174,7 +206,6 @@ function isWithinEtPauseWindow() {
     return hour >= ET_PAUSE_START_HOUR && hour < ET_PAUSE_END_HOUR;
   }
 
-  // Handles wraparound windows like 22 -> 6
   return hour >= ET_PAUSE_START_HOUR || hour < ET_PAUSE_END_HOUR;
 }
 
@@ -186,7 +217,11 @@ function normalizeMode(value) {
   return "AUTO";
 }
 
-function resolveRunMode({ manualOverride = "AUTO", heliusEnabled = true, regimeScore = DEFAULT_REGIME_SCORE }) {
+function resolveRunMode({
+  manualOverride = "AUTO",
+  heliusEnabled = true,
+  regimeScore = DEFAULT_REGIME_SCORE,
+}) {
   const normalizedManual = normalizeMode(manualOverride);
 
   if (normalizedManual !== "AUTO") {
@@ -251,7 +286,6 @@ function disconnectWebsocket(reason = "unknown") {
 }
 
 async function fetchRunControl() {
-  // Manual mode wins immediately.
   if (MANUAL_RUN_MODE !== "AUTO") {
     return {
       manualOverride: MANUAL_RUN_MODE,
@@ -339,9 +373,6 @@ async function refreshRunMode() {
     }
   } catch (err) {
     logError("Failed refreshing run mode", { error: err.message });
-
-    // Fail safe: if we cannot verify controls, do not force reconnect here.
-    // Keep existing mode.
   }
 }
 
@@ -409,6 +440,14 @@ async function fetchFullTransaction(signature) {
   }
 
   throw lastErr;
+}
+
+async function fetchTokenSupply(mintAddress) {
+  return heliusRpc("getTokenSupply", [mintAddress]);
+}
+
+async function fetchLargestTokenAccounts(mintAddress) {
+  return heliusRpc("getTokenLargestAccounts", [mintAddress]);
 }
 
 function getLogMessages(tx) {
@@ -615,6 +654,89 @@ function getTs(tx) {
   return tx?.blockTime ? new Date(tx.blockTime * 1000) : new Date();
 }
 
+function toNum(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizePct(value) {
+  if (value == null || !Number.isFinite(value)) return null;
+  return Number(value.toFixed(4));
+}
+
+function parseLargestAccountUiAmount(row) {
+  if (row?.uiAmount != null) {
+    const n = Number(row.uiAmount);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  if (row?.amount != null && row?.decimals != null) {
+    const n = Number(row.amount) / 10 ** Number(row.decimals);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  if (row?.uiAmountString != null) {
+    const n = Number(row.uiAmountString);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  return 0;
+}
+
+function calculateHolderConcentrationFromLargestAccounts(largestAccounts = [], totalSupplyUi = 0) {
+  if (!Array.isArray(largestAccounts) || largestAccounts.length === 0 || totalSupplyUi <= 0) {
+    return {
+      top_holder_pct: null,
+      top_5_holders_pct: null,
+      top_10_holders_pct: null,
+      holder_count_estimate: 0,
+    };
+  }
+
+  const amounts = largestAccounts
+    .map(parseLargestAccountUiAmount)
+    .filter((v) => v > 0)
+    .sort((a, b) => b - a);
+
+  if (!amounts.length) {
+    return {
+      top_holder_pct: null,
+      top_5_holders_pct: null,
+      top_10_holders_pct: null,
+      holder_count_estimate: 0,
+    };
+  }
+
+  const sum = (arr) => arr.reduce((acc, v) => acc + v, 0);
+
+  return {
+    top_holder_pct: normalizePct((amounts[0] / totalSupplyUi) * 100),
+    top_5_holders_pct: normalizePct((sum(amounts.slice(0, 5)) / totalSupplyUi) * 100),
+    top_10_holders_pct: normalizePct((sum(amounts.slice(0, 10)) / totalSupplyUi) * 100),
+    holder_count_estimate: amounts.length,
+  };
+}
+
+function classifyConcentrationRisk({
+  top_holder_pct,
+  top_5_holders_pct,
+  top_10_holders_pct,
+}) {
+  const top1 = toNum(top_holder_pct, 0);
+  const top5 = toNum(top_5_holders_pct, 0);
+  const top10 = toNum(top_10_holders_pct, 0);
+
+  if (top1 >= 25 || top5 >= 70 || top10 >= 90) return "high";
+  if (
+    top1 >= HOLDER_MIN_TOP1_RISK_PCT ||
+    top5 >= HOLDER_MIN_TOP5_RISK_PCT ||
+    top10 >= HOLDER_MIN_TOP10_RISK_PCT
+  ) {
+    return "medium";
+  }
+  return "low";
+}
+
 function parsePumpTrade(tx, signature) {
   if (!tx || !tx.meta || !tx.transaction) {
     return { ok: false, reason: "missing tx fields" };
@@ -728,6 +850,29 @@ async function createTables() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_safety_enrichment (
+      token_id TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      top_holder_pct NUMERIC,
+      top_5_holders_pct NUMERIC,
+      top_10_holders_pct NUMERIC,
+      holder_count_estimate INTEGER,
+      concentration_risk TEXT,
+      source TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE token_safety_enrichment
+    ADD COLUMN IF NOT EXISTS top_holder_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS top_5_holders_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS top_10_holders_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS holder_count_estimate INTEGER,
+    ADD COLUMN IF NOT EXISTS concentration_risk TEXT;
+  `);
+
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS raw_webhook_events_signature_idx
     ON raw_webhook_events (signature);
   `);
@@ -755,6 +900,11 @@ async function createTables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS wallet_trades_wallet_idx
     ON wallet_trades (wallet_address);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS token_safety_enrichment_updated_idx
+    ON token_safety_enrichment (updated_at DESC);
   `);
 }
 
@@ -829,7 +979,134 @@ async function insertWalletTrade(trade) {
 
   if (result.rowCount > 0) {
     stats.insertedTrades += 1;
+    return true;
   }
+
+  return false;
+}
+
+async function upsertTokenSafetyEnrichment({
+  token_id,
+  token_address,
+  top_holder_pct,
+  top_5_holders_pct,
+  top_10_holders_pct,
+  holder_count_estimate,
+  concentration_risk,
+  source = "holder_scan",
+}) {
+  await pool.query(
+    `
+    INSERT INTO token_safety_enrichment (
+      token_id,
+      token_address,
+      top_holder_pct,
+      top_5_holders_pct,
+      top_10_holders_pct,
+      holder_count_estimate,
+      concentration_risk,
+      source,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+    ON CONFLICT (token_id)
+    DO UPDATE SET
+      token_address = EXCLUDED.token_address,
+      top_holder_pct = EXCLUDED.top_holder_pct,
+      top_5_holders_pct = EXCLUDED.top_5_holders_pct,
+      top_10_holders_pct = EXCLUDED.top_10_holders_pct,
+      holder_count_estimate = EXCLUDED.holder_count_estimate,
+      concentration_risk = EXCLUDED.concentration_risk,
+      source = EXCLUDED.source,
+      updated_at = NOW()
+    `,
+    [
+      token_id,
+      token_address,
+      top_holder_pct,
+      top_5_holders_pct,
+      top_10_holders_pct,
+      holder_count_estimate,
+      concentration_risk,
+      source,
+    ]
+  );
+}
+
+async function enrichTokenHolderConcentration(tokenId) {
+  if (!HOLDER_ENRICHMENT_ENABLED) return;
+  if (!tokenId) return;
+
+  const now = Date.now();
+  const last = tokenLastEnrichedAt.get(tokenId) || 0;
+
+  if (now - last < HOLDER_REFRESH_COOLDOWN_MS) {
+    stats.enrichmentSkippedCooldown += 1;
+    return;
+  }
+
+  if (tokenEnrichmentInFlight.has(tokenId)) {
+    return tokenEnrichmentInFlight.get(tokenId);
+  }
+
+  const runPromise = (async () => {
+    try {
+      const [supplyResult, largestResult] = await Promise.all([
+        fetchTokenSupply(tokenId),
+        fetchLargestTokenAccounts(tokenId),
+      ]);
+
+      const totalSupplyUi =
+        supplyResult?.value?.uiAmount != null
+          ? Number(supplyResult.value.uiAmount)
+          : supplyResult?.value?.amount != null && supplyResult?.value?.decimals != null
+          ? Number(supplyResult.value.amount) / 10 ** Number(supplyResult.value.decimals)
+          : 0;
+
+      const largestAccounts = largestResult?.value || [];
+
+      const concentration = calculateHolderConcentrationFromLargestAccounts(
+        largestAccounts,
+        totalSupplyUi
+      );
+
+      const concentration_risk = classifyConcentrationRisk(concentration);
+
+      await upsertTokenSafetyEnrichment({
+        token_id: tokenId,
+        token_address: tokenId,
+        top_holder_pct: concentration.top_holder_pct,
+        top_5_holders_pct: concentration.top_5_holders_pct,
+        top_10_holders_pct: concentration.top_10_holders_pct,
+        holder_count_estimate: concentration.holder_count_estimate,
+        concentration_risk,
+        source: "holder_scan",
+      });
+
+      tokenLastEnrichedAt.set(tokenId, now);
+      stats.enrichmentRuns += 1;
+
+      logInfo("Token holder concentration enriched", {
+        tokenId,
+        totalSupplyUi,
+        topHolderPct: concentration.top_holder_pct,
+        top5Pct: concentration.top_5_holders_pct,
+        top10Pct: concentration.top_10_holders_pct,
+        concentrationRisk: concentration_risk,
+      });
+    } catch (err) {
+      stats.enrichmentErrors += 1;
+      logError("Failed token holder enrichment", {
+        tokenId,
+        error: err.message,
+      });
+    } finally {
+      tokenEnrichmentInFlight.delete(tokenId);
+    }
+  })();
+
+  tokenEnrichmentInFlight.set(tokenId, runPromise);
+  return runPromise;
 }
 
 function enqueueSignature(signature, slot = null, blockTime = null) {
@@ -923,8 +1200,19 @@ async function processQueuedSignature(item) {
       return;
     }
 
-    await insertWalletTrade(parsed.trade);
+    const inserted = await insertWalletTrade(parsed.trade);
+    if (!inserted) {
+      return;
+    }
+
     stats.processed += 1;
+
+    enrichTokenHolderConcentration(parsed.trade.token_id).catch((err) => {
+      logError("Async enrichment dispatch failed", {
+        tokenId: parsed.trade.token_id,
+        error: err.message,
+      });
+    });
   } catch (err) {
     stats.txFetchErrors += 1;
     logError("Failed processing signature", {
@@ -992,6 +1280,8 @@ function startQueueWorker() {
     minSolAmount: MIN_SOL_AMOUNT,
     limitedMinSolAmount: LIMITED_MIN_SOL_AMOUNT,
     limitedSampleRate: LIMITED_SAMPLE_RATE,
+    holderEnrichmentEnabled: HOLDER_ENRICHMENT_ENABLED,
+    holderRefreshCooldownMs: HOLDER_REFRESH_COOLDOWN_MS,
   });
 }
 
@@ -1028,6 +1318,7 @@ function startQueueLogger() {
 
       queueSize: signatureQueue.length,
       oldestAgeMs,
+      enrichmentInFlight: tokenEnrichmentInFlight.size,
 
       queued: stats.queued,
       dequeued: stats.dequeued,
@@ -1055,6 +1346,9 @@ function startQueueLogger() {
       emptyTx: stats.emptyTx,
       rpcRetries: stats.rpcRetries,
       regimeModeChanges: stats.regimeModeChanges,
+      enrichmentRuns: stats.enrichmentRuns,
+      enrichmentSkippedCooldown: stats.enrichmentSkippedCooldown,
+      enrichmentErrors: stats.enrichmentErrors,
     });
 
     lastQueued = stats.queued;
@@ -1212,7 +1506,6 @@ function connect() {
 
     cleanupSocket(socket);
 
-    // If mode is OFF now, do not reconnect.
     if (currentRunMode === "OFF") {
       return;
     }
@@ -1298,6 +1591,9 @@ http
             controlSource: currentControlSource,
             etHour: getEasternHour(),
             inEtPauseWindow: isWithinEtPauseWindow(),
+            holderEnrichmentEnabled: HOLDER_ENRICHMENT_ENABLED,
+            holderRefreshCooldownMs: HOLDER_REFRESH_COOLDOWN_MS,
+            enrichmentInFlight: tokenEnrichmentInFlight.size,
             stats,
           })
         );

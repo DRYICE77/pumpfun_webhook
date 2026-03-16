@@ -1,8 +1,7 @@
 require("dotenv").config();
 const { Pool } = require("pg");
 
-// Node 18+ has global fetch. If needed, uncomment next line for older runtimes.
-// const fetch = require("node-fetch");
+// Node 18+ has global fetch
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -25,6 +24,7 @@ const MIN_BUYS_5M = Number(process.env.X_MIN_BUYS_5M || 25);
 const RESCRAPE_COOLDOWN_MINUTES = Number(
   process.env.X_RESCRAPE_COOLDOWN_MINUTES || 10
 );
+const PER_TOKEN_SLEEP_MS = Number(process.env.X_PER_TOKEN_SLEEP_MS || 1000);
 
 function logInfo(message, meta = {}) {
   console.log(`[x-worker] ${message} ${JSON.stringify(meta)}`);
@@ -170,16 +170,47 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
   return result.rows;
 }
 
-async function searchTweetsForAddress(address) {
+function buildSearchTerms(token) {
+  const terms = new Set();
+  const address = String(token.token_address || "").trim();
+
+  if (address) {
+    terms.add(address);
+  }
+
+  return [...terms].filter(Boolean);
+}
+
+async function searchTweetsForToken(token) {
   if (!APIFY_API_TOKEN) {
     logError("Missing APIFY_API_TOKEN");
-    return { ok: false, tweets: [], reason: "missing_apify_token" };
+    return {
+      ok: false,
+      tweets: [],
+      reason: "missing_apify_token",
+      searchTerms: [],
+    };
+  }
+
+  const searchTerms = buildSearchTerms(token);
+
+  if (searchTerms.length === 0) {
+    logError("No search terms could be built", {
+      tokenId: token.token_id,
+      tokenAddress: token.token_address,
+    });
+    return {
+      ok: false,
+      tweets: [],
+      reason: "no_search_terms",
+      searchTerms: [],
+    };
   }
 
   const url = `https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
 
   const body = {
-    searchTerms: [address],
+    searchTerms,
     maxTweets: MAX_TWEETS_PER_TOKEN,
     sort: "Latest",
   };
@@ -195,10 +226,16 @@ async function searchTweetsForAddress(address) {
     });
   } catch (err) {
     logError("Apify network error", {
-      address,
+      tokenId: token.token_id,
+      searchTerms,
       error: err.message,
     });
-    return { ok: false, tweets: [], reason: "network_error" };
+    return {
+      ok: false,
+      tweets: [],
+      reason: "network_error",
+      searchTerms,
+    };
   }
 
   const text = await res.text();
@@ -208,11 +245,17 @@ async function searchTweetsForAddress(address) {
     json = JSON.parse(text);
   } catch (err) {
     logError("Failed to parse Apify response", {
-      address,
+      tokenId: token.token_id,
       status: res.status,
+      searchTerms,
       preview: text.slice(0, 300),
     });
-    return { ok: false, tweets: [], reason: "bad_json" };
+    return {
+      ok: false,
+      tweets: [],
+      reason: "bad_json",
+      searchTerms,
+    };
   }
 
   if (!res.ok) {
@@ -220,31 +263,67 @@ async function searchTweetsForAddress(address) {
 
     if (res.status === 403) {
       logError("Apify access denied or usage capped", {
-        address,
+        tokenId: token.token_id,
         status: res.status,
+        searchTerms,
         preview,
       });
-      return { ok: false, tweets: [], reason: "apify_403" };
+      return {
+        ok: false,
+        tweets: [],
+        reason: "apify_403",
+        searchTerms,
+      };
     }
 
     logError("Apify returned non-200 response", {
-      address,
+      tokenId: token.token_id,
       status: res.status,
+      searchTerms,
       preview,
     });
-    return { ok: false, tweets: [], reason: "apify_error" };
+    return {
+      ok: false,
+      tweets: [],
+      reason: "apify_error",
+      searchTerms,
+    };
   }
 
   if (!Array.isArray(json)) {
     logError("Apify returned unexpected payload", {
-      address,
+      tokenId: token.token_id,
       payloadType: typeof json,
+      searchTerms,
       preview: JSON.stringify(json).slice(0, 300),
     });
-    return { ok: false, tweets: [], reason: "unexpected_payload" };
+    return {
+      ok: false,
+      tweets: [],
+      reason: "unexpected_payload",
+      searchTerms,
+    };
   }
 
-  return { ok: true, tweets: json };
+  if (json.length === 0) {
+    logInfo("No tweets found for token search", {
+      tokenId: token.token_id,
+      searchTerms,
+    });
+  } else {
+    logInfo("Apify search completed", {
+      tokenId: token.token_id,
+      searchTerms,
+      tweetsReturned: json.length,
+    });
+  }
+
+  return {
+    ok: true,
+    tweets: json,
+    reason: null,
+    searchTerms,
+  };
 }
 
 function extractTweetId(tweet) {
@@ -287,7 +366,9 @@ function extractCreatedAt(tweet) {
 
 function extractMetrics(tweet) {
   return {
-    like_count: Number(tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0),
+    like_count: Number(
+      tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0
+    ),
     retweet_count: Number(tweet.retweetCount ?? tweet.retweets ?? 0),
     reply_count: Number(tweet.replyCount ?? tweet.replies ?? 0),
     quote_count: Number(tweet.quoteCount ?? tweet.quotes ?? 0),
@@ -315,7 +396,12 @@ async function insertRawTweet(tweet) {
       public_metrics
     )
     VALUES ($1, $2, $3, $4, $5::jsonb)
-    ON CONFLICT (tweet_id) DO NOTHING
+    ON CONFLICT (tweet_id) DO UPDATE
+    SET
+      author_id = EXCLUDED.author_id,
+      text = EXCLUDED.text,
+      created_at = EXCLUDED.created_at,
+      public_metrics = EXCLUDED.public_metrics
     RETURNING tweet_id
     `,
     [
@@ -404,10 +490,11 @@ async function processToken(token, index, total) {
       mentionsInserted: 0,
       skippedNoId: 0,
       reason: "missing_token_address",
+      searchTerms: [],
     };
   }
 
-  const searchResult = await searchTweetsForAddress(address);
+  const searchResult = await searchTweetsForToken(token);
 
   if (!searchResult.ok) {
     return {
@@ -418,6 +505,7 @@ async function processToken(token, index, total) {
       mentionsInserted: 0,
       skippedNoId: 0,
       reason: searchResult.reason || "apify_error",
+      searchTerms: searchResult.searchTerms || [],
     };
   }
 
@@ -441,7 +529,7 @@ async function processToken(token, index, total) {
       const mentionResult = await insertTokenMention(
         tokenId,
         rawResult.tweetId,
-        address
+        (searchResult.searchTerms && searchResult.searchTerms[0]) || address
       );
 
       if (mentionResult.inserted) {
@@ -461,6 +549,7 @@ async function processToken(token, index, total) {
     total,
     tokenId,
     address,
+    searchTerms: searchResult.searchTerms || [],
     tweetsFetched: searchResult.tweets.length,
     rawInserted,
     mentionsInserted,
@@ -478,6 +567,7 @@ async function processToken(token, index, total) {
     rawInserted,
     mentionsInserted,
     skippedNoId,
+    searchTerms: searchResult.searchTerms || [],
   };
 }
 
@@ -523,6 +613,7 @@ async function fetchMentionsCycle() {
           total: tokens.length,
           tokenId: result.tokenId,
           reason: result.reason,
+          searchTerms: result.searchTerms || [],
         });
       }
     } catch (err) {
@@ -535,7 +626,7 @@ async function fetchMentionsCycle() {
       });
     }
 
-    await sleep(1000);
+    await sleep(PER_TOKEN_SLEEP_MS);
   }
 
   let snapshotsInserted = 0;
@@ -563,6 +654,7 @@ async function fetchMentionsCycle() {
 async function main() {
   try {
     await ensureSchema();
+
     logInfo("X mentions worker started", {
       tokenLimit: TOKEN_LIMIT,
       maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
@@ -572,6 +664,7 @@ async function main() {
       minVolume5m: MIN_VOLUME_5M,
       minBuys5m: MIN_BUYS_5M,
       rescrapeCooldownMinutes: RESCRAPE_COOLDOWN_MINUTES,
+      perTokenSleepMs: PER_TOKEN_SLEEP_MS,
     });
 
     // eslint-disable-next-line no-constant-condition
@@ -585,6 +678,7 @@ async function main() {
       logInfo("Sleeping before next cycle", {
         sleepSeconds: Math.round(LOOP_SLEEP_MS / 1000),
       });
+
       await sleep(LOOP_SLEEP_MS);
     }
   } catch (err) {

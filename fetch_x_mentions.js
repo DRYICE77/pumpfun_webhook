@@ -104,6 +104,7 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
       SELECT
         tt.token_id,
         tt.token_address,
+        tt.symbol,
         tt.volume_5m,
         tt.buys_5m,
         tt.sells_5m,
@@ -135,6 +136,7 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
     SELECT
       s.token_id,
       s.token_address,
+      s.symbol,
       s.quality_score,
       s.volume_5m,
       s.buys_5m,
@@ -178,37 +180,32 @@ function buildSearchTerms(token) {
   const symbol =
     token && token.symbol ? String(token.symbol).trim().replace(/^\$/, "") : "";
 
-  const name =
-    token && token.name ? String(token.name).trim() : "";
-
   if (address) {
+    const short = address.slice(0, 6);
+
     terms.add(address);
     terms.add(`"${address}"`);
     terms.add(`CA ${address}`);
     terms.add(`CA: ${address}`);
+    terms.add(short);
+    terms.add(`"${short}"`);
   }
 
-  if (symbol && symbol.length <= 15) {
-    terms.add(symbol);
-    terms.add(`$${symbol}`);
-    terms.add(`"${symbol}"`);
-    terms.add(`"$${symbol}"`);
-  }
+  if (symbol && symbol.length <= 12) {
+    const upperSymbol = symbol.toUpperCase();
 
-  if (name && name.length <= 40) {
-    terms.add(name);
-    terms.add(`"${name}"`);
-  }
+    terms.add(`$${upperSymbol}`);
+    terms.add(`"$${upperSymbol}"`);
 
-  if (address && symbol) {
-    terms.add(`${symbol} ${address}`);
-    terms.add(`$${symbol} ${address}`);
-    terms.add(`CA ${address} $${symbol}`);
+    if (address) {
+      terms.add(`$${upperSymbol} ${address}`);
+      terms.add(`$${upperSymbol} CA`);
+      terms.add(`$${upperSymbol} contract`);
+    }
   }
 
   return [...terms].filter(Boolean);
 }
-
 async function searchTweetsForToken(token) {
   if (!APIFY_API_TOKEN) {
     logError("Missing APIFY_API_TOKEN");

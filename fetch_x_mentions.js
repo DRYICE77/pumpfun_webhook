@@ -208,7 +208,7 @@ function buildSearchTerms(token) {
 
   return [...terms].filter(Boolean);
 }
-}
+
 async function searchTweetsForToken(token) {
   if (!APIFY_API_TOKEN) {
     logError("Missing APIFY_API_TOKEN");

@@ -378,6 +378,11 @@ function extractMetrics(tweet) {
 async function insertRawTweet(tweet) {
   const tweetId = extractTweetId(tweet);
   if (!tweetId) {
+    console.log(
+      "[x-worker] 🚨 tweet missing ID, raw object:",
+      JSON.stringify(tweet, null, 2)
+    );
+
     return { inserted: false, tweetId: null, skipped: true };
   }
 

@@ -12,6 +12,8 @@ const pool = new Pool({
 });
 
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || "";
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+
 const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 5);
 const MAX_TWEETS_PER_TOKEN = Number(process.env.X_MAX_TWEETS_PER_TOKEN || 5);
 const SNAPSHOT_WINDOW_MINUTES = Number(
@@ -77,6 +79,15 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_metadata (
+      token_id TEXT PRIMARY KEY,
+      symbol TEXT,
+      name TEXT,
+      last_fetched TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_token_x_mentions_token_tweet
     ON token_x_mentions (token_id, tweet_id);
   `);
@@ -94,6 +105,11 @@ async function ensureSchema() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_token_x_mentions_token_id
     ON token_x_mentions (token_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_token_metadata_symbol
+    ON token_metadata (symbol);
   `);
 }
 
@@ -171,6 +187,7 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
 
   return result.rows;
 }
+
 function buildSearchTerms(token) {
   const terms = new Set();
 
@@ -192,43 +209,126 @@ function buildSearchTerms(token) {
   }
 
   if (symbol && symbol.length <= 12) {
-    const upperSymbol = symbol.toUpperCase();
-
-    terms.add(`$${upperSymbol}`);
-    terms.add(`"$${upperSymbol}"`);
+    const upper = symbol.toUpperCase();
+    terms.add(`$${upper}`);
+    terms.add(`"$${upper}"`);
 
     if (address) {
-      terms.add(`$${upperSymbol} ${address}`);
-      terms.add(`$${upperSymbol} CA`);
-      terms.add(`$${upperSymbol} contract`);
+      terms.add(`$${upper} ${address}`);
+      terms.add(`$${upper} CA`);
+      terms.add(`$${upper} contract`);
     }
   }
 
   return [...terms].filter(Boolean);
 }
-async function searchTweetsForToken(token) {
+
+async function fetchTokenMetadata(tokenId) {
+  if (!HELIUS_API_KEY) {
+    logError("Missing HELIUS_API_KEY", { tokenId });
+    return null;
+  }
+
+  try {
+    const res = await fetch(
+      `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mintAccounts: [tokenId],
+        }),
+      }
+    );
+
+    const text = await res.text();
+
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (err) {
+      logError("Failed to parse Helius metadata response", {
+        tokenId,
+        preview: text.slice(0, 300),
+      });
+      return null;
+    }
+
+    if (!res.ok) {
+      logError("Helius metadata non-200 response", {
+        tokenId,
+        status: res.status,
+        preview: JSON.stringify(json).slice(0, 300),
+      });
+      return null;
+    }
+
+    const item = Array.isArray(json) ? json[0] : null;
+    if (!item) {
+      logInfo("No Helius metadata found", { tokenId });
+      return null;
+    }
+
+    const symbol =
+      item?.onChainMetadata?.metadata?.data?.symbol ??
+      item?.offChainMetadata?.metadata?.symbol ??
+      item?.symbol ??
+      null;
+
+    const name =
+      item?.onChainMetadata?.metadata?.data?.name ??
+      item?.offChainMetadata?.metadata?.name ??
+      item?.name ??
+      null;
+
+    return {
+      symbol: symbol ? String(symbol).trim() : null,
+      name: name ? String(name).trim() : null,
+    };
+  } catch (err) {
+    logError("Helius metadata fetch error", {
+      tokenId,
+      error: err.message,
+    });
+    return null;
+  }
+}
+
+async function upsertTokenMetadata(tokenId, metadata) {
+  if (!tokenId || !metadata) return false;
+
+  const result = await pool.query(
+    `
+    INSERT INTO token_metadata (
+      token_id,
+      symbol,
+      name,
+      last_fetched
+    )
+    VALUES ($1::text, $2::text, $3::text, NOW())
+    ON CONFLICT (token_id) DO UPDATE
+    SET
+      symbol = EXCLUDED.symbol,
+      name = EXCLUDED.name,
+      last_fetched = NOW()
+    RETURNING token_id
+    `,
+    [String(tokenId), metadata.symbol || null, metadata.name || null]
+  );
+
+  return result.rowCount > 0;
+}
+
+async function runApifySearch(searchTerms, tokenId) {
   if (!APIFY_API_TOKEN) {
     logError("Missing APIFY_API_TOKEN");
     return {
       ok: false,
       tweets: [],
       reason: "missing_apify_token",
-      searchTerms: [],
-    };
-  }
-
-  const searchTerms = buildSearchTerms(token);
-
-  if (searchTerms.length === 0) {
-    logError("No search terms could be built", {
-      tokenId: token.token_id,
-      tokenAddress: token.token_address,
-    });
-    return {
-      ok: false,
-      tweets: [],
-      reason: "no_search_terms",
-      searchTerms: [],
+      searchTerms,
     };
   }
 
@@ -251,7 +351,7 @@ async function searchTweetsForToken(token) {
     });
   } catch (err) {
     logError("Apify network error", {
-      tokenId: token.token_id,
+      tokenId,
       searchTerms,
       error: err.message,
     });
@@ -270,7 +370,7 @@ async function searchTweetsForToken(token) {
     json = JSON.parse(text);
   } catch (err) {
     logError("Failed to parse Apify response", {
-      tokenId: token.token_id,
+      tokenId,
       status: res.status,
       searchTerms,
       preview: text.slice(0, 300),
@@ -288,7 +388,7 @@ async function searchTweetsForToken(token) {
 
     if (res.status === 403) {
       logError("Apify access denied or usage capped", {
-        tokenId: token.token_id,
+        tokenId,
         status: res.status,
         searchTerms,
         preview,
@@ -302,7 +402,7 @@ async function searchTweetsForToken(token) {
     }
 
     logError("Apify returned non-200 response", {
-      tokenId: token.token_id,
+      tokenId,
       status: res.status,
       searchTerms,
       preview,
@@ -317,7 +417,7 @@ async function searchTweetsForToken(token) {
 
   if (!Array.isArray(json)) {
     logError("Apify returned unexpected payload", {
-      tokenId: token.token_id,
+      tokenId,
       payloadType: typeof json,
       searchTerms,
       preview: JSON.stringify(json).slice(0, 300),
@@ -330,7 +430,6 @@ async function searchTweetsForToken(token) {
     };
   }
 
-  // Filter out placeholder / non-tweet objects like { noResults: true }
   const filteredTweets = json.filter((tweet) => {
     if (!tweet || typeof tweet !== "object") return false;
     if (tweet.noResults === true) return false;
@@ -348,25 +447,10 @@ async function searchTweetsForToken(token) {
 
   if (json.length > 0 && filteredTweets.length === 0) {
     logInfo("Apify returned only non-tweet placeholder items", {
-      tokenId: token.token_id,
+      tokenId,
       searchTerms,
       rawCount: json.length,
       sample: json[0],
-    });
-  }
-
-  if (filteredTweets.length === 0) {
-    logInfo("No usable tweets found for token search", {
-      tokenId: token.token_id,
-      searchTerms,
-      rawCount: json.length,
-    });
-  } else {
-    logInfo("Apify search completed", {
-      tokenId: token.token_id,
-      searchTerms,
-      tweetsReturned: filteredTweets.length,
-      rawItemsReturned: json.length,
     });
   }
 
@@ -377,6 +461,65 @@ async function searchTweetsForToken(token) {
     searchTerms,
   };
 }
+
+async function searchTweetsForToken(token) {
+  const searchTerms = buildSearchTerms(token);
+
+  if (searchTerms.length === 0) {
+    logError("No search terms could be built", {
+      tokenId: token.token_id,
+      tokenAddress: token.token_address,
+      symbol: token.symbol || null,
+    });
+    return {
+      ok: false,
+      tweets: [],
+      reason: "no_search_terms",
+      searchTerms: [],
+    };
+  }
+
+  // Try one term at a time for cleaner matching
+  for (const term of searchTerms) {
+    const result = await runApifySearch([term], token.token_id);
+
+    if (!result.ok) {
+      if (result.reason === "apify_403") {
+        return result;
+      }
+      continue;
+    }
+
+    if (result.tweets.length > 0) {
+      logInfo("Apify search completed", {
+        tokenId: token.token_id,
+        searchTerms: [term],
+        tweetsReturned: result.tweets.length,
+      });
+
+      return {
+        ok: true,
+        tweets: result.tweets,
+        reason: null,
+        searchTerms: [term],
+      };
+    }
+
+    logInfo("No usable tweets found for token search", {
+      tokenId: token.token_id,
+      searchTerms: [term],
+      rawCount: 0,
+    });
+  }
+
+  return {
+    ok: true,
+    tweets: [],
+    reason: null,
+    searchTerms,
+  };
+}
+
 function extractTweetId(tweet) {
   const rawId =
     tweet.id ??
@@ -433,7 +576,6 @@ async function insertRawTweet(tweet) {
       "[x-worker] 🚨 tweet missing ID, raw object:",
       JSON.stringify(tweet, null, 2)
     );
-
     return { inserted: false, tweetId: null, skipped: true };
   }
 
@@ -550,6 +692,28 @@ async function processToken(token, index, total) {
     };
   }
 
+  try {
+    if (!token.symbol) {
+      const metadata = await fetchTokenMetadata(tokenId);
+
+      if (metadata && (metadata.symbol || metadata.name)) {
+        await upsertTokenMetadata(tokenId, metadata);
+        token.symbol = metadata.symbol || null;
+
+        logInfo("Token metadata updated", {
+          tokenId,
+          symbol: metadata.symbol,
+          name: metadata.name,
+        });
+      }
+    }
+  } catch (err) {
+    logError("Failed metadata enrichment", {
+      tokenId,
+      error: err.message,
+    });
+  }
+
   const searchResult = await searchTweetsForToken(token);
 
   if (!searchResult.ok) {
@@ -605,6 +769,7 @@ async function processToken(token, index, total) {
     total,
     tokenId,
     address,
+    symbol: token.symbol || null,
     searchTerms: searchResult.searchTerms || [],
     tweetsFetched: searchResult.tweets.length,
     rawInserted,

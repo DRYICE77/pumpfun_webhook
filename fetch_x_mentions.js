@@ -189,38 +189,36 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
 }
 
 function buildSearchTerms(token) {
-  const terms = new Set();
+  const terms = [];
 
-  const address =
-    token && token.token_address ? String(token.token_address).trim() : "";
+  const address = String(token.token_address || "").trim();
+  const symbol = String(token.symbol || "")
+    .replace(/^\$/, "")
+    .toUpperCase()
+    .trim();
 
-  const symbol =
-    token && token.symbol ? String(token.symbol).trim().replace(/^\$/, "") : "";
-
-  if (address) {
-    const short = address.slice(0, 6);
-
-    terms.add(address);
-    terms.add(`"${address}"`);
-    terms.add(`CA ${address}`);
-    terms.add(`CA: ${address}`);
-    terms.add(short);
-    terms.add(`"${short}"`);
-  }
-
+  // 🔥 PRIORITY: ticker first
   if (symbol && symbol.length <= 12) {
-    const upper = symbol.toUpperCase();
-    terms.add(`$${upper}`);
-    terms.add(`"$${upper}"`);
+    terms.push(`$${symbol}`);
+    terms.push(`"$${symbol}"`);
 
     if (address) {
-      terms.add(`$${upper} ${address}`);
-      terms.add(`$${upper} CA`);
-      terms.add(`$${upper} contract`);
+      terms.push(`$${symbol} CA`);
+      terms.push(`$${symbol} contract`);
     }
   }
 
-  return [...terms].filter(Boolean);
+  // fallback: contract
+  if (address) {
+    const short = address.slice(0, 6);
+
+    terms.push(address);
+    terms.push(`"${address}"`);
+    terms.push(short);
+    terms.push(`"${short}"`);
+  }
+
+  return terms.filter(Boolean);
 }
 
 async function fetchTokenMetadata(tokenId) {

@@ -230,20 +230,26 @@ async function fetchTokenMetadata(tokenId) {
   }
 
   try {
-    const res = await fetch(
-      `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          mintAccounts: [tokenId],
-        }),
-      }
-    );
+    const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        mintAccounts: [tokenId],
+      }),
+    });
 
     const text = await res.text();
+
+    logInfo("Helius metadata HTTP response", {
+      tokenId,
+      status: res.status,
+      ok: res.ok,
+      preview: text.slice(0, 500),
+    });
 
     let json;
     try {
@@ -251,7 +257,8 @@ async function fetchTokenMetadata(tokenId) {
     } catch (err) {
       logError("Failed to parse Helius metadata response", {
         tokenId,
-        preview: text.slice(0, 300),
+        preview: text.slice(0, 500),
+        error: err.message,
       });
       return null;
     }
@@ -260,33 +267,66 @@ async function fetchTokenMetadata(tokenId) {
       logError("Helius metadata non-200 response", {
         tokenId,
         status: res.status,
-        preview: JSON.stringify(json).slice(0, 300),
+        preview: JSON.stringify(json).slice(0, 500),
       });
       return null;
     }
 
-    const item = Array.isArray(json) ? json[0] : null;
-    if (!item) {
-      logInfo("No Helius metadata found", { tokenId });
+    const item = Array.isArray(json) ? json[0] : json;
+
+    if (!item || typeof item !== "object") {
+      logInfo("No Helius metadata found", {
+        tokenId,
+        payloadType: typeof json,
+      });
       return null;
     }
 
-    const symbol =
+    const rawSymbol =
       item?.onChainMetadata?.metadata?.data?.symbol ??
       item?.offChainMetadata?.metadata?.symbol ??
+      item?.offChainMetadata?.symbol ??
+      item?.content?.metadata?.symbol ??
+      item?.metadata?.symbol ??
+      item?.tokenInfo?.symbol ??
       item?.symbol ??
       null;
 
-    const name =
+    const rawName =
       item?.onChainMetadata?.metadata?.data?.name ??
       item?.offChainMetadata?.metadata?.name ??
+      item?.offChainMetadata?.name ??
+      item?.content?.metadata?.name ??
+      item?.metadata?.name ??
+      item?.tokenInfo?.name ??
       item?.name ??
       null;
 
-    return {
-      symbol: symbol ? String(symbol).trim() : null,
-      name: name ? String(name).trim() : null,
+    const clean = (value) => {
+      if (value == null) return null;
+      const str = String(value).replace(/\0/g, "").trim();
+      return str.length > 0 ? str : null;
     };
+
+    const symbol = clean(rawSymbol);
+    const name = clean(rawName);
+
+    logInfo("Helius metadata parsed", {
+      tokenId,
+      symbol,
+      name,
+      topLevelKeys: Object.keys(item).slice(0, 20),
+    });
+
+    if (!symbol && !name) {
+      logInfo("Helius metadata returned no usable symbol/name", {
+        tokenId,
+        itemPreview: JSON.stringify(item).slice(0, 700),
+      });
+      return null;
+    }
+
+    return { symbol, name };
   } catch (err) {
     logError("Helius metadata fetch error", {
       tokenId,
@@ -295,7 +335,6 @@ async function fetchTokenMetadata(tokenId) {
     return null;
   }
 }
-
 async function upsertTokenMetadata(tokenId, metadata) {
   if (!tokenId || !metadata) return false;
 

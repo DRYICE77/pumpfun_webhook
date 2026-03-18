@@ -3,7 +3,7 @@ const { Pool } = require("pg");
 
 // Node 18+ has global fetch
 
-const pool = new Pool({
+const pool = new Pool({x
   connectionString: process.env.DATABASE_URL,
   ssl:
     process.env.PGSSLMODE === "disable"
@@ -172,10 +172,40 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
 
 function buildSearchTerms(token) {
   const terms = new Set();
-  const address = String(token.token_address || "").trim();
 
+  const address = String(token.token_address || "").trim();
+  const symbol = String(token.symbol || "").trim();
+  const name = String(token.name || "").trim();
+
+  // --- 1. Contract address variations ---
   if (address) {
     terms.add(address);
+    terms.add(`"${address}"`);          // exact match
+    terms.add(`CA ${address}`);
+    terms.add(`CA: ${address}`);
+  }
+
+  // --- 2. Symbol (VERY IMPORTANT for meme coins) ---
+  if (symbol && symbol.length <= 10) {
+    terms.add(`$${symbol}`);
+    terms.add(symbol);
+  }
+
+  // --- 3. Name ---
+  if (name && name.length <= 30) {
+    terms.add(name);
+  }
+
+  // --- 4. Combined (higher intent tweets) ---
+  if (symbol && address) {
+    terms.add(`$${symbol} ${address}`);
+  }
+
+  // --- 5. Meme coin context boosters ---
+  if (symbol) {
+    terms.add(`buy $${symbol}`);
+    terms.add(`ape $${symbol}`);
+    terms.add(`launch $${symbol}`);
   }
 
   return [...terms].filter(Boolean);

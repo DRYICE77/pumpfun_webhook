@@ -305,27 +305,53 @@ async function searchTweetsForToken(token) {
     };
   }
 
-  if (json.length === 0) {
-    logInfo("No tweets found for token search", {
+  // Filter out placeholder / non-tweet objects like { noResults: true }
+  const filteredTweets = json.filter((tweet) => {
+    if (!tweet || typeof tweet !== "object") return false;
+    if (tweet.noResults === true) return false;
+
+    const hasId =
+      tweet.id != null ||
+      tweet.id_str != null ||
+      tweet.tweetId != null ||
+      tweet.postId != null ||
+      tweet.url != null ||
+      tweet.tweetUrl != null;
+
+    return hasId;
+  });
+
+  if (json.length > 0 && filteredTweets.length === 0) {
+    logInfo("Apify returned only non-tweet placeholder items", {
       tokenId: token.token_id,
       searchTerms,
+      rawCount: json.length,
+      sample: json[0],
+    });
+  }
+
+  if (filteredTweets.length === 0) {
+    logInfo("No usable tweets found for token search", {
+      tokenId: token.token_id,
+      searchTerms,
+      rawCount: json.length,
     });
   } else {
     logInfo("Apify search completed", {
       tokenId: token.token_id,
       searchTerms,
-      tweetsReturned: json.length,
+      tweetsReturned: filteredTweets.length,
+      rawItemsReturned: json.length,
     });
   }
 
   return {
     ok: true,
-    tweets: json,
+    tweets: filteredTweets,
     reason: null,
     searchTerms,
   };
 }
-
 function extractTweetId(tweet) {
   const rawId =
     tweet.id ??

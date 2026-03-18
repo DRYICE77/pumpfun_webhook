@@ -173,44 +173,42 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
 function buildSearchTerms(token) {
   const terms = new Set();
 
-  const address = String(token.token_address || "").trim();
-  const symbol = String(token.symbol || "").trim();
-  const name = String(token.name || "").trim();
+  const address =
+    token && token.token_address ? String(token.token_address).trim() : "";
 
-  // --- 1. Contract address variations ---
+  const symbol =
+    token && token.symbol ? String(token.symbol).trim().replace(/^\$/, "") : "";
+
+  const name =
+    token && token.name ? String(token.name).trim() : "";
+
   if (address) {
     terms.add(address);
-    terms.add(`"${address}"`);          // exact match
+    terms.add(`"${address}"`);
     terms.add(`CA ${address}`);
     terms.add(`CA: ${address}`);
   }
 
-  // --- 2. Symbol (VERY IMPORTANT for meme coins) ---
-  if (symbol && symbol.length <= 10) {
-    terms.add(`$${symbol}`);
+  if (symbol && symbol.length <= 15) {
     terms.add(symbol);
+    terms.add(`$${symbol}`);
+    terms.add(`"${symbol}"`);
+    terms.add(`"$${symbol}"`);
   }
 
-  // --- 3. Name ---
-  if (name && name.length <= 30) {
+  if (name && name.length <= 40) {
     terms.add(name);
+    terms.add(`"${name}"`);
   }
 
-  // --- 4. Combined (higher intent tweets) ---
-  if (symbol && address) {
+  if (address && symbol) {
+    terms.add(`${symbol} ${address}`);
     terms.add(`$${symbol} ${address}`);
-  }
-
-  // --- 5. Meme coin context boosters ---
-  if (symbol) {
-    terms.add(`buy $${symbol}`);
-    terms.add(`ape $${symbol}`);
-    terms.add(`launch $${symbol}`);
+    terms.add(`CA ${address} $${symbol}`);
   }
 
   return [...terms].filter(Boolean);
 }
-
 async function searchTweetsForToken(token) {
   if (!APIFY_API_TOKEN) {
     logError("Missing APIFY_API_TOKEN");

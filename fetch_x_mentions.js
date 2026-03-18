@@ -3,7 +3,7 @@ const { Pool } = require("pg");
 
 // Node 18+ has global fetch
 
-const pool = new Pool({x
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
     process.env.PGSSLMODE === "disable"

@@ -175,6 +175,12 @@ function buildSearchTerms(token) {
   const address =
     token && token.token_address ? String(token.token_address).trim() : "";
 
+  const symbol =
+    token && token.symbol ? String(token.symbol).trim().replace(/^\$/, "") : "";
+
+  const name =
+    token && token.name ? String(token.name).trim() : "";
+
   if (address) {
     terms.add(address);
     terms.add(`"${address}"`);
@@ -182,7 +188,26 @@ function buildSearchTerms(token) {
     terms.add(`CA: ${address}`);
   }
 
+  if (symbol && symbol.length <= 15) {
+    terms.add(symbol);
+    terms.add(`$${symbol}`);
+    terms.add(`"${symbol}"`);
+    terms.add(`"$${symbol}"`);
+  }
+
+  if (name && name.length <= 40) {
+    terms.add(name);
+    terms.add(`"${name}"`);
+  }
+
+  if (address && symbol) {
+    terms.add(`${symbol} ${address}`);
+    terms.add(`$${symbol} ${address}`);
+    terms.add(`CA ${address} $${symbol}`);
+  }
+
   return [...terms].filter(Boolean);
+}
 }
 async function searchTweetsForToken(token) {
   if (!APIFY_API_TOKEN) {

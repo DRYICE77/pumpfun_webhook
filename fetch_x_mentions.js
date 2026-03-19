@@ -21,7 +21,7 @@ const SNAPSHOT_WINDOW_MINUTES = Number(
 );
 const LOOP_SLEEP_MS = Number(process.env.X_LOOP_SLEEP_MS || 60000);
 const MIN_QUALITY_SCORE = Number(process.env.X_MIN_QUALITY_SCORE || 40);
-const MIN_VOLUME_5M = Number(process.env.X_MIN_VOLUME_5M || 0);
+const MIN_VOLUME_5M = Number(process.env.X_MIN_VOLUME_5M || 5);
 const MIN_BUYS_5M = Number(process.env.X_MIN_BUYS_5M || 5);
 const RESCRAPE_COOLDOWN_MINUTES = Number(
   process.env.X_RESCRAPE_COOLDOWN_MINUTES || 10

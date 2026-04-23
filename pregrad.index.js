@@ -18,9 +18,6 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// IMPORTANT:
-// Set this in Railway env vars after confirming the correct Pump launchpad program.
-// This should NOT be the Pump AMM / Pump Swap program your current worker uses.
 const PUMP_LAUNCHPAD_PROGRAM_ID =
   process.env.PUMP_LAUNCHPAD_PROGRAM_ID || "REPLACE_WITH_PREGRAD_PROGRAM_ID";
 
@@ -286,15 +283,11 @@ function inferEventTypeFromLogs(tx) {
   return "unknown";
 }
 
-// Very lightweight mint selection heuristic for v1.
-// Honest note: this may need refinement once you inspect raw txs.
 function inferPrimaryMint(tx, eventType) {
   const mintCandidates = getMintCandidatesFromTokenBalances(tx);
   if (mintCandidates.length === 1) return mintCandidates[0];
   if (mintCandidates.length > 1) return mintCandidates[0];
 
-  // For create txs, sometimes token balances may not yet make mint obvious.
-  // Fallback: look through parsed instructions for mint-like fields.
   for (const ix of getInstructions(tx)) {
     if (ix?.parsed?.info?.mint) return ix.parsed.info.mint;
     if (ix?.parsed?.info?.tokenMint) return ix.parsed.info.tokenMint;
@@ -325,6 +318,29 @@ function parseCreateMetadata(tx) {
   return { name, symbol };
 }
 
+function buildTokenStateFromEvent(tx, signature, eventType, tokenAddress, walletAddress, name, symbol) {
+  if (!tokenAddress) return null;
+
+  const ts = getTs(tx);
+  const isMigrate = eventType === "migrate";
+
+  return {
+    token_address: tokenAddress,
+    creator_wallet: walletAddress,
+    symbol: symbol,
+    name: name,
+    token_program: null,
+    created_at: ts,
+    first_seen_signature: signature,
+    first_seen_slot: tx.slot || null,
+    graduation_status: isMigrate ? "graduated" : "pre_grad",
+    market_phase: isMigrate ? "JUST_GRADUATED" : "PRE_GRAD",
+    last_event_type: eventType,
+    last_seen_at: ts,
+    graduated_at: isMigrate ? ts : null,
+  };
+}
+
 function classifyPregradEvent(tx, signature) {
   if (!tx || !tx.meta || !tx.transaction) {
     return { ok: false, reason: "missing tx fields" };
@@ -353,21 +369,15 @@ function classifyPregradEvent(tx, signature) {
     raw_json: tx,
   };
 
-  const tokenUpsert =
-    eventType === "create" && tokenAddress
-      ? {
-          token_address: tokenAddress,
-          creator_wallet: walletAddress,
-          symbol: symbol,
-          name: name,
-          token_program: null,
-          created_at: getTs(tx),
-          first_seen_signature: signature,
-          first_seen_slot: tx.slot || null,
-          graduation_status: "pre_grad",
-          market_phase: "PRE_GRAD",
-        }
-      : null;
+  const tokenUpsert = buildTokenStateFromEvent(
+    tx,
+    signature,
+    eventType,
+    tokenAddress,
+    walletAddress,
+    name,
+    symbol
+  );
 
   return {
     ok: true,
@@ -390,8 +400,16 @@ async function createTables() {
       graduation_status TEXT NOT NULL DEFAULT 'pre_grad',
       graduated_at TIMESTAMPTZ,
       market_phase TEXT NOT NULL DEFAULT 'PRE_GRAD',
+      last_event_type TEXT,
+      last_seen_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE pump_launchpad_tokens
+    ADD COLUMN IF NOT EXISTS last_event_type TEXT,
+    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
   `);
 
   await pool.query(`
@@ -421,6 +439,11 @@ async function createTables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS pump_launchpad_tokens_status_idx
     ON pump_launchpad_tokens (graduation_status, created_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS pump_launchpad_tokens_phase_idx
+    ON pump_launchpad_tokens (market_phase, last_seen_at DESC);
   `);
 
   if (STORE_RAW_EVENTS) {
@@ -483,10 +506,13 @@ async function upsertLaunchpadToken(token) {
       first_seen_signature,
       first_seen_slot,
       graduation_status,
+      graduated_at,
       market_phase,
+      last_event_type,
+      last_seen_at,
       updated_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
     ON CONFLICT (token_address)
     DO UPDATE SET
       creator_wallet = COALESCE(pump_launchpad_tokens.creator_wallet, EXCLUDED.creator_wallet),
@@ -496,6 +522,21 @@ async function upsertLaunchpadToken(token) {
       created_at = COALESCE(pump_launchpad_tokens.created_at, EXCLUDED.created_at),
       first_seen_signature = COALESCE(pump_launchpad_tokens.first_seen_signature, EXCLUDED.first_seen_signature),
       first_seen_slot = COALESCE(pump_launchpad_tokens.first_seen_slot, EXCLUDED.first_seen_slot),
+
+      graduation_status = CASE
+        WHEN pump_launchpad_tokens.graduation_status = 'graduated' THEN 'graduated'
+        ELSE EXCLUDED.graduation_status
+      END,
+
+      graduated_at = COALESCE(pump_launchpad_tokens.graduated_at, EXCLUDED.graduated_at),
+
+      market_phase = CASE
+        WHEN pump_launchpad_tokens.market_phase IN ('JUST_GRADUATED', 'POST_GRAD') THEN pump_launchpad_tokens.market_phase
+        ELSE EXCLUDED.market_phase
+      END,
+
+      last_event_type = COALESCE(EXCLUDED.last_event_type, pump_launchpad_tokens.last_event_type),
+      last_seen_at = COALESCE(EXCLUDED.last_seen_at, pump_launchpad_tokens.last_seen_at),
       updated_at = NOW()
     RETURNING token_address
     `,
@@ -509,7 +550,10 @@ async function upsertLaunchpadToken(token) {
       token.first_seen_signature,
       token.first_seen_slot,
       token.graduation_status || "pre_grad",
+      token.graduated_at || null,
       token.market_phase || "PRE_GRAD",
+      token.last_event_type || null,
+      token.last_seen_at || null,
     ]
   );
 
@@ -519,6 +563,24 @@ async function upsertLaunchpadToken(token) {
   }
 
   return false;
+}
+
+async function markTokenGraduated(tokenAddress, graduatedAt) {
+  if (!tokenAddress) return;
+
+  await pool.query(
+    `
+    UPDATE pump_launchpad_tokens
+    SET graduation_status = 'graduated',
+        market_phase = 'JUST_GRADUATED',
+        graduated_at = COALESCE(graduated_at, $2),
+        last_event_type = 'migrate',
+        last_seen_at = COALESCE($2, NOW()),
+        updated_at = NOW()
+    WHERE token_address = $1
+    `,
+    [tokenAddress, graduatedAt]
+  );
 }
 
 async function insertLaunchpadEvent(event) {
@@ -613,8 +675,24 @@ async function processQueuedSignature(item) {
     const classified = classifyPregradEvent(tx, signature);
     if (!classified.ok) return;
 
-    if (classified.tokenUpsert) {
-      await upsertLaunchpadToken(classified.tokenUpsert);
+    if (classified.event?.token_address) {
+      await upsertLaunchpadToken(
+        classified.tokenUpsert || {
+          token_address: classified.event.token_address,
+          creator_wallet: classified.event.wallet_address,
+          symbol: null,
+          name: null,
+          token_program: null,
+          created_at: classified.event.block_time,
+          first_seen_signature: classified.event.signature,
+          first_seen_slot: classified.event.slot,
+          graduation_status: "pre_grad",
+          market_phase: "PRE_GRAD",
+          last_event_type: classified.event.event_type,
+          last_seen_at: classified.event.block_time,
+          graduated_at: null,
+        }
+      );
     }
 
     const inserted = await insertLaunchpadEvent(classified.event);
@@ -635,16 +713,9 @@ async function processQueuedSignature(item) {
       case "migrate":
         stats.classifiedMigrate += 1;
         if (classified.event.token_address) {
-          await pool.query(
-            `
-            UPDATE pump_launchpad_tokens
-            SET graduation_status = 'graduated',
-                market_phase = 'JUST_GRADUATED',
-                graduated_at = COALESCE(graduated_at, $2),
-                updated_at = NOW()
-            WHERE token_address = $1
-            `,
-            [classified.event.token_address, classified.event.block_time]
+          await markTokenGraduated(
+            classified.event.token_address,
+            classified.event.block_time
           );
         }
         break;
@@ -974,6 +1045,31 @@ http
             workerRunning,
             programId: PUMP_LAUNCHPAD_PROGRAM_ID,
             stats,
+          })
+        );
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+      return;
+    }
+
+    if (req.url === "/pregrad-counts") {
+      try {
+        const counts = await pool.query(`
+          SELECT
+            COUNT(*) FILTER (WHERE graduation_status = 'pre_grad') AS pre_grad_count,
+            COUNT(*) FILTER (WHERE graduation_status = 'graduated') AS graduated_count,
+            COUNT(*) FILTER (WHERE market_phase = 'PRE_GRAD') AS pre_grad_phase_count,
+            COUNT(*) FILTER (WHERE market_phase = 'JUST_GRADUATED') AS just_graduated_count
+          FROM pump_launchpad_tokens
+        `);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            counts: counts.rows[0],
           })
         );
       } catch (err) {

@@ -19,18 +19,17 @@ if (!DATABASE_URL) {
 }
 
 const PUMP_LAUNCHPAD_PROGRAM_ID =
-  process.env.PUMP_LAUNCHPAD_PROGRAM_ID || "REPLACE_WITH_PREGRAD_PROGRAM_ID";
+  process.env.PUMP_LAUNCHPAD_PROGRAM_ID || "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-const STORE_RAW_EVENTS =
-  String(process.env.STORE_RAW_EVENTS || "true") === "true";
-
+const STORE_RAW_EVENTS = String(process.env.STORE_RAW_EVENTS || "true") === "true";
 const RAW_RETENTION_COUNT = Number(process.env.RAW_RETENTION_COUNT || 5000);
-const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 100000);
-const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 12);
-const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 25);
-const SIGNATURE_MAX_AGE_MS = Number(
-  process.env.SIGNATURE_MAX_AGE_MS || 2 * 60 * 1000
-);
+
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 5000);
+const RESUME_QUEUE_SIZE = Number(process.env.RESUME_QUEUE_SIZE || 2500);
+const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 8);
+const MAX_TX_PER_SECOND = Number(process.env.MAX_TX_PER_SECOND || 30);
+const SIGNATURE_MAX_AGE_MS = Number(process.env.SIGNATURE_MAX_AGE_MS || 120000);
+const STALE_DRAIN_INTERVAL_MS = Number(process.env.STALE_DRAIN_INTERVAL_MS || 1000);
 const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
@@ -51,15 +50,18 @@ let retryCount = 0;
 let intentionalShutdown = false;
 let currentSocketId = 0;
 
-const seenSignatures = new Set();
-const SEEN_SIGNATURE_LIMIT = 100000;
+let intakePaused = false;
+let workerRunning = false;
 
+const seenSignatures = new Set();
 const queuedSignatures = new Set();
 const signatureQueue = [];
-
-let workerRunning = false;
 const workerPromises = [];
+
+const SEEN_SIGNATURE_LIMIT = 100000;
+
 let queueLogTimer = null;
+let staleDrainTimer = null;
 
 const stats = {
   queued: 0,
@@ -67,14 +69,20 @@ const stats = {
   processed: 0,
   insertedEvents: 0,
   insertedTokens: 0,
+
+  intakePausedCount: 0,
+  intakeResumedCount: 0,
   droppedQueueFull: 0,
   droppedDuplicate: 0,
   droppedStale: 0,
+  droppedDuringPause: 0,
+
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
   txFetchErrors: 0,
   workerErrors: 0,
   rpcRetries: 0,
+
   classifiedCreate: 0,
   classifiedBuy: 0,
   classifiedSell: 0,
@@ -83,13 +91,11 @@ const stats = {
 };
 
 function logInfo(message, extra = {}) {
-  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
-  console.log(`[pregrad-ws] ${message}${payload}`);
+  console.log(`[pregrad-ws] ${message}${Object.keys(extra).length ? " " + JSON.stringify(extra) : ""}`);
 }
 
 function logError(message, extra = {}) {
-  const payload = Object.keys(extra).length ? ` ${JSON.stringify(extra)}` : "";
-  console.error(`[pregrad-ws] ${message}${payload}`);
+  console.error(`[pregrad-ws] ${message}${Object.keys(extra).length ? " " + JSON.stringify(extra) : ""}`);
 }
 
 function sleep(ms) {
@@ -99,8 +105,7 @@ function sleep(ms) {
 function addSeenSignature(sig) {
   seenSignatures.add(sig);
   if (seenSignatures.size > SEEN_SIGNATURE_LIMIT) {
-    const first = seenSignatures.values().next().value;
-    seenSignatures.delete(first);
+    seenSignatures.delete(seenSignatures.values().next().value);
   }
 }
 
@@ -108,10 +113,54 @@ function alreadySeen(sig) {
   return seenSignatures.has(sig);
 }
 
-function backoffDelay(attempt, wasRateLimited = false) {
-  if (wasRateLimited) {
-    return Math.min(60000 * 2 ** Math.min(attempt, 4), 600000);
+function maybePauseIntake() {
+  if (!intakePaused && signatureQueue.length >= MAX_QUEUE_SIZE) {
+    intakePaused = true;
+    stats.intakePausedCount += 1;
+    logInfo("Intake paused", { queueSize: signatureQueue.length, maxQueueSize: MAX_QUEUE_SIZE });
   }
+}
+
+function maybeResumeIntake() {
+  if (intakePaused && signatureQueue.length <= RESUME_QUEUE_SIZE) {
+    intakePaused = false;
+    stats.intakeResumedCount += 1;
+    logInfo("Intake resumed", { queueSize: signatureQueue.length, resumeQueueSize: RESUME_QUEUE_SIZE });
+  }
+}
+
+function drainStaleQueueItems() {
+  const now = Date.now();
+  let dropped = 0;
+
+  while (signatureQueue.length && now - signatureQueue[0].enqueuedAt > SIGNATURE_MAX_AGE_MS) {
+    const item = signatureQueue.shift();
+    if (item?.signature) queuedSignatures.delete(item.signature);
+    dropped += 1;
+  }
+
+  if (dropped > 0) {
+    stats.droppedStale += dropped;
+    logInfo("Dropped stale queue items", { dropped, queueSize: signatureQueue.length });
+  }
+
+  maybeResumeIntake();
+}
+
+function startStaleDrainer() {
+  if (staleDrainTimer) return;
+  staleDrainTimer = setInterval(drainStaleQueueItems, STALE_DRAIN_INTERVAL_MS);
+}
+
+function stopStaleDrainer() {
+  if (staleDrainTimer) {
+    clearInterval(staleDrainTimer);
+    staleDrainTimer = null;
+  }
+}
+
+function backoffDelay(attempt, wasRateLimited = false) {
+  if (wasRateLimited) return Math.min(60000 * 2 ** Math.min(attempt, 4), 600000);
   return Math.min(2000 * 2 ** Math.min(attempt, 5), 60000);
 }
 
@@ -119,22 +168,13 @@ async function heliusRpc(method, params) {
   const res = await fetch(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: `${method}-${Date.now()}`,
-      method,
-      params,
-    }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: `${method}-${Date.now()}`, method, params }),
   });
 
-  if (!res.ok) {
-    throw new Error(`RPC HTTP error ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`RPC HTTP error ${res.status}`);
 
   const json = await res.json();
-  if (json.error) {
-    throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
-  }
+  if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
 
   return json.result;
 }
@@ -168,20 +208,16 @@ function getLogMessages(tx) {
   return tx?.meta?.logMessages || [];
 }
 
-function getAccountKeys(tx) {
-  return (
-    tx?.transaction?.message?.accountKeys?.map((k) =>
-      typeof k === "string" ? k : k.pubkey
-    ) || []
-  );
-}
-
 function getInstructions(tx) {
   return tx?.transaction?.message?.instructions || [];
 }
 
 function getInnerInstructions(tx) {
   return tx?.meta?.innerInstructions || [];
+}
+
+function getAccountKeys(tx) {
+  return tx?.transaction?.message?.accountKeys?.map((k) => (typeof k === "string" ? k : k.pubkey)) || [];
 }
 
 function getTs(tx) {
@@ -191,125 +227,89 @@ function getTs(tx) {
 function getSignerWallet(tx) {
   const keys = tx?.transaction?.message?.accountKeys || [];
   for (const key of keys) {
-    if (typeof key === "string") continue;
-    if (key.signer) return key.pubkey;
+    if (typeof key !== "string" && key.signer) return key.pubkey;
   }
   return null;
 }
 
-function getMintCandidatesFromTokenBalances(tx) {
-  const out = new Set();
-
-  for (const row of tx?.meta?.preTokenBalances || []) {
-    if (row?.mint) out.add(row.mint);
-  }
-
-  for (const row of tx?.meta?.postTokenBalances || []) {
-    if (row?.mint) out.add(row.mint);
-  }
-
-  return [...out];
-}
-
-function findInstructionProgramIds(tx) {
-  const ids = new Set();
+function txTouchesLaunchpadProgram(tx) {
+  if (getLogMessages(tx).some((l) => l.includes(PUMP_LAUNCHPAD_PROGRAM_ID))) return true;
+  if (getAccountKeys(tx).includes(PUMP_LAUNCHPAD_PROGRAM_ID)) return true;
 
   for (const ix of getInstructions(tx)) {
-    const pid =
-      typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
-    if (pid) ids.add(pid);
+    const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+    if (pid === PUMP_LAUNCHPAD_PROGRAM_ID) return true;
   }
 
   for (const group of getInnerInstructions(tx)) {
     for (const ix of group.instructions || []) {
-      const pid =
-        typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
-      if (pid) ids.add(pid);
+      const pid = typeof ix.programId === "string" ? ix.programId : ix.programId?.toString?.();
+      if (pid === PUMP_LAUNCHPAD_PROGRAM_ID) return true;
     }
   }
 
-  return [...ids];
-}
-
-function txTouchesLaunchpadProgram(tx) {
-  const logs = getLogMessages(tx);
-  if (logs.some((l) => l.includes(PUMP_LAUNCHPAD_PROGRAM_ID))) return true;
-
-  const keys = getAccountKeys(tx);
-  if (keys.includes(PUMP_LAUNCHPAD_PROGRAM_ID)) return true;
-
-  const programIds = findInstructionProgramIds(tx);
-  return programIds.includes(PUMP_LAUNCHPAD_PROGRAM_ID);
-}
-
-function isFreshEnough(blockTime) {
-  if (!blockTime) return true;
-  const eventAgeMs = Date.now() - blockTime * 1000;
-  return eventAgeMs <= 60 * 1000;
+  return false;
 }
 
 function looksRelevantFromLogs(value) {
   const logs = value?.logs || [];
   if (!Array.isArray(logs) || !logs.length) return false;
 
-  return logs.some(
-    (l) =>
+  return logs.some((l) => {
+    const s = String(l).toLowerCase();
+    return (
       l.includes(PUMP_LAUNCHPAD_PROGRAM_ID) ||
-      l.toLowerCase().includes("create") ||
-      l.toLowerCase().includes("buy") ||
-      l.toLowerCase().includes("sell") ||
-      l.toLowerCase().includes("migrate") ||
-      l.toLowerCase().includes("graduate")
-  );
+      s.includes("instruction: buy") ||
+      s.includes("instruction: sell") ||
+      s.includes("instruction: create") ||
+      s.includes("migrate") ||
+      s.includes("graduate")
+    );
+  });
 }
 
 function inferEventTypeFromLogs(tx) {
   const logs = getLogMessages(tx).map((l) => String(l).toLowerCase());
 
-  const hasCreateV2 = logs.some((l) => l.includes("create_v2"));
-  const hasCreate = logs.some(
-    (l) => l.includes("instruction: create") || l.includes(" create")
-  );
+  const hasCreate = logs.some((l) => l.includes("instruction: create") || l.includes("create_v2"));
   const hasBuy = logs.some((l) => l.includes("instruction: buy"));
   const hasSell = logs.some((l) => l.includes("instruction: sell"));
-  const hasMigrate = logs.some(
-    (l) => l.includes("migrate") || l.includes("graduate")
-  );
+  const hasMigrate = logs.some((l) => l.includes("migrate") || l.includes("graduate"));
 
-  if (hasCreateV2 || hasCreate) return "create";
+  if (hasCreate) return "create";
   if (hasMigrate) return "migrate";
   if (hasBuy && !hasSell) return "buy";
   if (hasSell && !hasBuy) return "sell";
   return "unknown";
 }
 
-function inferPrimaryMint(tx, eventType) {
-  const mintCandidates = getMintCandidatesFromTokenBalances(tx);
-  if (mintCandidates.length === 1) return mintCandidates[0];
-  if (mintCandidates.length > 1) return mintCandidates[0];
+function getMintCandidatesFromTokenBalances(tx) {
+  const out = new Set();
 
-  for (const ix of getInstructions(tx)) {
-    if (ix?.parsed?.info?.mint) return ix.parsed.info.mint;
-    if (ix?.parsed?.info?.tokenMint) return ix.parsed.info.tokenMint;
+  for (const row of tx?.meta?.preTokenBalances || []) {
+    if (row?.mint && !row.mint.startsWith("So111111")) out.add(row.mint);
   }
 
-  for (const group of getInnerInstructions(tx)) {
-    for (const ix of group.instructions || []) {
-      if (ix?.parsed?.info?.mint) return ix.parsed.info.mint;
-      if (ix?.parsed?.info?.tokenMint) return ix.parsed.info.tokenMint;
-    }
+  for (const row of tx?.meta?.postTokenBalances || []) {
+    if (row?.mint && !row.mint.startsWith("So111111")) out.add(row.mint);
   }
 
-  return null;
+  return [...out];
+}
+
+function inferPrimaryMint(tx) {
+  const candidates = getMintCandidatesFromTokenBalances(tx).filter((m) => m.endsWith("pump"));
+  if (candidates.length) return candidates[0];
+
+  const all = getMintCandidatesFromTokenBalances(tx);
+  return all[0] || null;
 }
 
 function parseCreateMetadata(tx) {
   let name = null;
   let symbol = null;
 
-  const instructions = getInstructions(tx);
-
-  for (const ix of instructions) {
+  for (const ix of getInstructions(tx)) {
     const info = ix?.parsed?.info || {};
     if (!name && typeof info.name === "string") name = info.name;
     if (!symbol && typeof info.symbol === "string") symbol = info.symbol;
@@ -318,72 +318,133 @@ function parseCreateMetadata(tx) {
   return { name, symbol };
 }
 
-function buildTokenStateFromEvent(tx, signature, eventType, tokenAddress, walletAddress, name, symbol) {
+function extractSolAmount(tx, eventType) {
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+  let maxSolUiAmount = null;
+
+  const scanIx = (ix) => {
+    const info = ix?.parsed?.info || {};
+    if (ix?.parsed?.type !== "transferChecked" && ix?.parsed?.type !== "transfer") return;
+
+    if (info.mint === SOL_MINT) {
+      const raw =
+        info?.tokenAmount?.uiAmount ??
+        info?.uiAmount ??
+        (info?.amount && info?.decimals === 9 ? Number(info.amount) / 1e9 : null);
+
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) {
+        maxSolUiAmount = maxSolUiAmount === null ? n : Math.max(maxSolUiAmount, n);
+      }
+    }
+
+    if (info.lamports) {
+      const n = Number(info.lamports) / 1e9;
+      if (Number.isFinite(n) && n > 0) {
+        maxSolUiAmount = maxSolUiAmount === null ? n : Math.max(maxSolUiAmount, n);
+      }
+    }
+  };
+
+  for (const ix of getInstructions(tx)) scanIx(ix);
+  for (const group of getInnerInstructions(tx)) {
+    for (const ix of group.instructions || []) scanIx(ix);
+  }
+
+  if (maxSolUiAmount !== null) return maxSolUiAmount;
+
+  const logs = getLogMessages(tx).join("\n");
+  const amountInMatch = logs.match(/amount_in:\s*([0-9]+)/i);
+  if (amountInMatch) {
+    const raw = Number(amountInMatch[1]);
+
+    if (Number.isFinite(raw) && raw > 0) {
+      if (eventType === "buy") return raw / 1e9;
+      return raw / 1e6;
+    }
+  }
+
+  return null;
+}
+
+function extractTokenAmount(tx, tokenAddress) {
   if (!tokenAddress) return null;
 
-  const ts = getTs(tx);
-  const isMigrate = eventType === "migrate";
+  let maxTokenUiAmount = null;
 
-  return {
-    token_address: tokenAddress,
-    creator_wallet: walletAddress,
-    symbol: symbol,
-    name: name,
-    token_program: null,
-    created_at: ts,
-    first_seen_signature: signature,
-    first_seen_slot: tx.slot || null,
-    graduation_status: isMigrate ? "graduated" : "pre_grad",
-    market_phase: isMigrate ? "JUST_GRADUATED" : "PRE_GRAD",
-    last_event_type: eventType,
-    last_seen_at: ts,
-    graduated_at: isMigrate ? ts : null,
+  const scanIx = (ix) => {
+    const info = ix?.parsed?.info || {};
+    if (info.mint !== tokenAddress) return;
+
+    const raw =
+      info?.tokenAmount?.uiAmount ??
+      info?.uiAmount ??
+      (info?.amount && info?.decimals != null ? Number(info.amount) / 10 ** Number(info.decimals) : null);
+
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) {
+      maxTokenUiAmount = maxTokenUiAmount === null ? n : Math.max(maxTokenUiAmount, n);
+    }
   };
+
+  for (const ix of getInstructions(tx)) scanIx(ix);
+  for (const group of getInnerInstructions(tx)) {
+    for (const ix of group.instructions || []) scanIx(ix);
+  }
+
+  return maxTokenUiAmount;
 }
 
 function classifyPregradEvent(tx, signature) {
-  if (!tx || !tx.meta || !tx.transaction) {
-    return { ok: false, reason: "missing tx fields" };
-  }
-
-  if (tx.meta.err) {
-    return { ok: false, reason: "tx failed" };
-  }
-
-  if (!txTouchesLaunchpadProgram(tx)) {
-    return { ok: false, reason: "not launchpad program" };
-  }
+  if (!tx || !tx.meta || !tx.transaction) return { ok: false, reason: "missing tx fields" };
+  if (tx.meta.err) return { ok: false, reason: "tx failed" };
+  if (!txTouchesLaunchpadProgram(tx)) return { ok: false, reason: "not launchpad program" };
 
   const eventType = inferEventTypeFromLogs(tx);
-  const tokenAddress = inferPrimaryMint(tx, eventType);
+  const tokenAddress = inferPrimaryMint(tx);
   const walletAddress = getSignerWallet(tx);
   const { name, symbol } = parseCreateMetadata(tx);
+
+  const solAmount = extractSolAmount(tx, eventType);
+  const tokenAmount = extractTokenAmount(tx, tokenAddress);
+  const pricePerToken = solAmount && tokenAmount ? solAmount / tokenAmount : null;
+
+  const blockTime = getTs(tx);
+  const isMigrate = eventType === "migrate";
 
   const event = {
     token_address: tokenAddress,
     signature,
     slot: tx.slot || null,
-    block_time: getTs(tx),
+    block_time: blockTime,
     event_type: eventType,
     wallet_address: walletAddress,
+    sol_amount: solAmount,
+    token_amount: tokenAmount,
+    price_per_token: pricePerToken,
     raw_json: tx,
   };
 
-  const tokenUpsert = buildTokenStateFromEvent(
-    tx,
-    signature,
-    eventType,
-    tokenAddress,
-    walletAddress,
-    name,
-    symbol
-  );
+  const tokenUpsert = tokenAddress
+    ? {
+        token_address: tokenAddress,
+        creator_wallet: walletAddress,
+        symbol,
+        name,
+        token_program: null,
+        created_at: blockTime,
+        first_seen_signature: signature,
+        first_seen_slot: tx.slot || null,
+        graduation_status: isMigrate ? "graduated" : "pre_grad",
+        market_phase: isMigrate ? "JUST_GRADUATED" : "PRE_GRAD",
+        last_event_type: eventType,
+        last_seen_at: blockTime,
+        graduated_at: isMigrate ? blockTime : null,
+      }
+    : null;
 
-  return {
-    ok: true,
-    event,
-    tokenUpsert,
-  };
+  return { ok: true, event, tokenUpsert };
 }
 
 async function createTables() {
@@ -408,8 +469,14 @@ async function createTables() {
 
   await pool.query(`
     ALTER TABLE pump_launchpad_tokens
-    ADD COLUMN IF NOT EXISTS last_event_type TEXT,
-    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS market_cap_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS liquidity_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS latest_price NUMERIC,
+    ADD COLUMN IF NOT EXISTS fdv_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS bonding_progress_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS ath_market_cap_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS atl_market_cap_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS updated_market_data_at TIMESTAMPTZ;
   `);
 
   await pool.query(`
@@ -424,6 +491,15 @@ async function createTables() {
       raw_json JSONB,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE pump_launchpad_events
+    ADD COLUMN IF NOT EXISTS sol_amount NUMERIC,
+    ADD COLUMN IF NOT EXISTS token_amount NUMERIC,
+    ADD COLUMN IF NOT EXISTS price_per_token NUMERIC,
+    ADD COLUMN IF NOT EXISTS market_cap_usd NUMERIC,
+    ADD COLUMN IF NOT EXISTS sol_price_usd NUMERIC;
   `);
 
   await pool.query(`
@@ -442,8 +518,8 @@ async function createTables() {
   `);
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS pump_launchpad_tokens_phase_idx
-    ON pump_launchpad_tokens (market_phase, last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS pump_launchpad_tokens_market_idx
+    ON pump_launchpad_tokens (graduation_status, market_cap_usd DESC, updated_market_data_at DESC);
   `);
 
   if (STORE_RAW_EVENTS) {
@@ -474,43 +550,16 @@ async function insertRawPregradEvent({ signature, slot, timestamp, type, payload
   );
 }
 
-async function trimRawEvents() {
-  if (!STORE_RAW_EVENTS) return;
-
-  await pool.query(
-    `
-    DELETE FROM raw_pregrad_events
-    WHERE id IN (
-      SELECT id
-      FROM raw_pregrad_events
-      ORDER BY created_at DESC
-      OFFSET $1
-    )
-    `,
-    [RAW_RETENTION_COUNT]
-  );
-}
-
 async function upsertLaunchpadToken(token) {
   if (!token?.token_address) return false;
 
   const result = await pool.query(
     `
     INSERT INTO pump_launchpad_tokens (
-      token_address,
-      creator_wallet,
-      symbol,
-      name,
-      token_program,
-      created_at,
-      first_seen_signature,
-      first_seen_slot,
-      graduation_status,
-      graduated_at,
-      market_phase,
-      last_event_type,
-      last_seen_at,
-      updated_at
+      token_address, creator_wallet, symbol, name, token_program,
+      created_at, first_seen_signature, first_seen_slot,
+      graduation_status, graduated_at, market_phase,
+      last_event_type, last_seen_at, updated_at
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
     ON CONFLICT (token_address)
@@ -522,19 +571,15 @@ async function upsertLaunchpadToken(token) {
       created_at = COALESCE(pump_launchpad_tokens.created_at, EXCLUDED.created_at),
       first_seen_signature = COALESCE(pump_launchpad_tokens.first_seen_signature, EXCLUDED.first_seen_signature),
       first_seen_slot = COALESCE(pump_launchpad_tokens.first_seen_slot, EXCLUDED.first_seen_slot),
-
       graduation_status = CASE
         WHEN pump_launchpad_tokens.graduation_status = 'graduated' THEN 'graduated'
         ELSE EXCLUDED.graduation_status
       END,
-
       graduated_at = COALESCE(pump_launchpad_tokens.graduated_at, EXCLUDED.graduated_at),
-
       market_phase = CASE
         WHEN pump_launchpad_tokens.market_phase IN ('JUST_GRADUATED', 'POST_GRAD') THEN pump_launchpad_tokens.market_phase
         ELSE EXCLUDED.market_phase
       END,
-
       last_event_type = COALESCE(EXCLUDED.last_event_type, pump_launchpad_tokens.last_event_type),
       last_seen_at = COALESCE(EXCLUDED.last_seen_at, pump_launchpad_tokens.last_seen_at),
       updated_at = NOW()
@@ -587,15 +632,10 @@ async function insertLaunchpadEvent(event) {
   const result = await pool.query(
     `
     INSERT INTO pump_launchpad_events (
-      token_address,
-      signature,
-      slot,
-      block_time,
-      event_type,
-      wallet_address,
-      raw_json
+      token_address, signature, slot, block_time, event_type,
+      wallet_address, sol_amount, token_amount, price_per_token, raw_json
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     ON CONFLICT (signature) DO NOTHING
     RETURNING id
     `,
@@ -606,6 +646,9 @@ async function insertLaunchpadEvent(event) {
       event.block_time,
       event.event_type,
       event.wallet_address,
+      event.sol_amount,
+      event.token_amount,
+      event.price_per_token,
       STORE_RAW_EVENTS ? event.raw_json : null,
     ]
   );
@@ -621,6 +664,14 @@ async function insertLaunchpadEvent(event) {
 function enqueueSignature(signature, slot = null, blockTime = null) {
   if (!signature) return;
 
+  maybeResumeIntake();
+  maybePauseIntake();
+
+  if (intakePaused) {
+    stats.droppedDuringPause += 1;
+    return;
+  }
+
   if (alreadySeen(signature) || queuedSignatures.has(signature)) {
     stats.droppedDuplicate += 1;
     return;
@@ -628,71 +679,49 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
 
   if (signatureQueue.length >= MAX_QUEUE_SIZE) {
     stats.droppedQueueFull += 1;
+    maybePauseIntake();
     return;
   }
 
   queuedSignatures.add(signature);
-  signatureQueue.push({
-    signature,
-    slot,
-    blockTime,
-    enqueuedAt: Date.now(),
-  });
-
+  signatureQueue.push({ signature, slot, blockTime, enqueuedAt: Date.now() });
   stats.queued += 1;
 }
 
 async function processQueuedSignature(item) {
-  const { signature, slot, blockTime, enqueuedAt } = item;
-
-  queuedSignatures.delete(signature);
+  queuedSignatures.delete(item.signature);
   stats.dequeued += 1;
 
-  if (!signature || alreadySeen(signature)) return;
+  if (!item.signature || alreadySeen(item.signature)) return;
 
-  if (Date.now() - enqueuedAt > SIGNATURE_MAX_AGE_MS) {
+  if (Date.now() - item.enqueuedAt > SIGNATURE_MAX_AGE_MS) {
     stats.droppedStale += 1;
     return;
   }
 
-  addSeenSignature(signature);
+  addSeenSignature(item.signature);
 
   try {
-    const tx = await fetchFullTransaction(signature);
+    const tx = await fetchFullTransaction(item.signature);
+
     if (!tx) {
       stats.skippedEmptyTx += 1;
       return;
     }
 
     await insertRawPregradEvent({
-      signature,
-      slot: tx.slot || slot,
-      timestamp: tx.blockTime || blockTime,
+      signature: item.signature,
+      slot: tx.slot || item.slot,
+      timestamp: tx.blockTime || item.blockTime,
       type: "helius_ws_pregrad_tx",
       payload: tx,
     });
 
-    const classified = classifyPregradEvent(tx, signature);
+    const classified = classifyPregradEvent(tx, item.signature);
     if (!classified.ok) return;
 
     if (classified.event?.token_address) {
-      await upsertLaunchpadToken(
-        classified.tokenUpsert || {
-          token_address: classified.event.token_address,
-          creator_wallet: classified.event.wallet_address,
-          symbol: null,
-          name: null,
-          token_program: null,
-          created_at: classified.event.block_time,
-          first_seen_signature: classified.event.signature,
-          first_seen_slot: classified.event.slot,
-          graduation_status: "pre_grad",
-          market_phase: "PRE_GRAD",
-          last_event_type: classified.event.event_type,
-          last_seen_at: classified.event.block_time,
-          graduated_at: null,
-        }
-      );
+      await upsertLaunchpadToken(classified.tokenUpsert);
     }
 
     const inserted = await insertLaunchpadEvent(classified.event);
@@ -712,36 +741,27 @@ async function processQueuedSignature(item) {
         break;
       case "migrate":
         stats.classifiedMigrate += 1;
-        if (classified.event.token_address) {
-          await markTokenGraduated(
-            classified.event.token_address,
-            classified.event.block_time
-          );
-        }
+        await markTokenGraduated(classified.event.token_address, classified.event.block_time);
         break;
       default:
         stats.classifiedUnknown += 1;
-        break;
     }
   } catch (err) {
     stats.txFetchErrors += 1;
-    logError("Failed processing signature", {
-      signature,
-      error: err.message,
-    });
+    logError("Failed processing signature", { signature: item.signature, error: err.message });
   }
 }
 
 async function queueWorkerLoop(workerId) {
-  const minDelayMs = Math.max(
-    Math.floor((1000 / MAX_TX_PER_SECOND) * WORKER_CONCURRENCY),
-    15
-  );
+  const minDelayMs = Math.max(Math.floor((1000 / MAX_TX_PER_SECOND) * WORKER_CONCURRENCY), 15);
 
   while (workerRunning) {
+    drainStaleQueueItems();
+
     const item = signatureQueue.shift();
 
     if (!item) {
+      maybeResumeIntake();
       await sleep(100);
       continue;
     }
@@ -750,12 +770,10 @@ async function queueWorkerLoop(workerId) {
       await processQueuedSignature(item);
     } catch (err) {
       stats.workerErrors += 1;
-      logError("Queue worker error", {
-        workerId,
-        error: err.message,
-      });
+      logError("Queue worker error", { workerId, error: err.message });
     }
 
+    maybeResumeIntake();
     await sleep(minDelayMs);
   }
 }
@@ -765,21 +783,14 @@ function startQueueWorker() {
   workerRunning = true;
 
   for (let i = 0; i < WORKER_CONCURRENCY; i += 1) {
-    const workerId = i + 1;
-    const promise = queueWorkerLoop(workerId).catch((err) => {
-      stats.workerErrors += 1;
-      logError("Worker loop crashed", {
-        workerId,
-        error: err.message,
-      });
-    });
-    workerPromises.push(promise);
+    workerPromises.push(queueWorkerLoop(i + 1));
   }
 
   logInfo("Queue workers started", {
     workerConcurrency: WORKER_CONCURRENCY,
     maxTxPerSecond: MAX_TX_PER_SECOND,
     maxQueueSize: MAX_QUEUE_SIZE,
+    resumeQueueSize: RESUME_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
   });
 }
@@ -791,6 +802,7 @@ function stopQueueWorker() {
 let lastQueued = 0;
 let lastDequeued = 0;
 let lastInserted = 0;
+let lastDroppedPause = 0;
 let lastLogTime = Date.now();
 
 function startQueueLogger() {
@@ -798,17 +810,12 @@ function startQueueLogger() {
 
   queueLogTimer = setInterval(() => {
     const now = Date.now();
-    const seconds = (now - lastLogTime) / 1000;
+    const seconds = Math.max((now - lastLogTime) / 1000, 1);
 
-    const incomingRate = (stats.queued - lastQueued) / seconds;
-    const drainRate = (stats.dequeued - lastDequeued) / seconds;
-    const insertRate = (stats.insertedEvents - lastInserted) / seconds;
-
-    const oldestAgeMs = signatureQueue.length
-      ? now - signatureQueue[0].enqueuedAt
-      : 0;
+    const oldestAgeMs = signatureQueue.length ? now - signatureQueue[0].enqueuedAt : 0;
 
     logInfo("Queue stats", {
+      intakePaused,
       queueSize: signatureQueue.length,
       oldestAgeMs,
       queued: stats.queued,
@@ -816,17 +823,16 @@ function startQueueLogger() {
       processed: stats.processed,
       insertedEvents: stats.insertedEvents,
       insertedTokens: stats.insertedTokens,
-      incomingPerSec: incomingRate.toFixed(2),
-      drainedPerSec: drainRate.toFixed(2),
-      insertedPerSec: insertRate.toFixed(2),
+      incomingPerSec: ((stats.queued - lastQueued) / seconds).toFixed(2),
+      drainedPerSec: ((stats.dequeued - lastDequeued) / seconds).toFixed(2),
+      insertedPerSec: ((stats.insertedEvents - lastInserted) / seconds).toFixed(2),
+      droppedDuringPausePerSec: ((stats.droppedDuringPause - lastDroppedPause) / seconds).toFixed(2),
       droppedQueueFull: stats.droppedQueueFull,
       droppedDuplicate: stats.droppedDuplicate,
       droppedStale: stats.droppedStale,
-      skippedIrrelevantLog: stats.skippedIrrelevantLog,
-      skippedEmptyTx: stats.skippedEmptyTx,
+      droppedDuringPause: stats.droppedDuringPause,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
-      rpcRetries: stats.rpcRetries,
       classifiedCreate: stats.classifiedCreate,
       classifiedBuy: stats.classifiedBuy,
       classifiedSell: stats.classifiedSell,
@@ -837,6 +843,7 @@ function startQueueLogger() {
     lastQueued = stats.queued;
     lastDequeued = stats.dequeued;
     lastInserted = stats.insertedEvents;
+    lastDroppedPause = stats.droppedDuringPause;
     lastLogTime = now;
   }, QUEUE_LOG_EVERY_MS);
 }
@@ -849,32 +856,22 @@ function stopQueueLogger() {
 }
 
 function subscribe(socket) {
-  const request = {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "logsSubscribe",
-    params: [
-      { mentions: [PUMP_LAUNCHPAD_PROGRAM_ID] },
-      { commitment: "confirmed" },
-    ],
-  };
+  socket.send(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "logsSubscribe",
+      params: [{ mentions: [PUMP_LAUNCHPAD_PROGRAM_ID] }, { commitment: "confirmed" }],
+    })
+  );
 
-  socket.send(JSON.stringify(request));
-  logInfo("Sent logsSubscribe", {
-    programId: PUMP_LAUNCHPAD_PROGRAM_ID,
-  });
+  logInfo("Sent logsSubscribe", { programId: PUMP_LAUNCHPAD_PROGRAM_ID });
 }
 
 function cleanupSocket(socket) {
   try {
     socket.removeAllListeners();
-  } catch (_) {}
-
-  try {
-    if (
-      socket.readyState === WebSocket.OPEN ||
-      socket.readyState === WebSocket.CONNECTING
-    ) {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
       socket.terminate();
     }
   } catch (_) {}
@@ -902,17 +899,11 @@ function startPing(socketId) {
 }
 
 function scheduleReconnect(reason = "unknown", wasRateLimited = false) {
-  if (intentionalShutdown) return;
-  if (reconnectTimeout) return;
+  if (intentionalShutdown || reconnectTimeout) return;
 
   const delay = backoffDelay(retryCount, wasRateLimited);
 
-  logInfo("Scheduling reconnect", {
-    reason,
-    retryCount,
-    delayMs: delay,
-    wasRateLimited,
-  });
+  logInfo("Scheduling reconnect", { reason, retryCount, delayMs: delay, wasRateLimited });
 
   reconnectTimeout = setTimeout(() => {
     reconnectTimeout = null;
@@ -924,19 +915,14 @@ function scheduleReconnect(reason = "unknown", wasRateLimited = false) {
 function connect() {
   if (intentionalShutdown) return;
 
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
   currentSocketId += 1;
   const socketId = currentSocketId;
   const socket = new WebSocket(WSS_URL);
   ws = socket;
 
-  logInfo("Connecting websocket", {
-    socketId,
-    url: "wss://mainnet.helius-rpc.com/?api-key=***",
-  });
+  logInfo("Connecting websocket", { socketId, url: "wss://mainnet.helius-rpc.com/?api-key=***" });
 
   socket.on("open", () => {
     if (socketId !== currentSocketId) {
@@ -957,10 +943,7 @@ function connect() {
       const msg = JSON.parse(data.toString());
 
       if (typeof msg.result === "number" && msg.id === 1) {
-        logInfo("Subscribed successfully", {
-          socketId,
-          subscriptionId: msg.result,
-        });
+        logInfo("Subscribed successfully", { socketId, subscriptionId: msg.result });
         return;
       }
 
@@ -968,11 +951,11 @@ function connect() {
       const value = result?.value;
       const context = result?.context;
 
-      if (!value || value.err) return;
-      if (!value.signature) return;
+      if (!value || value.err || !value.signature) return;
 
-      if (!isFreshEnough(value.blockTime)) {
-        stats.droppedStale += 1;
+      if (intakePaused) {
+        stats.droppedDuringPause += 1;
+        maybeResumeIntake();
         return;
       }
 
@@ -981,28 +964,15 @@ function connect() {
         return;
       }
 
-      enqueueSignature(
-        value.signature,
-        context?.slot || null,
-        value.blockTime || null
-      );
+      enqueueSignature(value.signature, context?.slot || null, value.blockTime || null);
     } catch (err) {
-      logError("WS message parse error", {
-        socketId,
-        error: err.message,
-      });
+      logError("WS message parse error", { socketId, error: err.message });
     }
   });
 
   socket.on("error", (err) => {
     const message = err?.message || "unknown websocket error";
-    const wasRateLimited = message.includes("429");
-
-    logError("WebSocket error", {
-      socketId,
-      error: message,
-      wasRateLimited,
-    });
+    logError("WebSocket error", { socketId, error: message, wasRateLimited: message.includes("429") });
   });
 
   socket.on("close", (code, reasonBuffer) => {
@@ -1010,19 +980,10 @@ function connect() {
 
     stopPing();
 
-    const reason =
-      reasonBuffer && reasonBuffer.length
-        ? reasonBuffer.toString()
-        : "no reason";
-
+    const reason = reasonBuffer?.length ? reasonBuffer.toString() : "no reason";
     const wasRateLimited = reason.includes("429");
 
-    logInfo("WebSocket closed", {
-      socketId,
-      code,
-      reason,
-      wasRateLimited,
-    });
+    logInfo("WebSocket closed", { socketId, code, reason, wasRateLimited });
 
     cleanupSocket(socket);
     scheduleReconnect("socket_closed", wasRateLimited);
@@ -1042,34 +1003,10 @@ http
             retryCount,
             dbTime: db.rows[0].now,
             queueSize: signatureQueue.length,
+            intakePaused,
             workerRunning,
             programId: PUMP_LAUNCHPAD_PROGRAM_ID,
             stats,
-          })
-        );
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-      return;
-    }
-
-    if (req.url === "/pregrad-counts") {
-      try {
-        const counts = await pool.query(`
-          SELECT
-            COUNT(*) FILTER (WHERE graduation_status = 'pre_grad') AS pre_grad_count,
-            COUNT(*) FILTER (WHERE graduation_status = 'graduated') AS graduated_count,
-            COUNT(*) FILTER (WHERE market_phase = 'PRE_GRAD') AS pre_grad_phase_count,
-            COUNT(*) FILTER (WHERE market_phase = 'JUST_GRADUATED') AS just_graduated_count
-          FROM pump_launchpad_tokens
-        `);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            ok: true,
-            counts: counts.rows[0],
           })
         );
       } catch (err) {
@@ -1094,16 +1031,9 @@ async function boot() {
     await createTables();
     logInfo("Tables ready");
 
-    if (STORE_RAW_EVENTS) {
-      setInterval(() => {
-        trimRawEvents().catch((err) =>
-          logError("Raw trim error", { error: err.message })
-        );
-      }, 5 * 60 * 1000);
-    }
-
     startQueueWorker();
     startQueueLogger();
+    startStaleDrainer();
     connect();
   } catch (err) {
     logError("Boot failed", { error: err.message });
@@ -1121,16 +1051,11 @@ async function shutdown() {
   stopPing();
   stopQueueWorker();
   stopQueueLogger();
+  stopStaleDrainer();
 
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-    reconnectTimeout = null;
-  }
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
-  if (ws) {
-    cleanupSocket(ws);
-    ws = null;
-  }
+  if (ws) cleanupSocket(ws);
 
   try {
     await Promise.allSettled(workerPromises);

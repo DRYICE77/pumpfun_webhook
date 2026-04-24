@@ -719,6 +719,18 @@ async function processQueuedSignature(item) {
 
     const classified = classifyPregradEvent(tx, item.signature);
     if (!classified.ok) return;
+    const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
+
+if (
+  ["buy", "sell"].includes(classified.event?.event_type) &&
+  (
+    classified.event?.sol_amount === null ||
+    classified.event?.sol_amount < MIN_SOL_AMOUNT
+  )
+) {
+  stats.skippedSmallSolAmount = (stats.skippedSmallSolAmount || 0) + 1;
+  return;
+}
 
     if (classified.event?.token_address) {
       await upsertLaunchpadToken(classified.tokenUpsert);

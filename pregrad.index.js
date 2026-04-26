@@ -35,6 +35,9 @@ const QUEUE_LOG_EVERY_MS = Number(process.env.QUEUE_LOG_EVERY_MS || 10000);
 const RPC_RETRY_COUNT = Number(process.env.RPC_RETRY_COUNT || 3);
 const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
 
+const CONTROL_REFRESH_MS = Number(process.env.CONTROL_REFRESH_MS || 5000);
+const DEFAULT_MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
+
 const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
@@ -42,6 +45,16 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+let pregradControl = {
+  helius_enabled: false,
+  manual_override: "OFF",
+  max_queue_size: MAX_QUEUE_SIZE,
+  min_sol_threshold: DEFAULT_MIN_SOL_AMOUNT,
+  updated_at: null,
+};
+
+let lastControlFetchAt = 0;
 
 let ws = null;
 let pingInterval = null;
@@ -76,12 +89,14 @@ const stats = {
   droppedDuplicate: 0,
   droppedStale: 0,
   droppedDuringPause: 0,
+  skippedSmallSolAmount: 0,
 
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
   txFetchErrors: 0,
   workerErrors: 0,
   rpcRetries: 0,
+  controlFetchErrors: 0,
 
   classifiedCreate: 0,
   classifiedBuy: 0,
@@ -102,6 +117,63 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function getPregradControl(force = false) {
+  const now = Date.now();
+
+  if (!force && now - lastControlFetchAt < CONTROL_REFRESH_MS) {
+    return pregradControl;
+  }
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        helius_enabled,
+        manual_override,
+        max_queue_size,
+        min_sol_threshold,
+        updated_at
+      FROM pregrad_system_control
+      WHERE id = 1
+    `);
+
+    if (result.rows[0]) {
+      pregradControl = {
+        helius_enabled: result.rows[0].helius_enabled === true,
+        manual_override: result.rows[0].manual_override || "OFF",
+        max_queue_size: Number(result.rows[0].max_queue_size || MAX_QUEUE_SIZE),
+        min_sol_threshold: Number(result.rows[0].min_sol_threshold || DEFAULT_MIN_SOL_AMOUNT),
+        updated_at: result.rows[0].updated_at,
+      };
+    }
+
+    lastControlFetchAt = now;
+  } catch (err) {
+    stats.controlFetchErrors += 1;
+
+    logError("Failed to fetch pregrad system control", { error: err.message });
+
+    pregradControl = {
+      ...pregradControl,
+      helius_enabled: false,
+      manual_override: "CONTROL_FETCH_FAILED",
+    };
+  }
+
+  return pregradControl;
+}
+
+function isPregradEnabled() {
+  return pregradControl.helius_enabled === true && pregradControl.manual_override !== "OFF";
+}
+
+function effectiveMaxQueueSize() {
+  return Number(pregradControl.max_queue_size || MAX_QUEUE_SIZE);
+}
+
+function effectiveMinSolAmount() {
+  return Number(pregradControl.min_sol_threshold || DEFAULT_MIN_SOL_AMOUNT);
+}
+
 function addSeenSignature(sig) {
   seenSignatures.add(sig);
   if (seenSignatures.size > SEEN_SIGNATURE_LIMIT) {
@@ -114,18 +186,28 @@ function alreadySeen(sig) {
 }
 
 function maybePauseIntake() {
-  if (!intakePaused && signatureQueue.length >= MAX_QUEUE_SIZE) {
+  const maxQueueSize = effectiveMaxQueueSize();
+
+  if (!intakePaused && signatureQueue.length >= maxQueueSize) {
     intakePaused = true;
     stats.intakePausedCount += 1;
-    logInfo("Intake paused", { queueSize: signatureQueue.length, maxQueueSize: MAX_QUEUE_SIZE });
+    logInfo("Intake paused", {
+      queueSize: signatureQueue.length,
+      maxQueueSize,
+      manualOverride: pregradControl.manual_override,
+    });
   }
 }
 
 function maybeResumeIntake() {
-  if (intakePaused && signatureQueue.length <= RESUME_QUEUE_SIZE) {
+  if (intakePaused && signatureQueue.length <= RESUME_QUEUE_SIZE && isPregradEnabled()) {
     intakePaused = false;
     stats.intakeResumedCount += 1;
-    logInfo("Intake resumed", { queueSize: signatureQueue.length, resumeQueueSize: RESUME_QUEUE_SIZE });
+    logInfo("Intake resumed", {
+      queueSize: signatureQueue.length,
+      resumeQueueSize: RESUME_QUEUE_SIZE,
+      manualOverride: pregradControl.manual_override,
+    });
   }
 }
 
@@ -449,6 +531,38 @@ function classifyPregradEvent(tx, signature) {
 
 async function createTables() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS pregrad_system_control (
+      id BIGINT PRIMARY KEY DEFAULT 1,
+      helius_enabled BOOLEAN DEFAULT false,
+      manual_override TEXT DEFAULT 'OFF',
+      max_queue_size INTEGER DEFAULT 2500,
+      min_sol_threshold NUMERIC DEFAULT 0.05,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      CONSTRAINT single_pregrad_control_row CHECK (id = 1)
+    );
+  `);
+
+  await pool.query(`
+    INSERT INTO pregrad_system_control (
+      id,
+      helius_enabled,
+      manual_override,
+      max_queue_size,
+      min_sol_threshold,
+      updated_at
+    )
+    VALUES (
+      1,
+      false,
+      'OFF',
+      2500,
+      0.05,
+      now()
+    )
+    ON CONFLICT (id) DO NOTHING;
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS pump_launchpad_tokens (
       token_address TEXT PRIMARY KEY,
       creator_wallet TEXT,
@@ -533,6 +647,11 @@ async function createTables() {
         type TEXT,
         payload JSONB
       );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS raw_pregrad_events_created_idx
+      ON raw_pregrad_events (created_at DESC);
     `);
   }
 }
@@ -667,6 +786,11 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
   maybeResumeIntake();
   maybePauseIntake();
 
+  if (!isPregradEnabled()) {
+    stats.droppedDuringPause += 1;
+    return;
+  }
+
   if (intakePaused) {
     stats.droppedDuringPause += 1;
     return;
@@ -677,7 +801,9 @@ function enqueueSignature(signature, slot = null, blockTime = null) {
     return;
   }
 
-  if (signatureQueue.length >= MAX_QUEUE_SIZE) {
+  const maxQueueSize = effectiveMaxQueueSize();
+
+  if (signatureQueue.length >= maxQueueSize) {
     stats.droppedQueueFull += 1;
     maybePauseIntake();
     return;
@@ -696,6 +822,13 @@ async function processQueuedSignature(item) {
 
   if (Date.now() - item.enqueuedAt > SIGNATURE_MAX_AGE_MS) {
     stats.droppedStale += 1;
+    return;
+  }
+
+  const control = await getPregradControl();
+
+  if (!control.helius_enabled || control.manual_override === "OFF") {
+    stats.droppedDuringPause += 1;
     return;
   }
 
@@ -719,18 +852,16 @@ async function processQueuedSignature(item) {
 
     const classified = classifyPregradEvent(tx, item.signature);
     if (!classified.ok) return;
-    const MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
 
-if (
-  ["buy", "sell"].includes(classified.event?.event_type) &&
-  (
-    classified.event?.sol_amount === null ||
-    classified.event?.sol_amount < MIN_SOL_AMOUNT
-  )
-) {
-  stats.skippedSmallSolAmount = (stats.skippedSmallSolAmount || 0) + 1;
-  return;
-}
+    const minSolAmount = effectiveMinSolAmount();
+
+    if (
+      ["buy", "sell"].includes(classified.event?.event_type) &&
+      (classified.event?.sol_amount === null || classified.event?.sol_amount < minSolAmount)
+    ) {
+      stats.skippedSmallSolAmount += 1;
+      return;
+    }
 
     if (classified.event?.token_address) {
       await upsertLaunchpadToken(classified.tokenUpsert);
@@ -768,6 +899,8 @@ async function queueWorkerLoop(workerId) {
   const minDelayMs = Math.max(Math.floor((1000 / MAX_TX_PER_SECOND) * WORKER_CONCURRENCY), 15);
 
   while (workerRunning) {
+    await getPregradControl();
+
     drainStaleQueueItems();
 
     const item = signatureQueue.shift();
@@ -801,7 +934,7 @@ function startQueueWorker() {
   logInfo("Queue workers started", {
     workerConcurrency: WORKER_CONCURRENCY,
     maxTxPerSecond: MAX_TX_PER_SECOND,
-    maxQueueSize: MAX_QUEUE_SIZE,
+    envMaxQueueSize: MAX_QUEUE_SIZE,
     resumeQueueSize: RESUME_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
   });
@@ -820,13 +953,17 @@ let lastLogTime = Date.now();
 function startQueueLogger() {
   if (queueLogTimer) return;
 
-  queueLogTimer = setInterval(() => {
+  queueLogTimer = setInterval(async () => {
+    await getPregradControl();
+
     const now = Date.now();
     const seconds = Math.max((now - lastLogTime) / 1000, 1);
 
     const oldestAgeMs = signatureQueue.length ? now - signatureQueue[0].enqueuedAt : 0;
 
     logInfo("Queue stats", {
+      systemEnabled: isPregradEnabled(),
+      pregradControl,
       intakePaused,
       queueSize: signatureQueue.length,
       oldestAgeMs,
@@ -843,8 +980,10 @@ function startQueueLogger() {
       droppedDuplicate: stats.droppedDuplicate,
       droppedStale: stats.droppedStale,
       droppedDuringPause: stats.droppedDuringPause,
+      skippedSmallSolAmount: stats.skippedSmallSolAmount,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
+      controlFetchErrors: stats.controlFetchErrors,
       classifiedCreate: stats.classifiedCreate,
       classifiedBuy: stats.classifiedBuy,
       classifiedSell: stats.classifiedSell,
@@ -948,7 +1087,7 @@ function connect() {
     startPing(socketId);
   });
 
-  socket.on("message", (data) => {
+  socket.on("message", async (data) => {
     if (socketId !== currentSocketId) return;
 
     try {
@@ -964,6 +1103,13 @@ function connect() {
       const context = result?.context;
 
       if (!value || value.err || !value.signature) return;
+
+      const control = await getPregradControl();
+
+      if (!control.helius_enabled || control.manual_override === "OFF") {
+        stats.droppedDuringPause += 1;
+        return;
+      }
 
       if (intakePaused) {
         stats.droppedDuringPause += 1;
@@ -1006,7 +1152,10 @@ http
   .createServer(async (req, res) => {
     if (req.url === "/health") {
       try {
+        await getPregradControl(true);
+
         const db = await pool.query("SELECT now()");
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -1018,6 +1167,8 @@ http
             intakePaused,
             workerRunning,
             programId: PUMP_LAUNCHPAD_PROGRAM_ID,
+            systemEnabled: isPregradEnabled(),
+            pregradControl,
             stats,
           })
         );
@@ -1042,6 +1193,9 @@ async function boot() {
 
     await createTables();
     logInfo("Tables ready");
+
+    await getPregradControl(true);
+    logInfo("PreGrad system control loaded", pregradControl);
 
     startQueueWorker();
     startQueueLogger();

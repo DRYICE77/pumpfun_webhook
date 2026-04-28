@@ -1,3 +1,6 @@
+// PreGrad index.js
+// Fresh version with live market_cap_usd updates from buy/sell events
+
 require("dotenv").config();
 
 const http = require("http");
@@ -37,6 +40,10 @@ const RPC_RETRY_DELAY_MS = Number(process.env.RPC_RETRY_DELAY_MS || 500);
 
 const CONTROL_REFRESH_MS = Number(process.env.CONTROL_REFRESH_MS || 5000);
 const DEFAULT_MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
+
+// New market-data constants
+const PREGRAD_TOKEN_SUPPLY = Number(process.env.PREGRAD_TOKEN_SUPPLY || 1000000000);
+const SOL_PRICE_USD = Number(process.env.SOL_PRICE_USD || 150);
 
 const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -82,6 +89,7 @@ const stats = {
   processed: 0,
   insertedEvents: 0,
   insertedTokens: 0,
+  updatedMarketData: 0,
 
   intakePausedCount: 0,
   intakeResumedCount: 0,
@@ -90,6 +98,7 @@ const stats = {
   droppedStale: 0,
   droppedDuringPause: 0,
   skippedSmallSolAmount: 0,
+  skippedMarketDataUpdate: 0,
 
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
@@ -149,7 +158,6 @@ async function getPregradControl(force = false) {
     lastControlFetchAt = now;
   } catch (err) {
     stats.controlFetchErrors += 1;
-
     logError("Failed to fetch pregrad system control", { error: err.message });
 
     pregradControl = {
@@ -402,7 +410,6 @@ function parseCreateMetadata(tx) {
 
 function extractSolAmount(tx, eventType) {
   const SOL_MINT = "So11111111111111111111111111111111111111112";
-
   let maxSolUiAmount = null;
 
   const scanIx = (ix) => {
@@ -551,14 +558,7 @@ async function createTables() {
       min_sol_threshold,
       updated_at
     )
-    VALUES (
-      1,
-      false,
-      'OFF',
-      2500,
-      0.05,
-      now()
-    )
+    VALUES (1, false, 'OFF', 2500, 0.05, now())
     ON CONFLICT (id) DO NOTHING;
   `);
 
@@ -729,6 +729,64 @@ async function upsertLaunchpadToken(token) {
   return false;
 }
 
+async function updateLaunchpadMarketDataFromEvent(event) {
+  if (!event?.token_address) return false;
+
+  const priceSol = Number(event.price_per_token || 0);
+  const solUsd = SOL_PRICE_USD;
+
+  if (!Number.isFinite(priceSol) || priceSol <= 0) {
+    stats.skippedMarketDataUpdate += 1;
+    return false;
+  }
+
+  if (!Number.isFinite(solUsd) || solUsd <= 0) {
+    stats.skippedMarketDataUpdate += 1;
+    return false;
+  }
+
+  const latestPriceUsd = priceSol * solUsd;
+  const marketCapUsd = latestPriceUsd * PREGRAD_TOKEN_SUPPLY;
+
+  if (!Number.isFinite(latestPriceUsd) || !Number.isFinite(marketCapUsd) || marketCapUsd <= 0) {
+    stats.skippedMarketDataUpdate += 1;
+    return false;
+  }
+
+  await pool.query(
+    `
+    UPDATE pump_launchpad_tokens
+    SET
+      latest_price = $2,
+      market_cap_usd = $3,
+      fdv_usd = $3,
+      ath_market_cap_usd = GREATEST(COALESCE(ath_market_cap_usd, 0), $3),
+      atl_market_cap_usd = CASE
+        WHEN atl_market_cap_usd IS NULL OR atl_market_cap_usd = 0 THEN $3
+        ELSE LEAST(atl_market_cap_usd, $3)
+      END,
+      updated_market_data_at = NOW(),
+      updated_at = NOW()
+    WHERE token_address = $1
+    `,
+    [event.token_address, latestPriceUsd, marketCapUsd]
+  );
+
+  await pool.query(
+    `
+    UPDATE pump_launchpad_events
+    SET
+      market_cap_usd = $2,
+      sol_price_usd = $3
+    WHERE signature = $1
+    `,
+    [event.signature, marketCapUsd, solUsd]
+  );
+
+  stats.updatedMarketData += 1;
+  return true;
+}
+
 async function markTokenGraduated(tokenAddress, graduatedAt) {
   if (!tokenAddress) return;
 
@@ -870,6 +928,10 @@ async function processQueuedSignature(item) {
     const inserted = await insertLaunchpadEvent(classified.event);
     if (!inserted) return;
 
+    if (["buy", "sell"].includes(classified.event.event_type)) {
+      await updateLaunchpadMarketDataFromEvent(classified.event);
+    }
+
     stats.processed += 1;
 
     switch (classified.event.event_type) {
@@ -937,6 +999,8 @@ function startQueueWorker() {
     envMaxQueueSize: MAX_QUEUE_SIZE,
     resumeQueueSize: RESUME_QUEUE_SIZE,
     signatureMaxAgeMs: SIGNATURE_MAX_AGE_MS,
+    solPriceUsd: SOL_PRICE_USD,
+    pregradTokenSupply: PREGRAD_TOKEN_SUPPLY,
   });
 }
 
@@ -947,6 +1011,7 @@ function stopQueueWorker() {
 let lastQueued = 0;
 let lastDequeued = 0;
 let lastInserted = 0;
+let lastUpdatedMarketData = 0;
 let lastDroppedPause = 0;
 let lastLogTime = Date.now();
 
@@ -958,7 +1023,6 @@ function startQueueLogger() {
 
     const now = Date.now();
     const seconds = Math.max((now - lastLogTime) / 1000, 1);
-
     const oldestAgeMs = signatureQueue.length ? now - signatureQueue[0].enqueuedAt : 0;
 
     logInfo("Queue stats", {
@@ -972,15 +1036,18 @@ function startQueueLogger() {
       processed: stats.processed,
       insertedEvents: stats.insertedEvents,
       insertedTokens: stats.insertedTokens,
+      updatedMarketData: stats.updatedMarketData,
       incomingPerSec: ((stats.queued - lastQueued) / seconds).toFixed(2),
       drainedPerSec: ((stats.dequeued - lastDequeued) / seconds).toFixed(2),
       insertedPerSec: ((stats.insertedEvents - lastInserted) / seconds).toFixed(2),
+      marketDataUpdatesPerSec: ((stats.updatedMarketData - lastUpdatedMarketData) / seconds).toFixed(2),
       droppedDuringPausePerSec: ((stats.droppedDuringPause - lastDroppedPause) / seconds).toFixed(2),
       droppedQueueFull: stats.droppedQueueFull,
       droppedDuplicate: stats.droppedDuplicate,
       droppedStale: stats.droppedStale,
       droppedDuringPause: stats.droppedDuringPause,
       skippedSmallSolAmount: stats.skippedSmallSolAmount,
+      skippedMarketDataUpdate: stats.skippedMarketDataUpdate,
       txFetchErrors: stats.txFetchErrors,
       workerErrors: stats.workerErrors,
       controlFetchErrors: stats.controlFetchErrors,
@@ -994,6 +1061,7 @@ function startQueueLogger() {
     lastQueued = stats.queued;
     lastDequeued = stats.dequeued;
     lastInserted = stats.insertedEvents;
+    lastUpdatedMarketData = stats.updatedMarketData;
     lastDroppedPause = stats.droppedDuringPause;
     lastLogTime = now;
   }, QUEUE_LOG_EVERY_MS);
@@ -1153,7 +1221,6 @@ http
     if (req.url === "/health") {
       try {
         await getPregradControl(true);
-
         const db = await pool.query("SELECT now()");
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1168,6 +1235,8 @@ http
             workerRunning,
             programId: PUMP_LAUNCHPAD_PROGRAM_ID,
             systemEnabled: isPregradEnabled(),
+            solPriceUsd: SOL_PRICE_USD,
+            pregradTokenSupply: PREGRAD_TOKEN_SUPPLY,
             pregradControl,
             stats,
           })
@@ -1220,7 +1289,6 @@ async function shutdown() {
   stopStaleDrainer();
 
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
-
   if (ws) cleanupSocket(ws);
 
   try {

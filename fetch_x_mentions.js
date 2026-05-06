@@ -1,8 +1,6 @@
 require("dotenv").config();
 const { Pool } = require("pg");
 
-// Node 18+ has global fetch
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
@@ -12,28 +10,29 @@ const pool = new Pool({
 });
 
 const APIFY_API_TOKEN = process.env.APIFY_API_TOKEN || "";
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 
-const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 5);
-const MAX_TWEETS_PER_TOKEN = Number(process.env.X_MAX_TWEETS_PER_TOKEN || 5);
-const SNAPSHOT_WINDOW_MINUTES = Number(
-  process.env.X_SNAPSHOT_WINDOW_MINUTES || 5
-);
+// Example: apidojo/twitter-scraper-lite
+const APIFY_ACTOR_ID =
+  process.env.APIFY_ACTOR_ID || "apidojo/twitter-scraper-lite";
+
+const TOKEN_LIMIT = Number(process.env.X_TOKEN_LIMIT || 10);
+const MAX_TWEETS_PER_SEARCH = Number(process.env.X_MAX_TWEETS_PER_SEARCH || 5);
+const SNAPSHOT_WINDOW_MINUTES = Number(process.env.X_SNAPSHOT_WINDOW_MINUTES || 10);
 const LOOP_SLEEP_MS = Number(process.env.X_LOOP_SLEEP_MS || 60000);
-const MIN_QUALITY_SCORE = Number(process.env.X_MIN_QUALITY_SCORE || 40);
-const MIN_VOLUME_5M = Number(process.env.X_MIN_VOLUME_5M || 5);
-const MIN_BUYS_5M = Number(process.env.X_MIN_BUYS_5M || 5);
-const RESCRAPE_COOLDOWN_MINUTES = Number(
-  process.env.X_RESCRAPE_COOLDOWN_MINUTES || 10
-);
-const PER_TOKEN_SLEEP_MS = Number(process.env.X_PER_TOKEN_SLEEP_MS || 1000);
+const RESCRAPE_COOLDOWN_MINUTES = Number(process.env.X_RESCRAPE_COOLDOWN_MINUTES || 5);
+const PER_TOKEN_SLEEP_MS = Number(process.env.X_PER_TOKEN_SLEEP_MS || 1500);
+
+const MIN_MARKET_CAP_USD = Number(process.env.X_MIN_MARKET_CAP_USD || 8000);
+const MAX_MARKET_CAP_USD = Number(process.env.X_MAX_MARKET_CAP_USD || 75000);
+const MIN_BUYS_5M = Number(process.env.X_MIN_BUYS_5M || 3);
+const MIN_VOLUME_5M = Number(process.env.X_MIN_VOLUME_5M || 2);
 
 function logInfo(message, meta = {}) {
-  console.log(`[x-worker] ${message} ${JSON.stringify(meta)}`);
+  console.log(`[pregrad-x-worker] ${message} ${JSON.stringify(meta)}`);
 }
 
 function logError(message, meta = {}) {
-  console.error(`[x-worker] ${message} ${JSON.stringify(meta)}`);
+  console.error(`[pregrad-x-worker] ${message} ${JSON.stringify(meta)}`);
 }
 
 function sleep(ms) {
@@ -45,6 +44,7 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS x_raw_tweets (
       tweet_id TEXT PRIMARY KEY,
       author_id TEXT,
+      author_username TEXT,
       text TEXT,
       created_at TIMESTAMPTZ NOT NULL,
       public_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -53,132 +53,148 @@ async function ensureSchema() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS token_x_mentions (
+    CREATE TABLE IF NOT EXISTS pregrad_token_x_mentions (
       id BIGSERIAL PRIMARY KEY,
-      token_id TEXT NOT NULL,
+      token_address TEXT NOT NULL,
       tweet_id TEXT NOT NULL,
       match_value TEXT,
+      match_type TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS token_social_snapshots (
+    CREATE TABLE IF NOT EXISTS pregrad_token_social_snapshots (
       id BIGSERIAL PRIMARY KEY,
-      token_id TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      symbol TEXT,
+      name TEXT,
       ts TIMESTAMPTZ NOT NULL,
       window_minutes INTEGER NOT NULL,
       mentions_count INTEGER NOT NULL DEFAULT 0,
+      ca_mentions_count INTEGER NOT NULL DEFAULT 0,
+      ticker_mentions_count INTEGER NOT NULL DEFAULT 0,
       unique_authors INTEGER NOT NULL DEFAULT 0,
       likes_total INTEGER NOT NULL DEFAULT 0,
       rts_total INTEGER NOT NULL DEFAULT 0,
       replies_total INTEGER NOT NULL DEFAULT 0,
       quotes_total INTEGER NOT NULL DEFAULT 0,
+      searched BOOLEAN NOT NULL DEFAULT TRUE,
+      search_terms JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS token_metadata (
-      token_id TEXT PRIMARY KEY,
-      symbol TEXT,
-      name TEXT,
-      last_fetched TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pregrad_token_x_mentions_token_tweet
+    ON pregrad_token_x_mentions (token_address, tweet_id);
   `);
 
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_token_x_mentions_token_tweet
-    ON token_x_mentions (token_id, tweet_id);
+    CREATE INDEX IF NOT EXISTS idx_pregrad_social_snapshots_token_ts
+    ON pregrad_token_social_snapshots (token_address, ts DESC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_pregrad_token_x_mentions_token
+    ON pregrad_token_x_mentions (token_address);
   `);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_x_raw_tweets_created_at
     ON x_raw_tweets (created_at DESC);
   `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_token_social_snapshots_token_ts
-    ON token_social_snapshots (token_id, ts DESC);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_token_x_mentions_token_id
-    ON token_x_mentions (token_id);
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_token_metadata_symbol
-    ON token_metadata (symbol);
-  `);
 }
 
-async function getSocialCandidates(limit = TOKEN_LIMIT) {
+async function getPregradSocialCandidates(limit = TOKEN_LIMIT) {
   const result = await pool.query(
     `
-    WITH scored_tokens AS (
+    WITH recent_events AS (
       SELECT
-        tt.token_id,
-        tt.token_address,
-        tt.symbol,
-        tt.volume_5m,
-        tt.buys_5m,
-        tt.sells_5m,
-        tt.last_updated,
+        e.token_address,
+        COUNT(*) FILTER (
+          WHERE e.event_type ILIKE 'buy'
+            AND e.block_time > NOW() - INTERVAL '5 minutes'
+        ) AS buys_5m,
+        COUNT(*) FILTER (
+          WHERE e.event_type ILIKE 'sell'
+            AND e.block_time > NOW() - INTERVAL '5 minutes'
+        ) AS sells_5m,
+        COUNT(DISTINCT e.wallet_address) FILTER (
+          WHERE e.block_time > NOW() - INTERVAL '5 minutes'
+        ) AS unique_wallets_5m,
+        COUNT(*) FILTER (
+          WHERE e.block_time > NOW() - INTERVAL '10 minutes'
+        ) AS events_10m
+      FROM pump_launchpad_events e
+      WHERE e.block_time > NOW() - INTERVAL '15 minutes'
+      GROUP BY e.token_address
+    ),
+
+    last_scrape AS (
+      SELECT
+        token_address,
+        MAX(ts) AS last_snapshot_ts
+      FROM pregrad_token_social_snapshots
+      GROUP BY token_address
+    ),
+
+    candidates AS (
+      SELECT
+        t.token_address,
+        t.symbol,
+        t.name,
+        t.creator_wallet,
+        t.created_at,
+        t.market_cap_usd,
+        t.bonding_progress_pct,
+        t.updated_market_data_at,
+        COALESCE(r.buys_5m, 0) AS buys_5m,
+        COALESCE(r.sells_5m, 0) AS sells_5m,
+        COALESCE(r.unique_wallets_5m, 0) AS unique_wallets_5m,
+        COALESCE(r.events_10m, 0) AS events_10m,
+        ls.last_snapshot_ts,
+
         ROUND(
-          LEAST(tt.volume_5m / 50.0, 40) +
-          LEAST(tt.buys_5m / 5.0, 40) +
+          LEAST(COALESCE(t.market_cap_usd, 0) / 1000.0, 35) +
+          LEAST(COALESCE(r.buys_5m, 0) * 4.0, 30) +
+          LEAST(COALESCE(r.unique_wallets_5m, 0) * 5.0, 25) +
           CASE
-            WHEN tt.buys_5m = 0 THEN 0
-            WHEN tt.sells_5m = 0 THEN 20
-            WHEN tt.buys_5m::numeric / NULLIF(tt.sells_5m, 0) >= 3 THEN 20
-            WHEN tt.buys_5m::numeric / NULLIF(tt.sells_5m, 0) >= 2 THEN 15
-            WHEN tt.buys_5m > tt.sells_5m THEN 10
+            WHEN COALESCE(r.buys_5m, 0) >= 3
+             AND COALESCE(r.sells_5m, 0) = 0 THEN 10
+            WHEN COALESCE(r.buys_5m, 0) > COALESCE(r.sells_5m, 0) THEN 6
             ELSE 0
           END,
           2
-        ) AS quality_score
-      FROM tracked_tokens tt
-      WHERE tt.token_address IS NOT NULL
-        AND tt.token_address <> ''
-    ),
-    last_scrape AS (
-      SELECT
-        token_id,
-        MAX(ts) AS last_snapshot_ts
-      FROM token_social_snapshots
-      GROUP BY token_id
+        ) AS social_candidate_score
+
+      FROM pump_launchpad_tokens t
+      LEFT JOIN recent_events r
+        ON r.token_address = t.token_address
+      LEFT JOIN last_scrape ls
+        ON ls.token_address = t.token_address
+      WHERE t.token_address IS NOT NULL
+        AND t.token_address <> ''
+        AND COALESCE(t.market_cap_usd, 0) BETWEEN $1::numeric AND $2::numeric
+        AND COALESCE(r.buys_5m, 0) >= $3::int
+        AND (
+          ls.last_snapshot_ts IS NULL
+          OR ls.last_snapshot_ts < NOW() - make_interval(mins => $4::int)
+        )
     )
-    SELECT
-      s.token_id,
-      s.token_address,
-      s.symbol,
-      s.quality_score,
-      s.volume_5m,
-      s.buys_5m,
-      s.sells_5m,
-      s.last_updated,
-      ls.last_snapshot_ts
-    FROM scored_tokens s
-    LEFT JOIN last_scrape ls
-      ON ls.token_id = s.token_id
-    WHERE s.quality_score >= $1::numeric
-      AND s.volume_5m >= $2::numeric
-      AND s.buys_5m >= $3::int
-      AND (
-        ls.last_snapshot_ts IS NULL
-        OR ls.last_snapshot_ts < NOW() - make_interval(mins => $4::int)
-      )
+
+    SELECT *
+    FROM candidates
     ORDER BY
-      s.quality_score DESC,
-      s.volume_5m DESC,
-      s.buys_5m DESC,
-      s.last_updated DESC NULLS LAST
+      social_candidate_score DESC,
+      buys_5m DESC,
+      unique_wallets_5m DESC,
+      market_cap_usd DESC NULLS LAST
     LIMIT $5::int
     `,
     [
-      MIN_QUALITY_SCORE,
-      MIN_VOLUME_5M,
+      MIN_MARKET_CAP_USD,
+      MAX_MARKET_CAP_USD,
       MIN_BUYS_5M,
       RESCRAPE_COOLDOWN_MINUTES,
       limit,
@@ -188,192 +204,74 @@ async function getSocialCandidates(limit = TOKEN_LIMIT) {
   return result.rows;
 }
 
+function cleanSymbol(symbol) {
+  return String(symbol || "")
+    .replace(/^\$/, "")
+    .replace(/[^a-zA-Z0-9_]/g, "")
+    .toUpperCase()
+    .trim();
+}
+
 function buildSearchTerms(token) {
   const terms = [];
 
   const address = String(token.token_address || "").trim();
-  const symbol = String(token.symbol || "")
-    .replace(/^\$/, "")
-    .toUpperCase()
-    .trim();
+  const symbol = cleanSymbol(token.symbol);
 
-  // 🔥 PRIORITY: ticker first
-  if (symbol && symbol.length <= 12) {
-    terms.push(`$${symbol}`);
-    terms.push(`"$${symbol}"`);
-
-    if (address) {
-      terms.push(`$${symbol} CA`);
-      terms.push(`$${symbol} contract`);
-    }
-  }
-
-  // fallback: contract
+  // CA first: cleanest pump-fun signal
   if (address) {
-    const short = address.slice(0, 6);
+    terms.push({
+      term: address,
+      matchType: "ca",
+    });
 
-    terms.push(address);
-    terms.push(`"${address}"`);
-    terms.push(short);
-    terms.push(`"${short}"`);
+    terms.push({
+      term: `"${address}"`,
+      matchType: "ca_exact",
+    });
   }
 
-  return terms.filter(Boolean);
-}
+  // Ticker second: useful, but noisier
+  if (symbol && symbol.length >= 2 && symbol.length <= 12) {
+    terms.push({
+      term: `$${symbol}`,
+      matchType: "ticker",
+    });
 
-async function fetchTokenMetadata(tokenId) {
-  if (!HELIUS_API_KEY) {
-    logError("Missing HELIUS_API_KEY", { tokenId });
-    return null;
+    terms.push({
+      term: `"$${symbol}"`,
+      matchType: "ticker_exact",
+    });
+
+    terms.push({
+      term: `$${symbol} CA`,
+      matchType: "ticker_ca",
+    });
+
+    terms.push({
+      term: `$${symbol} pump`,
+      matchType: "ticker_pump",
+    });
   }
 
-  try {
-    const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        mintAccounts: [tokenId],
-      }),
-    });
-
-    const text = await res.text();
-
-    logInfo("Helius metadata HTTP response", {
-      tokenId,
-      status: res.status,
-      ok: res.ok,
-      preview: text.slice(0, 500),
-    });
-
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (err) {
-      logError("Failed to parse Helius metadata response", {
-        tokenId,
-        preview: text.slice(0, 500),
-        error: err.message,
-      });
-      return null;
-    }
-
-    if (!res.ok) {
-      logError("Helius metadata non-200 response", {
-        tokenId,
-        status: res.status,
-        preview: JSON.stringify(json).slice(0, 500),
-      });
-      return null;
-    }
-
-    const item = Array.isArray(json) ? json[0] : json;
-
-    if (!item || typeof item !== "object") {
-      logInfo("No Helius metadata found", {
-        tokenId,
-        payloadType: typeof json,
-      });
-      return null;
-    }
-
-    const rawSymbol =
-      item?.onChainMetadata?.metadata?.data?.symbol ??
-      item?.offChainMetadata?.metadata?.symbol ??
-      item?.offChainMetadata?.symbol ??
-      item?.content?.metadata?.symbol ??
-      item?.metadata?.symbol ??
-      item?.tokenInfo?.symbol ??
-      item?.symbol ??
-      null;
-
-    const rawName =
-      item?.onChainMetadata?.metadata?.data?.name ??
-      item?.offChainMetadata?.metadata?.name ??
-      item?.offChainMetadata?.name ??
-      item?.content?.metadata?.name ??
-      item?.metadata?.name ??
-      item?.tokenInfo?.name ??
-      item?.name ??
-      null;
-
-    const clean = (value) => {
-      if (value == null) return null;
-      const str = String(value).replace(/\0/g, "").trim();
-      return str.length > 0 ? str : null;
-    };
-
-    const symbol = clean(rawSymbol);
-    const name = clean(rawName);
-
-    logInfo("Helius metadata parsed", {
-      tokenId,
-      symbol,
-      name,
-      topLevelKeys: Object.keys(item).slice(0, 20),
-    });
-
-    if (!symbol && !name) {
-      logInfo("Helius metadata returned no usable symbol/name", {
-        tokenId,
-        itemPreview: JSON.stringify(item).slice(0, 700),
-      });
-      return null;
-    }
-
-    return { symbol, name };
-  } catch (err) {
-    logError("Helius metadata fetch error", {
-      tokenId,
-      error: err.message,
-    });
-    return null;
-  }
-}
-async function upsertTokenMetadata(tokenId, metadata) {
-  if (!tokenId || !metadata) return false;
-
-  const result = await pool.query(
-    `
-    INSERT INTO token_metadata (
-      token_id,
-      symbol,
-      name,
-      last_fetched
-    )
-    VALUES ($1::text, $2::text, $3::text, NOW())
-    ON CONFLICT (token_id) DO UPDATE
-    SET
-      symbol = EXCLUDED.symbol,
-      name = EXCLUDED.name,
-      last_fetched = NOW()
-    RETURNING token_id
-    `,
-    [String(tokenId), metadata.symbol || null, metadata.name || null]
-  );
-
-  return result.rowCount > 0;
+  return terms;
 }
 
-async function runApifySearch(searchTerms, tokenId) {
+async function runApifySearch(termObject, tokenAddress) {
   if (!APIFY_API_TOKEN) {
-    logError("Missing APIFY_API_TOKEN");
     return {
       ok: false,
       tweets: [],
       reason: "missing_apify_token",
-      searchTerms,
     };
   }
 
-  const url = `https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
+  const encodedActorId = APIFY_ACTOR_ID.replace("/", "~");
+  const url = `https://api.apify.com/v2/acts/${encodedActorId}/run-sync-get-dataset-items?token=${APIFY_API_TOKEN}`;
 
   const body = {
-    searchTerms,
-    maxTweets: MAX_TWEETS_PER_TOKEN,
+    searchTerms: [termObject.term],
+    maxTweets: MAX_TWEETS_PER_SEARCH,
     sort: "Latest",
   };
 
@@ -381,22 +279,20 @@ async function runApifySearch(searchTerms, tokenId) {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
   } catch (err) {
     logError("Apify network error", {
-      tokenId,
-      searchTerms,
+      tokenAddress,
+      term: termObject.term,
       error: err.message,
     });
+
     return {
       ok: false,
       tweets: [],
       reason: "network_error",
-      searchTerms,
     };
   }
 
@@ -406,154 +302,120 @@ async function runApifySearch(searchTerms, tokenId) {
   try {
     json = JSON.parse(text);
   } catch (err) {
-    logError("Failed to parse Apify response", {
-      tokenId,
+    logError("Bad Apify JSON", {
+      tokenAddress,
       status: res.status,
-      searchTerms,
+      term: termObject.term,
       preview: text.slice(0, 300),
     });
+
     return {
       ok: false,
       tweets: [],
       reason: "bad_json",
-      searchTerms,
     };
   }
 
   if (!res.ok) {
-    const preview = JSON.stringify(json).slice(0, 300);
-
-    if (res.status === 403) {
-      logError("Apify access denied or usage capped", {
-        tokenId,
-        status: res.status,
-        searchTerms,
-        preview,
-      });
-      return {
-        ok: false,
-        tweets: [],
-        reason: "apify_403",
-        searchTerms,
-      };
-    }
-
-    logError("Apify returned non-200 response", {
-      tokenId,
+    logError("Apify non-200 response", {
+      tokenAddress,
       status: res.status,
-      searchTerms,
-      preview,
+      term: termObject.term,
+      preview: JSON.stringify(json).slice(0, 300),
     });
+
     return {
       ok: false,
       tweets: [],
-      reason: "apify_error",
-      searchTerms,
+      reason: res.status === 403 ? "apify_403" : "apify_error",
     };
   }
 
   if (!Array.isArray(json)) {
-    logError("Apify returned unexpected payload", {
-      tokenId,
-      payloadType: typeof json,
-      searchTerms,
-      preview: JSON.stringify(json).slice(0, 300),
-    });
     return {
       ok: false,
       tweets: [],
       reason: "unexpected_payload",
-      searchTerms,
     };
   }
 
-  const filteredTweets = json.filter((tweet) => {
+  const tweets = json.filter((tweet) => {
     if (!tweet || typeof tweet !== "object") return false;
     if (tweet.noResults === true) return false;
 
-    const hasId =
-      tweet.id != null ||
-      tweet.id_str != null ||
-      tweet.tweetId != null ||
-      tweet.postId != null ||
-      tweet.url != null ||
-      tweet.tweetUrl != null;
-
-    return hasId;
+    return Boolean(
+      tweet.id ||
+      tweet.id_str ||
+      tweet.tweetId ||
+      tweet.postId ||
+      tweet.url ||
+      tweet.tweetUrl
+    );
   });
-
-  if (json.length > 0 && filteredTweets.length === 0) {
-    logInfo("Apify returned only non-tweet placeholder items", {
-      tokenId,
-      searchTerms,
-      rawCount: json.length,
-      sample: json[0],
-    });
-  }
 
   return {
     ok: true,
-    tweets: filteredTweets,
+    tweets,
     reason: null,
-    searchTerms,
   };
 }
 
 async function searchTweetsForToken(token) {
-  const searchTerms = buildSearchTerms(token);
+  const termObjects = buildSearchTerms(token);
+  const allTweets = [];
+  const usedTerms = [];
 
-  if (searchTerms.length === 0) {
-    logError("No search terms could be built", {
-      tokenId: token.token_id,
-      tokenAddress: token.token_address,
-      symbol: token.symbol || null,
-    });
+  if (termObjects.length === 0) {
     return {
       ok: false,
       tweets: [],
       reason: "no_search_terms",
-      searchTerms: [],
+      usedTerms: [],
     };
   }
 
-  // Try one term at a time for cleaner matching
-  for (const term of searchTerms) {
-    const result = await runApifySearch([term], token.token_id);
+  for (const termObject of termObjects) {
+    const result = await runApifySearch(termObject, token.token_address);
+
+    usedTerms.push(termObject);
 
     if (!result.ok) {
       if (result.reason === "apify_403") {
-        return result;
+        return {
+          ok: false,
+          tweets: allTweets,
+          reason: "apify_403",
+          usedTerms,
+        };
       }
+
       continue;
     }
 
-    if (result.tweets.length > 0) {
-      logInfo("Apify search completed", {
-        tokenId: token.token_id,
-        searchTerms: [term],
-        tweetsReturned: result.tweets.length,
+    for (const tweet of result.tweets) {
+      allTweets.push({
+        tweet,
+        matchValue: termObject.term,
+        matchType: termObject.matchType,
       });
-
-      return {
-        ok: true,
-        tweets: result.tweets,
-        reason: null,
-        searchTerms: [term],
-      };
     }
 
-    logInfo("No usable tweets found for token search", {
-      tokenId: token.token_id,
-      searchTerms: [term],
-      rawCount: 0,
-    });
+    // If CA search finds tweets, that is enough. Avoid spending usage on noisy ticker searches.
+    if (
+      result.tweets.length > 0 &&
+      ["ca", "ca_exact"].includes(termObject.matchType)
+    ) {
+      break;
+    }
+
+    await sleep(250);
   }
 
   return {
     ok: true,
-    tweets: [],
+    tweets: allTweets,
     reason: null,
-    searchTerms,
+    usedTerms,
   };
 }
 
@@ -570,36 +432,46 @@ function extractTweetId(tweet) {
 }
 
 function extractAuthorId(tweet) {
-  const rawAuthorId =
+  const raw =
     tweet.authorId ??
     tweet.user?.id ??
     tweet.author?.id ??
+    tweet.userId ??
     null;
 
-  return rawAuthorId ? String(rawAuthorId) : null;
+  return raw ? String(raw) : null;
+}
+
+function extractAuthorUsername(tweet) {
+  const raw =
+    tweet.author?.userName ??
+    tweet.author?.username ??
+    tweet.user?.userName ??
+    tweet.user?.username ??
+    tweet.username ??
+    tweet.userName ??
+    null;
+
+  return raw ? String(raw) : null;
 }
 
 function extractText(tweet) {
-  return tweet.text ?? tweet.fullText ?? "";
+  return tweet.text ?? tweet.fullText ?? tweet.content ?? "";
 }
 
 function extractCreatedAt(tweet) {
-  const value = tweet.createdAt ?? tweet.created_at ?? null;
+  const value = tweet.createdAt ?? tweet.created_at ?? tweet.date ?? null;
   if (!value) return new Date().toISOString();
 
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return new Date().toISOString();
-  }
+  if (Number.isNaN(parsed.getTime())) return new Date().toISOString();
 
   return parsed.toISOString();
 }
 
 function extractMetrics(tweet) {
   return {
-    like_count: Number(
-      tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0
-    ),
+    like_count: Number(tweet.likeCount ?? tweet.likes ?? tweet.favoriteCount ?? 0),
     retweet_count: Number(tweet.retweetCount ?? tweet.retweets ?? 0),
     reply_count: Number(tweet.replyCount ?? tweet.replies ?? 0),
     quote_count: Number(tweet.quoteCount ?? tweet.quotes ?? 0),
@@ -609,31 +481,28 @@ function extractMetrics(tweet) {
 async function insertRawTweet(tweet) {
   const tweetId = extractTweetId(tweet);
   if (!tweetId) {
-    console.log(
-      "[x-worker] 🚨 tweet missing ID, raw object:",
-      JSON.stringify(tweet, null, 2)
-    );
-    return { inserted: false, tweetId: null, skipped: true };
+    return {
+      inserted: false,
+      skipped: true,
+      tweetId: null,
+    };
   }
-
-  const authorId = extractAuthorId(tweet);
-  const text = extractText(tweet);
-  const createdAt = extractCreatedAt(tweet);
-  const publicMetrics = extractMetrics(tweet);
 
   const result = await pool.query(
     `
     INSERT INTO x_raw_tweets (
       tweet_id,
       author_id,
+      author_username,
       text,
       created_at,
       public_metrics
     )
-    VALUES ($1, $2, $3, $4, $5::jsonb)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
     ON CONFLICT (tweet_id) DO UPDATE
     SET
       author_id = EXCLUDED.author_id,
+      author_username = EXCLUDED.author_username,
       text = EXCLUDED.text,
       created_at = EXCLUDED.created_at,
       public_metrics = EXCLUDED.public_metrics
@@ -641,128 +510,132 @@ async function insertRawTweet(tweet) {
     `,
     [
       tweetId,
-      authorId,
-      text || null,
-      createdAt,
-      JSON.stringify(publicMetrics),
+      extractAuthorId(tweet),
+      extractAuthorUsername(tweet),
+      extractText(tweet) || null,
+      extractCreatedAt(tweet),
+      JSON.stringify(extractMetrics(tweet)),
     ]
   );
 
   return {
     inserted: result.rowCount > 0,
-    tweetId,
     skipped: false,
+    tweetId,
   };
 }
 
-async function insertTokenMention(tokenId, tweetId, matchValue) {
-  if (!tweetId) return { inserted: false };
+async function insertTokenMention(tokenAddress, tweetId, matchValue, matchType) {
+  if (!tokenAddress || !tweetId) {
+    return { inserted: false };
+  }
 
   const result = await pool.query(
     `
-    INSERT INTO token_x_mentions (
-      token_id,
+    INSERT INTO pregrad_token_x_mentions (
+      token_address,
       tweet_id,
-      match_value
+      match_value,
+      match_type
     )
-    VALUES ($1::text, $2::text, $3::text)
-    ON CONFLICT (token_id, tweet_id) DO NOTHING
+    VALUES ($1::text, $2::text, $3::text, $4::text)
+    ON CONFLICT (token_address, tweet_id) DO NOTHING
     RETURNING id
     `,
-    [String(tokenId), String(tweetId), matchValue ? String(matchValue) : null]
+    [
+      String(tokenAddress),
+      String(tweetId),
+      matchValue ? String(matchValue) : null,
+      matchType ? String(matchType) : null,
+    ]
   );
 
-  return { inserted: result.rowCount > 0 };
+  return {
+    inserted: result.rowCount > 0,
+  };
 }
 
-async function updateSocialSnapshots(windowMinutes = SNAPSHOT_WINDOW_MINUTES) {
+async function insertSocialSnapshot(token, usedTerms) {
   const result = await pool.query(
     `
-    INSERT INTO token_social_snapshots (
-      token_id,
+    INSERT INTO pregrad_token_social_snapshots (
+      token_address,
+      symbol,
+      name,
       ts,
       window_minutes,
       mentions_count,
+      ca_mentions_count,
+      ticker_mentions_count,
       unique_authors,
       likes_total,
       rts_total,
       replies_total,
-      quotes_total
+      quotes_total,
+      searched,
+      search_terms
     )
     SELECT
-      txm.token_id,
-      NOW(),
-      $1::int,
-      COUNT(*)::INT AS mentions_count,
-      COUNT(DISTINCT x.author_id)::INT AS unique_authors,
-      COALESCE(SUM((x.public_metrics->>'like_count')::INT), 0)::INT AS likes_total,
-      COALESCE(SUM((x.public_metrics->>'retweet_count')::INT), 0)::INT AS rts_total,
-      COALESCE(SUM((x.public_metrics->>'reply_count')::INT), 0)::INT AS replies_total,
-      COALESCE(SUM((x.public_metrics->>'quote_count')::INT), 0)::INT AS quotes_total
-    FROM token_x_mentions txm
-    JOIN x_raw_tweets x
+      $1::text AS token_address,
+      $2::text AS symbol,
+      $3::text AS name,
+      NOW() AS ts,
+      $4::int AS window_minutes,
+
+      COUNT(txm.tweet_id)::int AS mentions_count,
+
+      COUNT(txm.tweet_id) FILTER (
+        WHERE txm.match_type IN ('ca', 'ca_exact')
+      )::int AS ca_mentions_count,
+
+      COUNT(txm.tweet_id) FILTER (
+        WHERE txm.match_type NOT IN ('ca', 'ca_exact')
+      )::int AS ticker_mentions_count,
+
+      COUNT(DISTINCT x.author_id)::int AS unique_authors,
+
+      COALESCE(SUM((x.public_metrics->>'like_count')::int), 0)::int AS likes_total,
+      COALESCE(SUM((x.public_metrics->>'retweet_count')::int), 0)::int AS rts_total,
+      COALESCE(SUM((x.public_metrics->>'reply_count')::int), 0)::int AS replies_total,
+      COALESCE(SUM((x.public_metrics->>'quote_count')::int), 0)::int AS quotes_total,
+
+      TRUE AS searched,
+      $5::jsonb AS search_terms
+
+    FROM (
+      SELECT $1::text AS token_address
+    ) base
+    LEFT JOIN pregrad_token_x_mentions txm
+      ON txm.token_address = base.token_address
+    LEFT JOIN x_raw_tweets x
       ON x.tweet_id = txm.tweet_id
-    WHERE x.created_at > NOW() - make_interval(mins => $1::int)
-    GROUP BY txm.token_id
+     AND x.created_at > NOW() - make_interval(mins => $4::int)
     `,
-    [windowMinutes]
+    [
+      token.token_address,
+      token.symbol || null,
+      token.name || null,
+      SNAPSHOT_WINDOW_MINUTES,
+      JSON.stringify(usedTerms || []),
+    ]
   );
 
   return result.rowCount;
 }
 
 async function processToken(token, index, total) {
-  const tokenId = token.token_id;
-  const address = token.token_address;
-
-  if (!address) {
-    logError("Token missing address", { index, total, tokenId });
-    return {
-      ok: false,
-      tokenId,
-      tweetsFetched: 0,
-      rawInserted: 0,
-      mentionsInserted: 0,
-      skippedNoId: 0,
-      reason: "missing_token_address",
-      searchTerms: [],
-    };
-  }
-
-  try {
-    if (!token.symbol) {
-      const metadata = await fetchTokenMetadata(tokenId);
-
-      if (metadata && (metadata.symbol || metadata.name)) {
-        await upsertTokenMetadata(tokenId, metadata);
-        token.symbol = metadata.symbol || null;
-
-        logInfo("Token metadata updated", {
-          tokenId,
-          symbol: metadata.symbol,
-          name: metadata.name,
-        });
-      }
-    }
-  } catch (err) {
-    logError("Failed metadata enrichment", {
-      tokenId,
-      error: err.message,
-    });
-  }
+  const tokenAddress = token.token_address;
 
   const searchResult = await searchTweetsForToken(token);
 
-  if (!searchResult.ok) {
+  if (!searchResult.ok && searchResult.reason === "apify_403") {
     return {
       ok: false,
-      tokenId,
+      tokenAddress,
+      reason: "apify_403",
       tweetsFetched: 0,
       rawInserted: 0,
       mentionsInserted: 0,
-      skippedNoId: 0,
-      reason: searchResult.reason || "apify_error",
-      searchTerms: searchResult.searchTerms || [],
     };
   }
 
@@ -770,130 +643,102 @@ async function processToken(token, index, total) {
   let mentionsInserted = 0;
   let skippedNoId = 0;
 
-  for (const tweet of searchResult.tweets) {
+  for (const item of searchResult.tweets || []) {
     try {
-      const rawResult = await insertRawTweet(tweet);
+      const rawResult = await insertRawTweet(item.tweet);
 
       if (rawResult.skipped || !rawResult.tweetId) {
         skippedNoId += 1;
         continue;
       }
 
-      if (rawResult.inserted) {
-        rawInserted += 1;
-      }
+      if (rawResult.inserted) rawInserted += 1;
 
       const mentionResult = await insertTokenMention(
-        tokenId,
+        tokenAddress,
         rawResult.tweetId,
-        (searchResult.searchTerms && searchResult.searchTerms[0]) || address
+        item.matchValue,
+        item.matchType
       );
 
-      if (mentionResult.inserted) {
-        mentionsInserted += 1;
-      }
+      if (mentionResult.inserted) mentionsInserted += 1;
     } catch (err) {
       logError("Failed storing tweet", {
-        tokenId,
-        address,
+        tokenAddress,
         error: err.message,
       });
     }
   }
 
+  await insertSocialSnapshot(token, searchResult.usedTerms || []);
+
   logInfo("Token processed", {
     index,
     total,
-    tokenId,
-    address,
+    tokenAddress,
     symbol: token.symbol || null,
-    searchTerms: searchResult.searchTerms || [],
-    tweetsFetched: searchResult.tweets.length,
+    name: token.name || null,
+    marketCap: token.market_cap_usd,
+    buys5m: token.buys_5m,
+    uniqueWallets5m: token.unique_wallets_5m,
+    tweetsFetched: searchResult.tweets?.length || 0,
     rawInserted,
     mentionsInserted,
     skippedNoId,
-    qualityScore: token.quality_score,
-    volume5m: token.volume_5m,
-    buys5m: token.buys_5m,
-    sells5m: token.sells_5m,
+    searchedTerms: searchResult.usedTerms || [],
   });
 
   return {
     ok: true,
-    tokenId,
-    tweetsFetched: searchResult.tweets.length,
+    tokenAddress,
+    tweetsFetched: searchResult.tweets?.length || 0,
     rawInserted,
     mentionsInserted,
-    skippedNoId,
-    searchTerms: searchResult.searchTerms || [],
   };
 }
 
 async function fetchMentionsCycle() {
   const startedAt = Date.now();
 
-  const tokens = await getSocialCandidates(TOKEN_LIMIT);
-  logInfo("Loaded social candidates", { count: tokens.length });
+  const tokens = await getPregradSocialCandidates(TOKEN_LIMIT);
 
-  if (tokens.length === 0) {
-    logInfo("No social candidates found");
-    return;
-  }
+  logInfo("Loaded pregrad social candidates", {
+    count: tokens.length,
+  });
+
+  if (tokens.length === 0) return;
 
   let successCount = 0;
   let failureCount = 0;
   let totalFetched = 0;
   let totalRawInserted = 0;
   let totalMentionsInserted = 0;
-  let totalSkippedNoId = 0;
-  let apify403Count = 0;
 
   for (let i = 0; i < tokens.length; i += 1) {
     try {
       const result = await processToken(tokens[i], i + 1, tokens.length);
 
-      totalFetched += result.tweetsFetched;
-      totalRawInserted += result.rawInserted;
-      totalMentionsInserted += result.mentionsInserted;
-      totalSkippedNoId += result.skippedNoId;
+      if (result.ok) successCount += 1;
+      else failureCount += 1;
 
-      if (result.ok) {
-        successCount += 1;
-      } else {
-        failureCount += 1;
+      totalFetched += result.tweetsFetched || 0;
+      totalRawInserted += result.rawInserted || 0;
+      totalMentionsInserted += result.mentionsInserted || 0;
 
-        if (result.reason === "apify_403") {
-          apify403Count += 1;
-        }
-
-        logError("Token failed", {
-          index: i + 1,
-          total: tokens.length,
-          tokenId: result.tokenId,
-          reason: result.reason,
-          searchTerms: result.searchTerms || [],
-        });
+      if (result.reason === "apify_403") {
+        logError("Stopping cycle because Apify returned 403", {});
+        break;
       }
     } catch (err) {
       failureCount += 1;
-      logError("Unhandled token processing failure", {
-        index: i + 1,
-        total: tokens.length,
-        tokenId: tokens[i]?.token_id ?? null,
+
+      logError("Unhandled token failure", {
+        tokenAddress: tokens[i]?.token_address || null,
         error: err.message,
       });
     }
 
     await sleep(PER_TOKEN_SLEEP_MS);
-  }
-
-  let snapshotsInserted = 0;
-  try {
-    snapshotsInserted = await updateSocialSnapshots(SNAPSHOT_WINDOW_MINUTES);
-  } catch (err) {
-    logError("Failed updating social snapshots", {
-      error: err.message,
-    });
   }
 
   logInfo("Cycle complete", {
@@ -903,9 +748,6 @@ async function fetchMentionsCycle() {
     tweetsFetched: totalFetched,
     rawTweetsInserted: totalRawInserted,
     mentionsInserted: totalMentionsInserted,
-    skippedNoId: totalSkippedNoId,
-    snapshotsInserted,
-    apify403Count,
   });
 }
 
@@ -913,24 +755,25 @@ async function main() {
   try {
     await ensureSchema();
 
-    logInfo("X mentions worker started", {
+    logInfo("Pregrad X mentions worker started", {
+      actorId: APIFY_ACTOR_ID,
       tokenLimit: TOKEN_LIMIT,
-      maxTweetsPerToken: MAX_TWEETS_PER_TOKEN,
+      maxTweetsPerSearch: MAX_TWEETS_PER_SEARCH,
       snapshotWindowMinutes: SNAPSHOT_WINDOW_MINUTES,
       loopSleepMs: LOOP_SLEEP_MS,
-      minQualityScore: MIN_QUALITY_SCORE,
-      minVolume5m: MIN_VOLUME_5M,
+      minMarketCapUsd: MIN_MARKET_CAP_USD,
+      maxMarketCapUsd: MAX_MARKET_CAP_USD,
       minBuys5m: MIN_BUYS_5M,
       rescrapeCooldownMinutes: RESCRAPE_COOLDOWN_MINUTES,
-      perTokenSleepMs: PER_TOKEN_SLEEP_MS,
     });
 
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
         await fetchMentionsCycle();
       } catch (err) {
-        logError("Cycle failed", { error: err.message });
+        logError("Cycle failed", {
+          error: err.message,
+        });
       }
 
       logInfo("Sleeping before next cycle", {
@@ -940,7 +783,10 @@ async function main() {
       await sleep(LOOP_SLEEP_MS);
     }
   } catch (err) {
-    logError("Fatal worker error", { error: err.message });
+    logError("Fatal worker error", {
+      error: err.message,
+    });
+
     process.exit(1);
   }
 }

@@ -1,5 +1,5 @@
 // PreGrad index.js
-// Fresh version with live market_cap_usd updates from buy/sell events
+// Fresh version with live market_cap_usd updates + token safety enrichment
 
 require("dotenv").config();
 
@@ -45,6 +45,30 @@ const DEFAULT_MIN_SOL_AMOUNT = Number(process.env.MIN_SOL_AMOUNT || 0.1);
 const PREGRAD_TOKEN_SUPPLY = Number(process.env.PREGRAD_TOKEN_SUPPLY || 1000000000);
 const SOL_PRICE_USD = Number(process.env.SOL_PRICE_USD || 150);
 
+// -----------------------------
+// Token safety enrichment controls
+// -----------------------------
+const TOKEN_SAFETY_ENRICHMENT_ENABLED =
+  String(process.env.TOKEN_SAFETY_ENRICHMENT_ENABLED || "true") === "true";
+
+const HOLDER_ENRICHMENT_ENABLED =
+  String(process.env.HOLDER_ENRICHMENT_ENABLED || "true") === "true";
+
+const HOLDER_REFRESH_COOLDOWN_MS = Number(
+  process.env.HOLDER_REFRESH_COOLDOWN_MS || 10 * 60 * 1000
+);
+
+const HOLDER_MIN_TOP1_RISK_PCT = Number(process.env.HOLDER_MIN_TOP1_RISK_PCT || 15);
+const HOLDER_MIN_TOP5_RISK_PCT = Number(process.env.HOLDER_MIN_TOP5_RISK_PCT || 50);
+const HOLDER_MIN_TOP10_RISK_PCT = Number(process.env.HOLDER_MIN_TOP10_RISK_PCT || 80);
+
+const LP_ENRICHMENT_ENABLED =
+  String(process.env.LP_ENRICHMENT_ENABLED || "true") === "true";
+
+const LP_REFRESH_COOLDOWN_MS = Number(
+  process.env.LP_REFRESH_COOLDOWN_MS || 30 * 60 * 1000
+);
+
 const WSS_URL = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
@@ -77,6 +101,10 @@ const seenSignatures = new Set();
 const queuedSignatures = new Set();
 const signatureQueue = [];
 const workerPromises = [];
+
+const tokenSafetyEnrichmentInFlight = new Map();
+const tokenLastHolderEnrichedAt = new Map();
+const tokenLastLpEnrichedAt = new Map();
 
 const SEEN_SIGNATURE_LIMIT = 100000;
 
@@ -112,6 +140,13 @@ const stats = {
   classifiedSell: 0,
   classifiedMigrate: 0,
   classifiedUnknown: 0,
+
+  safetyEnrichmentRuns: 0,
+  safetyEnrichmentSkippedCooldown: 0,
+  safetyEnrichmentErrors: 0,
+  lpEnrichmentRuns: 0,
+  lpEnrichmentSkippedCooldown: 0,
+  lpEnrichmentErrors: 0,
 };
 
 function logInfo(message, extra = {}) {
@@ -267,6 +302,15 @@ async function heliusRpc(method, params) {
   if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
 
   return json.result;
+}
+
+
+async function fetchTokenSupply(mintAddress) {
+  return heliusRpc("getTokenSupply", [mintAddress]);
+}
+
+async function fetchLargestTokenAccounts(mintAddress) {
+  return heliusRpc("getTokenLargestAccounts", [mintAddress]);
 }
 
 async function fetchFullTransaction(signature) {
@@ -485,6 +529,91 @@ function extractTokenAmount(tx, tokenAddress) {
   return maxTokenUiAmount;
 }
 
+
+function toNum(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizePct(value) {
+  if (value == null || !Number.isFinite(value)) return null;
+  return Number(value.toFixed(4));
+}
+
+function parseLargestAccountUiAmount(row) {
+  if (row?.uiAmount != null) {
+    const n = Number(row.uiAmount);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  if (row?.amount != null && row?.decimals != null) {
+    const n = Number(row.amount) / 10 ** Number(row.decimals);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  if (row?.uiAmountString != null) {
+    const n = Number(row.uiAmountString);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  return 0;
+}
+
+function calculateHolderConcentrationFromLargestAccounts(largestAccounts = [], totalSupplyUi = 0) {
+  if (!Array.isArray(largestAccounts) || largestAccounts.length === 0 || totalSupplyUi <= 0) {
+    return {
+      top_holder_pct: null,
+      top_5_holders_pct: null,
+      top_10_holders_pct: null,
+      holder_count_estimate: 0,
+    };
+  }
+
+  const amounts = largestAccounts
+    .map(parseLargestAccountUiAmount)
+    .filter((v) => v > 0)
+    .sort((a, b) => b - a);
+
+  if (!amounts.length) {
+    return {
+      top_holder_pct: null,
+      top_5_holders_pct: null,
+      top_10_holders_pct: null,
+      holder_count_estimate: 0,
+    };
+  }
+
+  const sum = (arr) => arr.reduce((acc, v) => acc + v, 0);
+
+  return {
+    top_holder_pct: normalizePct((amounts[0] / totalSupplyUi) * 100),
+    top_5_holders_pct: normalizePct((sum(amounts.slice(0, 5)) / totalSupplyUi) * 100),
+    top_10_holders_pct: normalizePct((sum(amounts.slice(0, 10)) / totalSupplyUi) * 100),
+    holder_count_estimate: amounts.length,
+  };
+}
+
+function classifyConcentrationRisk({ top_holder_pct, top_5_holders_pct, top_10_holders_pct }) {
+  const top1 = toNum(top_holder_pct, 0);
+  const top5 = toNum(top_5_holders_pct, 0);
+  const top10 = toNum(top_10_holders_pct, 0);
+
+  if (top1 >= 25 || top5 >= 70 || top10 >= 90) return "high";
+  if (top1 >= HOLDER_MIN_TOP1_RISK_PCT || top5 >= HOLDER_MIN_TOP5_RISK_PCT || top10 >= HOLDER_MIN_TOP10_RISK_PCT) {
+    return "medium";
+  }
+
+  return "low";
+}
+
+function classifyLpBurnRisk({ lp_mint_address, lp_burned_amount, lp_burned_pct }) {
+  if (!lp_mint_address) return "unknown";
+  if (toNum(lp_burned_pct, 0) >= 99) return "low";
+  if (toNum(lp_burned_pct, 0) >= 90) return "medium";
+  if (toNum(lp_burned_amount, 0) <= 0) return "high";
+  return "unknown";
+}
+
 function classifyPregradEvent(tx, signature) {
   if (!tx || !tx.meta || !tx.transaction) return { ok: false, reason: "missing tx fields" };
   if (tx.meta.err) return { ok: false, reason: "tx failed" };
@@ -634,6 +763,67 @@ async function createTables() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS pump_launchpad_tokens_market_idx
     ON pump_launchpad_tokens (graduation_status, market_cap_usd DESC, updated_market_data_at DESC);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_safety_enrichment (
+      token_id TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      dev_hold_pct NUMERIC,
+      insiders_pct NUMERIC,
+      phishing_pct NUMERIC,
+      bundler_pct NUMERIC,
+      sniper_pct NUMERIC,
+      dex_paid BOOLEAN,
+      burnt BOOLEAN,
+      no_mint BOOLEAN,
+      no_blacklist BOOLEAN,
+      source TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      pool_address TEXT,
+      lp_mint_address TEXT,
+      lp_total_supply NUMERIC,
+      lp_burned_amount NUMERIC,
+      lp_burned_pct NUMERIC,
+      top_holder_pct NUMERIC,
+      top_5_holders_pct NUMERIC,
+      top_10_holders_pct NUMERIC,
+      holder_count_estimate INTEGER,
+      concentration_risk TEXT,
+      lp_burn_risk TEXT
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE token_safety_enrichment
+    ADD COLUMN IF NOT EXISTS token_address TEXT,
+    ADD COLUMN IF NOT EXISTS dev_hold_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS insiders_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS phishing_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS bundler_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS sniper_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS dex_paid BOOLEAN,
+    ADD COLUMN IF NOT EXISTS burnt BOOLEAN,
+    ADD COLUMN IF NOT EXISTS no_mint BOOLEAN,
+    ADD COLUMN IF NOT EXISTS no_blacklist BOOLEAN,
+    ADD COLUMN IF NOT EXISTS source TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS pool_address TEXT,
+    ADD COLUMN IF NOT EXISTS lp_mint_address TEXT,
+    ADD COLUMN IF NOT EXISTS lp_total_supply NUMERIC,
+    ADD COLUMN IF NOT EXISTS lp_burned_amount NUMERIC,
+    ADD COLUMN IF NOT EXISTS lp_burned_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS top_holder_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS top_5_holders_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS top_10_holders_pct NUMERIC,
+    ADD COLUMN IF NOT EXISTS holder_count_estimate INTEGER,
+    ADD COLUMN IF NOT EXISTS concentration_risk TEXT,
+    ADD COLUMN IF NOT EXISTS lp_burn_risk TEXT;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS token_safety_enrichment_updated_idx
+    ON token_safety_enrichment (updated_at DESC);
   `);
 
   if (STORE_RAW_EVENTS) {
@@ -838,6 +1028,214 @@ async function insertLaunchpadEvent(event) {
   return false;
 }
 
+
+async function upsertTokenSafetyEnrichment({
+  token_id,
+  token_address,
+  top_holder_pct,
+  top_5_holders_pct,
+  top_10_holders_pct,
+  holder_count_estimate,
+  concentration_risk,
+  lp_mint_address,
+  lp_total_supply,
+  lp_burned_amount,
+  lp_burned_pct,
+  lp_burn_risk,
+  source = "pregrad_holder_scan",
+}) {
+  if (!token_id && !token_address) return;
+
+  const tokenId = token_id || token_address;
+  const tokenAddress = token_address || token_id;
+
+  await pool.query(
+    `
+    INSERT INTO token_safety_enrichment (
+      token_id,
+      token_address,
+      top_holder_pct,
+      top_5_holders_pct,
+      top_10_holders_pct,
+      holder_count_estimate,
+      concentration_risk,
+      lp_mint_address,
+      lp_total_supply,
+      lp_burned_amount,
+      lp_burned_pct,
+      lp_burn_risk,
+      source,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+    ON CONFLICT (token_id)
+    DO UPDATE SET
+      token_address = COALESCE(EXCLUDED.token_address, token_safety_enrichment.token_address),
+      top_holder_pct = COALESCE(EXCLUDED.top_holder_pct, token_safety_enrichment.top_holder_pct),
+      top_5_holders_pct = COALESCE(EXCLUDED.top_5_holders_pct, token_safety_enrichment.top_5_holders_pct),
+      top_10_holders_pct = COALESCE(EXCLUDED.top_10_holders_pct, token_safety_enrichment.top_10_holders_pct),
+      holder_count_estimate = COALESCE(EXCLUDED.holder_count_estimate, token_safety_enrichment.holder_count_estimate),
+      concentration_risk = COALESCE(EXCLUDED.concentration_risk, token_safety_enrichment.concentration_risk),
+      lp_mint_address = COALESCE(EXCLUDED.lp_mint_address, token_safety_enrichment.lp_mint_address),
+      lp_total_supply = COALESCE(EXCLUDED.lp_total_supply, token_safety_enrichment.lp_total_supply),
+      lp_burned_amount = COALESCE(EXCLUDED.lp_burned_amount, token_safety_enrichment.lp_burned_amount),
+      lp_burned_pct = COALESCE(EXCLUDED.lp_burned_pct, token_safety_enrichment.lp_burned_pct),
+      lp_burn_risk = COALESCE(EXCLUDED.lp_burn_risk, token_safety_enrichment.lp_burn_risk),
+      source = EXCLUDED.source,
+      updated_at = NOW()
+    `,
+    [
+      tokenId,
+      tokenAddress,
+      top_holder_pct ?? null,
+      top_5_holders_pct ?? null,
+      top_10_holders_pct ?? null,
+      holder_count_estimate ?? null,
+      concentration_risk ?? null,
+      lp_mint_address ?? null,
+      lp_total_supply ?? null,
+      lp_burned_amount ?? null,
+      lp_burned_pct ?? null,
+      lp_burn_risk ?? null,
+      source,
+    ]
+  );
+}
+
+async function enrichTokenHolderConcentration(tokenAddress) {
+  if (!TOKEN_SAFETY_ENRICHMENT_ENABLED || !HOLDER_ENRICHMENT_ENABLED) return;
+  if (!tokenAddress) return;
+
+  const now = Date.now();
+  const last = tokenLastHolderEnrichedAt.get(tokenAddress) || 0;
+
+  if (now - last < HOLDER_REFRESH_COOLDOWN_MS) {
+    stats.safetyEnrichmentSkippedCooldown += 1;
+    return;
+  }
+
+  if (tokenSafetyEnrichmentInFlight.has(tokenAddress)) {
+    return tokenSafetyEnrichmentInFlight.get(tokenAddress);
+  }
+
+  const runPromise = (async () => {
+    try {
+      const [supplyResult, largestResult] = await Promise.all([
+        fetchTokenSupply(tokenAddress),
+        fetchLargestTokenAccounts(tokenAddress),
+      ]);
+
+      const totalSupplyUi =
+        supplyResult?.value?.uiAmount != null
+          ? Number(supplyResult.value.uiAmount)
+          : supplyResult?.value?.amount != null && supplyResult?.value?.decimals != null
+          ? Number(supplyResult.value.amount) / 10 ** Number(supplyResult.value.decimals)
+          : 0;
+
+      const concentration = calculateHolderConcentrationFromLargestAccounts(
+        largestResult?.value || [],
+        totalSupplyUi
+      );
+
+      const concentration_risk = classifyConcentrationRisk(concentration);
+
+      await upsertTokenSafetyEnrichment({
+        token_id: tokenAddress,
+        token_address: tokenAddress,
+        top_holder_pct: concentration.top_holder_pct,
+        top_5_holders_pct: concentration.top_5_holders_pct,
+        top_10_holders_pct: concentration.top_10_holders_pct,
+        holder_count_estimate: concentration.holder_count_estimate,
+        concentration_risk,
+        source: "pregrad_holder_scan",
+      });
+
+      tokenLastHolderEnrichedAt.set(tokenAddress, now);
+      stats.safetyEnrichmentRuns += 1;
+
+      logInfo("Token safety holder enrichment updated", {
+        tokenAddress,
+        totalSupplyUi,
+        topHolderPct: concentration.top_holder_pct,
+        top5Pct: concentration.top_5_holders_pct,
+        top10Pct: concentration.top_10_holders_pct,
+        concentrationRisk: concentration_risk,
+      });
+    } catch (err) {
+      stats.safetyEnrichmentErrors += 1;
+      logError("Failed token safety holder enrichment", {
+        tokenAddress,
+        error: err.message,
+      });
+    } finally {
+      tokenSafetyEnrichmentInFlight.delete(tokenAddress);
+    }
+  })();
+
+  tokenSafetyEnrichmentInFlight.set(tokenAddress, runPromise);
+  return runPromise;
+}
+
+async function enrichTokenLiquiditySafety(tokenAddress) {
+  if (!TOKEN_SAFETY_ENRICHMENT_ENABLED || !LP_ENRICHMENT_ENABLED) return;
+  if (!tokenAddress) return;
+
+  const now = Date.now();
+  const last = tokenLastLpEnrichedAt.get(tokenAddress) || 0;
+
+  if (now - last < LP_REFRESH_COOLDOWN_MS) {
+    stats.lpEnrichmentSkippedCooldown += 1;
+    return;
+  }
+
+  try {
+    // Pre-grad launchpad events do not reliably expose LP mint/burn details.
+    // Keep the row alive and mark LP risk unknown rather than inventing safety data.
+    await upsertTokenSafetyEnrichment({
+      token_id: tokenAddress,
+      token_address: tokenAddress,
+      lp_mint_address: null,
+      lp_total_supply: null,
+      lp_burned_amount: null,
+      lp_burned_pct: null,
+      lp_burn_risk: classifyLpBurnRisk({
+        lp_mint_address: null,
+        lp_burned_amount: null,
+        lp_burned_pct: null,
+      }),
+      source: "pregrad_holder_scan",
+    });
+
+    tokenLastLpEnrichedAt.set(tokenAddress, now);
+    stats.lpEnrichmentRuns += 1;
+  } catch (err) {
+    stats.lpEnrichmentErrors += 1;
+    logError("Failed token safety LP enrichment", {
+      tokenAddress,
+      error: err.message,
+    });
+  }
+}
+
+function dispatchTokenSafetyEnrichment(tokenAddress) {
+  if (!tokenAddress) return;
+
+  enrichTokenHolderConcentration(tokenAddress).catch((err) => {
+    logError("Async holder safety enrichment dispatch failed", {
+      tokenAddress,
+      error: err.message,
+    });
+  });
+
+  enrichTokenLiquiditySafety(tokenAddress).catch((err) => {
+    logError("Async LP safety enrichment dispatch failed", {
+      tokenAddress,
+      error: err.message,
+    });
+  });
+}
+
+
 function enqueueSignature(signature, slot = null, blockTime = null) {
   if (!signature) return;
 
@@ -931,6 +1329,8 @@ async function processQueuedSignature(item) {
     if (["buy", "sell"].includes(classified.event.event_type)) {
       await updateLaunchpadMarketDataFromEvent(classified.event);
     }
+
+    dispatchTokenSafetyEnrichment(classified.event.token_address);
 
     stats.processed += 1;
 

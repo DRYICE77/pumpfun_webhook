@@ -629,43 +629,80 @@ async function calculateEarlySupplySnapshot(tokenAddress, tokenCreatedAt) {
 
   const result = await pool.query(
     `
+    WITH total_supply AS (
+      SELECT
+        COALESCE(SUM(net_tokens), 0) AS total_net_tokens
+      FROM wallet_token_positions
+      WHERE token_id = $1
+        AND net_tokens > 0
+    ),
+
+    early_wallets_1m AS (
+      SELECT DISTINCT wallet_address
+      FROM pump_launchpad_events
+      WHERE token_address = $1
+        AND block_time >= $2
+        AND block_time <= $2 + INTERVAL '1 minute'
+        AND event_type = 'buy'
+        AND wallet_address IS NOT NULL
+    ),
+
+    early_wallets_3m AS (
+      SELECT DISTINCT wallet_address
+      FROM pump_launchpad_events
+      WHERE token_address = $1
+        AND block_time >= $2
+        AND block_time <= $2 + INTERVAL '3 minutes'
+        AND event_type = 'buy'
+        AND wallet_address IS NOT NULL
+    ),
+
+    early_positions_1m AS (
+      SELECT
+        COUNT(DISTINCT w.wallet_address) AS early_holder_wallet_count_1m,
+        COALESCE(SUM(w.net_tokens), 0) AS early_net_tokens_1m
+      FROM wallet_token_positions w
+      JOIN early_wallets_1m ew
+        ON ew.wallet_address = w.wallet_address
+      WHERE w.token_id = $1
+        AND w.net_tokens > 0
+    ),
+
+    early_positions_3m AS (
+      SELECT
+        COUNT(DISTINCT w.wallet_address) AS early_holder_wallet_count_3m,
+        COALESCE(SUM(w.net_tokens), 0) AS early_net_tokens_3m
+      FROM wallet_token_positions w
+      JOIN early_wallets_3m ew
+        ON ew.wallet_address = w.wallet_address
+      WHERE w.token_id = $1
+        AND w.net_tokens > 0
+    )
+
     SELECT
-      COUNT(DISTINCT wallet_address) FILTER (
-        WHERE block_time >= $2
-          AND block_time <= $2 + INTERVAL '1 minute'
-          AND event_type = 'buy'
-          AND wallet_address IS NOT NULL
-      ) AS early_holder_wallet_count_1m,
+      ep1.early_holder_wallet_count_1m,
+      ep3.early_holder_wallet_count_3m,
 
-      COUNT(DISTINCT wallet_address) FILTER (
-        WHERE block_time >= $2
-          AND block_time <= $2 + INTERVAL '3 minutes'
-          AND event_type = 'buy'
-          AND wallet_address IS NOT NULL
-      ) AS early_holder_wallet_count_3m,
+      CASE
+        WHEN ts.total_net_tokens > 0
+        THEN (ep1.early_net_tokens_1m / ts.total_net_tokens) * 100
+        ELSE NULL
+      END AS early_supply_pct_1m,
 
-      SUM(token_amount) FILTER (
-        WHERE block_time >= $2
-          AND block_time <= $2 + INTERVAL '1 minute'
-          AND event_type = 'buy'
-      ) AS early_token_amount_1m,
+      CASE
+        WHEN ts.total_net_tokens > 0
+        THEN (ep3.early_net_tokens_3m / ts.total_net_tokens) * 100
+        ELSE NULL
+      END AS early_supply_pct_3m
 
-      SUM(token_amount) FILTER (
-        WHERE block_time >= $2
-          AND block_time <= $2 + INTERVAL '3 minutes'
-          AND event_type = 'buy'
-      ) AS early_token_amount_3m
-
-    FROM pump_launchpad_events
-    WHERE token_address = $1
+    FROM total_supply ts
+    CROSS JOIN early_positions_1m ep1
+    CROSS JOIN early_positions_3m ep3
     `,
     [tokenAddress, createdAt]
   );
 
   const row = result.rows[0] || {};
-
-  const tokenAmount1m = toNum(row.early_token_amount_1m, 0);
-  const tokenAmount3m = toNum(row.early_token_amount_3m, 0);
 
   return {
     early_holder_wallet_count_1m: isWithin1m
@@ -676,23 +713,14 @@ async function calculateEarlySupplySnapshot(tokenAddress, tokenCreatedAt) {
       ? toNum(row.early_holder_wallet_count_3m, null)
       : null,
 
-   early_supply_pct_1m: isWithin1m
-  ? normalizePct(
-      Math.min(
-        (tokenAmount1m / PREGRAD_TOKEN_SUPPLY) * 100,
-        100
-      )
-    )
-  : null,
+    early_supply_pct_1m: isWithin1m
+      ? normalizePct(toNum(row.early_supply_pct_1m, null))
+      : null,
 
-early_supply_pct_3m: isWithin3m
-  ? normalizePct(
-      Math.min(
-        (tokenAmount3m / PREGRAD_TOKEN_SUPPLY) * 100,
-        100
-      )
-    )
-  : null,
+    early_supply_pct_3m: isWithin3m
+      ? normalizePct(toNum(row.early_supply_pct_3m, null))
+      : null,
+
     early_supply_recorded_at_1m: isWithin1m ? new Date() : null,
     early_supply_recorded_at_3m: isWithin3m ? new Date() : null,
   };

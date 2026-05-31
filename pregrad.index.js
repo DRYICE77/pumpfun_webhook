@@ -1,5 +1,5 @@
 // PreGrad index.js
-// Fresh version with live market_cap_usd updates + token safety enrichment
+// Fresh version with live market_cap_usd updates + token safety enrichment + 1m/3m early supply capture
 
 require("dotenv").config();
 
@@ -606,6 +606,33 @@ function classifyConcentrationRisk({ top_holder_pct, top_5_holders_pct, top_10_h
   return "low";
 }
 
+
+function classifyEarlySupplySnapshot({ tokenCreatedAt, concentration }) {
+  if (!tokenCreatedAt || !concentration) {
+    return {};
+  }
+
+  const createdAtMs = new Date(tokenCreatedAt).getTime();
+  if (!Number.isFinite(createdAtMs)) {
+    return {};
+  }
+
+  const ageMs = Date.now() - createdAtMs;
+  const isWithin1m = ageMs >= 0 && ageMs <= 60 * 1000;
+  const isWithin3m = ageMs >= 0 && ageMs <= 3 * 60 * 1000;
+
+  // Use top 10 holder supply as the early supply concentration proxy.
+  // These values are only written once, because the upsert preserves the first non-null capture.
+  return {
+    early_holder_wallet_count_1m: isWithin1m ? concentration.holder_count_estimate : null,
+    early_holder_wallet_count_3m: isWithin3m ? concentration.holder_count_estimate : null,
+    early_supply_pct_1m: isWithin1m ? concentration.top_10_holders_pct : null,
+    early_supply_pct_3m: isWithin3m ? concentration.top_10_holders_pct : null,
+    early_supply_recorded_at_1m: isWithin1m ? new Date() : null,
+    early_supply_recorded_at_3m: isWithin3m ? new Date() : null,
+  };
+}
+
 function classifyLpBurnRisk({ lp_mint_address, lp_burned_amount, lp_burned_pct }) {
   if (!lp_mint_address) return "unknown";
   if (toNum(lp_burned_pct, 0) >= 99) return "low";
@@ -790,7 +817,13 @@ async function createTables() {
       top_10_holders_pct NUMERIC,
       holder_count_estimate INTEGER,
       concentration_risk TEXT,
-      lp_burn_risk TEXT
+      lp_burn_risk TEXT,
+      early_holder_wallet_count_1m INTEGER,
+      early_holder_wallet_count_3m INTEGER,
+      early_supply_pct_1m NUMERIC,
+      early_supply_pct_3m NUMERIC,
+      early_supply_recorded_at_1m TIMESTAMPTZ,
+      early_supply_recorded_at_3m TIMESTAMPTZ
     );
   `);
 
@@ -818,7 +851,13 @@ async function createTables() {
     ADD COLUMN IF NOT EXISTS top_10_holders_pct NUMERIC,
     ADD COLUMN IF NOT EXISTS holder_count_estimate INTEGER,
     ADD COLUMN IF NOT EXISTS concentration_risk TEXT,
-    ADD COLUMN IF NOT EXISTS lp_burn_risk TEXT;
+    ADD COLUMN IF NOT EXISTS lp_burn_risk TEXT,
+    ADD COLUMN IF NOT EXISTS early_holder_wallet_count_1m INTEGER,
+    ADD COLUMN IF NOT EXISTS early_holder_wallet_count_3m INTEGER,
+    ADD COLUMN IF NOT EXISTS early_supply_pct_1m NUMERIC,
+    ADD COLUMN IF NOT EXISTS early_supply_pct_3m NUMERIC,
+    ADD COLUMN IF NOT EXISTS early_supply_recorded_at_1m TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS early_supply_recorded_at_3m TIMESTAMPTZ;
   `);
 
   await pool.query(`
@@ -1042,6 +1081,12 @@ async function upsertTokenSafetyEnrichment({
   lp_burned_amount,
   lp_burned_pct,
   lp_burn_risk,
+  early_holder_wallet_count_1m,
+  early_holder_wallet_count_3m,
+  early_supply_pct_1m,
+  early_supply_pct_3m,
+  early_supply_recorded_at_1m,
+  early_supply_recorded_at_3m,
   source = "pregrad_holder_scan",
 }) {
   if (!token_id && !token_address) return;
@@ -1064,10 +1109,16 @@ async function upsertTokenSafetyEnrichment({
       lp_burned_amount,
       lp_burned_pct,
       lp_burn_risk,
+      early_holder_wallet_count_1m,
+      early_holder_wallet_count_3m,
+      early_supply_pct_1m,
+      early_supply_pct_3m,
+      early_supply_recorded_at_1m,
+      early_supply_recorded_at_3m,
       source,
       updated_at
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
     ON CONFLICT (token_id)
     DO UPDATE SET
       token_address = COALESCE(EXCLUDED.token_address, token_safety_enrichment.token_address),
@@ -1081,6 +1132,12 @@ async function upsertTokenSafetyEnrichment({
       lp_burned_amount = COALESCE(EXCLUDED.lp_burned_amount, token_safety_enrichment.lp_burned_amount),
       lp_burned_pct = COALESCE(EXCLUDED.lp_burned_pct, token_safety_enrichment.lp_burned_pct),
       lp_burn_risk = COALESCE(EXCLUDED.lp_burn_risk, token_safety_enrichment.lp_burn_risk),
+      early_holder_wallet_count_1m = COALESCE(token_safety_enrichment.early_holder_wallet_count_1m, EXCLUDED.early_holder_wallet_count_1m),
+      early_holder_wallet_count_3m = COALESCE(token_safety_enrichment.early_holder_wallet_count_3m, EXCLUDED.early_holder_wallet_count_3m),
+      early_supply_pct_1m = COALESCE(token_safety_enrichment.early_supply_pct_1m, EXCLUDED.early_supply_pct_1m),
+      early_supply_pct_3m = COALESCE(token_safety_enrichment.early_supply_pct_3m, EXCLUDED.early_supply_pct_3m),
+      early_supply_recorded_at_1m = COALESCE(token_safety_enrichment.early_supply_recorded_at_1m, EXCLUDED.early_supply_recorded_at_1m),
+      early_supply_recorded_at_3m = COALESCE(token_safety_enrichment.early_supply_recorded_at_3m, EXCLUDED.early_supply_recorded_at_3m),
       source = EXCLUDED.source,
       updated_at = NOW()
     `,
@@ -1097,6 +1154,12 @@ async function upsertTokenSafetyEnrichment({
       lp_burned_amount ?? null,
       lp_burned_pct ?? null,
       lp_burn_risk ?? null,
+      early_holder_wallet_count_1m ?? null,
+      early_holder_wallet_count_3m ?? null,
+      early_supply_pct_1m ?? null,
+      early_supply_pct_3m ?? null,
+      early_supply_recorded_at_1m ?? null,
+      early_supply_recorded_at_3m ?? null,
       source,
     ]
   );
@@ -1139,6 +1202,21 @@ async function enrichTokenHolderConcentration(tokenAddress) {
 
       const concentration_risk = classifyConcentrationRisk(concentration);
 
+      const tokenRow = await pool.query(
+        `
+        SELECT created_at
+        FROM pump_launchpad_tokens
+        WHERE token_address = $1
+        LIMIT 1
+        `,
+        [tokenAddress]
+      );
+
+      const earlySnapshot = classifyEarlySupplySnapshot({
+        tokenCreatedAt: tokenRow.rows[0]?.created_at || null,
+        concentration,
+      });
+
       await upsertTokenSafetyEnrichment({
         token_id: tokenAddress,
         token_address: tokenAddress,
@@ -1147,6 +1225,7 @@ async function enrichTokenHolderConcentration(tokenAddress) {
         top_10_holders_pct: concentration.top_10_holders_pct,
         holder_count_estimate: concentration.holder_count_estimate,
         concentration_risk,
+        ...earlySnapshot,
         source: "pregrad_holder_scan",
       });
 
@@ -1160,6 +1239,8 @@ async function enrichTokenHolderConcentration(tokenAddress) {
         top5Pct: concentration.top_5_holders_pct,
         top10Pct: concentration.top_10_holders_pct,
         concentrationRisk: concentration_risk,
+        earlySupplyPct1m: earlySnapshot.early_supply_pct_1m,
+        earlySupplyPct3m: earlySnapshot.early_supply_pct_3m,
       });
     } catch (err) {
       stats.safetyEnrichmentErrors += 1;

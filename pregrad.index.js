@@ -676,14 +676,23 @@ async function calculateEarlySupplySnapshot(tokenAddress, tokenCreatedAt) {
       ? toNum(row.early_holder_wallet_count_3m, null)
       : null,
 
-    early_supply_pct_1m: isWithin1m
-      ? normalizePct((tokenAmount1m / PREGRAD_TOKEN_SUPPLY) * 100)
-      : null,
+   early_supply_pct_1m: isWithin1m
+  ? normalizePct(
+      Math.min(
+        (tokenAmount1m / PREGRAD_TOKEN_SUPPLY) * 100,
+        100
+      )
+    )
+  : null,
 
-    early_supply_pct_3m: isWithin3m
-      ? normalizePct((tokenAmount3m / PREGRAD_TOKEN_SUPPLY) * 100)
-      : null,
-
+early_supply_pct_3m: isWithin3m
+  ? normalizePct(
+      Math.min(
+        (tokenAmount3m / PREGRAD_TOKEN_SUPPLY) * 100,
+        100
+      )
+    )
+  : null,
     early_supply_recorded_at_1m: isWithin1m ? new Date() : null,
     early_supply_recorded_at_3m: isWithin3m ? new Date() : null,
   };

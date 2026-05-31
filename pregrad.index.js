@@ -607,12 +607,14 @@ function classifyConcentrationRisk({ top_holder_pct, top_5_holders_pct, top_10_h
 }
 
 
-function classifyEarlySupplySnapshot({ tokenCreatedAt, concentration }) {
-  if (!tokenCreatedAt || !concentration) {
+async function calculateEarlySupplySnapshot(tokenAddress, tokenCreatedAt) {
+  if (!tokenAddress || !tokenCreatedAt) {
     return {};
   }
 
-  const createdAtMs = new Date(tokenCreatedAt).getTime();
+  const createdAt = new Date(tokenCreatedAt);
+  const createdAtMs = createdAt.getTime();
+
   if (!Number.isFinite(createdAtMs)) {
     return {};
   }
@@ -621,18 +623,71 @@ function classifyEarlySupplySnapshot({ tokenCreatedAt, concentration }) {
   const isWithin1m = ageMs >= 0 && ageMs <= 60 * 1000;
   const isWithin3m = ageMs >= 0 && ageMs <= 3 * 60 * 1000;
 
-  // Use top 10 holder supply as the early supply concentration proxy.
-  // These values are only written once, because the upsert preserves the first non-null capture.
+  if (!isWithin1m && !isWithin3m) {
+    return {};
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      COUNT(DISTINCT wallet_address) FILTER (
+        WHERE block_time >= $2
+          AND block_time <= $2 + INTERVAL '1 minute'
+          AND event_type = 'buy'
+          AND wallet_address IS NOT NULL
+      ) AS early_holder_wallet_count_1m,
+
+      COUNT(DISTINCT wallet_address) FILTER (
+        WHERE block_time >= $2
+          AND block_time <= $2 + INTERVAL '3 minutes'
+          AND event_type = 'buy'
+          AND wallet_address IS NOT NULL
+      ) AS early_holder_wallet_count_3m,
+
+      SUM(token_amount) FILTER (
+        WHERE block_time >= $2
+          AND block_time <= $2 + INTERVAL '1 minute'
+          AND event_type = 'buy'
+      ) AS early_token_amount_1m,
+
+      SUM(token_amount) FILTER (
+        WHERE block_time >= $2
+          AND block_time <= $2 + INTERVAL '3 minutes'
+          AND event_type = 'buy'
+      ) AS early_token_amount_3m
+
+    FROM pump_launchpad_events
+    WHERE token_address = $1
+    `,
+    [tokenAddress, createdAt]
+  );
+
+  const row = result.rows[0] || {};
+
+  const tokenAmount1m = toNum(row.early_token_amount_1m, 0);
+  const tokenAmount3m = toNum(row.early_token_amount_3m, 0);
+
   return {
-    early_holder_wallet_count_1m: isWithin1m ? concentration.holder_count_estimate : null,
-    early_holder_wallet_count_3m: isWithin3m ? concentration.holder_count_estimate : null,
-    early_supply_pct_1m: isWithin1m ? concentration.top_10_holders_pct : null,
-    early_supply_pct_3m: isWithin3m ? concentration.top_10_holders_pct : null,
+    early_holder_wallet_count_1m: isWithin1m
+      ? toNum(row.early_holder_wallet_count_1m, null)
+      : null,
+
+    early_holder_wallet_count_3m: isWithin3m
+      ? toNum(row.early_holder_wallet_count_3m, null)
+      : null,
+
+    early_supply_pct_1m: isWithin1m
+      ? normalizePct((tokenAmount1m / PREGRAD_TOKEN_SUPPLY) * 100)
+      : null,
+
+    early_supply_pct_3m: isWithin3m
+      ? normalizePct((tokenAmount3m / PREGRAD_TOKEN_SUPPLY) * 100)
+      : null,
+
     early_supply_recorded_at_1m: isWithin1m ? new Date() : null,
     early_supply_recorded_at_3m: isWithin3m ? new Date() : null,
   };
 }
-
 function classifyLpBurnRisk({ lp_mint_address, lp_burned_amount, lp_burned_pct }) {
   if (!lp_mint_address) return "unknown";
   if (toNum(lp_burned_pct, 0) >= 99) return "low";
@@ -1212,10 +1267,10 @@ async function enrichTokenHolderConcentration(tokenAddress) {
         [tokenAddress]
       );
 
-      const earlySnapshot = classifyEarlySupplySnapshot({
-        tokenCreatedAt: tokenRow.rows[0]?.created_at || null,
-        concentration,
-      });
+     const earlySnapshot = await calculateEarlySupplySnapshot(
+  tokenAddress,
+  tokenRow.rows[0]?.created_at || null
+);
 
       await upsertTokenSafetyEnrichment({
         token_id: tokenAddress,

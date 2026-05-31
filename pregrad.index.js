@@ -1174,27 +1174,51 @@ async function upsertTokenSafetyEnrichment({
       updated_at
     )
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
-    ON CONFLICT (token_id)
-    DO UPDATE SET
-      token_address = COALESCE(EXCLUDED.token_address, token_safety_enrichment.token_address),
-      top_holder_pct = COALESCE(EXCLUDED.top_holder_pct, token_safety_enrichment.top_holder_pct),
-      top_5_holders_pct = COALESCE(EXCLUDED.top_5_holders_pct, token_safety_enrichment.top_5_holders_pct),
-      top_10_holders_pct = COALESCE(EXCLUDED.top_10_holders_pct, token_safety_enrichment.top_10_holders_pct),
-      holder_count_estimate = COALESCE(EXCLUDED.holder_count_estimate, token_safety_enrichment.holder_count_estimate),
-      concentration_risk = COALESCE(EXCLUDED.concentration_risk, token_safety_enrichment.concentration_risk),
-      lp_mint_address = COALESCE(EXCLUDED.lp_mint_address, token_safety_enrichment.lp_mint_address),
-      lp_total_supply = COALESCE(EXCLUDED.lp_total_supply, token_safety_enrichment.lp_total_supply),
-      lp_burned_amount = COALESCE(EXCLUDED.lp_burned_amount, token_safety_enrichment.lp_burned_amount),
-      lp_burned_pct = COALESCE(EXCLUDED.lp_burned_pct, token_safety_enrichment.lp_burned_pct),
-      lp_burn_risk = COALESCE(EXCLUDED.lp_burn_risk, token_safety_enrichment.lp_burn_risk),
-      early_holder_wallet_count_1m = COALESCE(token_safety_enrichment.early_holder_wallet_count_1m, EXCLUDED.early_holder_wallet_count_1m),
-      early_holder_wallet_count_3m = COALESCE(token_safety_enrichment.early_holder_wallet_count_3m, EXCLUDED.early_holder_wallet_count_3m),
-      early_supply_pct_1m = COALESCE(token_safety_enrichment.early_supply_pct_1m, EXCLUDED.early_supply_pct_1m),
-      early_supply_pct_3m = COALESCE(token_safety_enrichment.early_supply_pct_3m, EXCLUDED.early_supply_pct_3m),
-      early_supply_recorded_at_1m = COALESCE(token_safety_enrichment.early_supply_recorded_at_1m, EXCLUDED.early_supply_recorded_at_1m),
-      early_supply_recorded_at_3m = COALESCE(token_safety_enrichment.early_supply_recorded_at_3m, EXCLUDED.early_supply_recorded_at_3m),
-      source = EXCLUDED.source,
-      updated_at = NOW()
+ ON CONFLICT (token_id)
+DO UPDATE SET
+  token_address = COALESCE(EXCLUDED.token_address, token_safety_enrichment.token_address),
+
+  top_holder_pct = COALESCE(EXCLUDED.top_holder_pct, token_safety_enrichment.top_holder_pct),
+  top_5_holders_pct = COALESCE(EXCLUDED.top_5_holders_pct, token_safety_enrichment.top_5_holders_pct),
+  top_10_holders_pct = COALESCE(EXCLUDED.top_10_holders_pct, token_safety_enrichment.top_10_holders_pct),
+
+  holder_count_estimate = COALESCE(EXCLUDED.holder_count_estimate, token_safety_enrichment.holder_count_estimate),
+  concentration_risk = COALESCE(EXCLUDED.concentration_risk, token_safety_enrichment.concentration_risk),
+
+  lp_mint_address = COALESCE(EXCLUDED.lp_mint_address, token_safety_enrichment.lp_mint_address),
+  lp_total_supply = COALESCE(EXCLUDED.lp_total_supply, token_safety_enrichment.lp_total_supply),
+  lp_burned_amount = COALESCE(EXCLUDED.lp_burned_amount, token_safety_enrichment.lp_burned_amount),
+  lp_burned_pct = COALESCE(EXCLUDED.lp_burned_pct, token_safety_enrichment.lp_burned_pct),
+  lp_burn_risk = COALESCE(EXCLUDED.lp_burn_risk, token_safety_enrichment.lp_burn_risk),
+
+  -- EARLY SUPPLY (NEW VALUES WIN)
+
+  early_holder_wallet_count_1m =
+    COALESCE(EXCLUDED.early_holder_wallet_count_1m,
+             token_safety_enrichment.early_holder_wallet_count_1m),
+
+  early_holder_wallet_count_3m =
+    COALESCE(EXCLUDED.early_holder_wallet_count_3m,
+             token_safety_enrichment.early_holder_wallet_count_3m),
+
+  early_supply_pct_1m =
+    COALESCE(EXCLUDED.early_supply_pct_1m,
+             token_safety_enrichment.early_supply_pct_1m),
+
+  early_supply_pct_3m =
+    COALESCE(EXCLUDED.early_supply_pct_3m,
+             token_safety_enrichment.early_supply_pct_3m),
+
+  early_supply_recorded_at_1m =
+    COALESCE(EXCLUDED.early_supply_recorded_at_1m,
+             token_safety_enrichment.early_supply_recorded_at_1m),
+
+  early_supply_recorded_at_3m =
+    COALESCE(EXCLUDED.early_supply_recorded_at_3m,
+             token_safety_enrichment.early_supply_recorded_at_3m),
+
+  source = EXCLUDED.source,
+  updated_at = NOW()
     `,
     [
       tokenId,

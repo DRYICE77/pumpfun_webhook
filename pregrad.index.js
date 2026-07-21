@@ -2848,8 +2848,11 @@ async function boot() {
       dbTime: test.rows[0].now,
     });
 
-    await createTables();
-    logInfo("Tables ready");
+    // Tables are managed separately.
+    // Do not run CREATE / ALTER / INDEX statements
+    // during WebSocket startup because a database lock
+    // can prevent the Helius connection from opening.
+    logInfo("Skipping runtime table migrations");
 
     await getPregradControl(true);
 
@@ -2864,16 +2867,19 @@ async function boot() {
     startQueueLogger();
     startStaleDrainer();
     startRetentionCleanup();
+
     connect();
+
+    logInfo("PreGrad scanner boot completed");
   } catch (error) {
     logError("Boot failed", {
       error: error.message,
+      stack: error.stack,
     });
 
     process.exit(1);
   }
 }
-
 async function shutdown() {
   if (intentionalShutdown) return;
 

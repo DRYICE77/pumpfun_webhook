@@ -2,7 +2,7 @@
 // PRE-GRAD TOKENS.JS
 // NORTH STAR — HELIUS PUMP.FUN PRE-GRAD SCANNER
 //
-// Purpose:
+
 //
 // 1. Subscribe to Pump.fun program logs through Helius.
 // 2. Queue and hydrate matching transactions safely.

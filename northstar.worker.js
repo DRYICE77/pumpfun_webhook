@@ -290,14 +290,8 @@ async function processOneMinute(sql) {
     transactionOpen = true;
 
     await client.query(
-      'SET LOCAL statement_timeout = $1',
-      [STATEMENT_TIMEOUT_MS]
-    ).catch(async () => {
-      // SET LOCAL does not support bind parameters in PostgreSQL.
-      await client.query(
-        `SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`
-      );
-    });
+  `SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`
+);
 
     // Serialize worker instances through the checkpoint row.
     const checkpointResult = await client.query(

@@ -39,7 +39,9 @@ const { Pool } = require('pg');
 const JOB_NAME = 'volume_minutes';
 
 const ENABLE_WRITES =
-  process.env.NORTHSTAR_ENABLE_MINUTE_WRITES === 'true';
+  String(
+    process.env.NORTHSTAR_ENABLE_MINUTE_WRITES ?? ''
+  ).trim().toLowerCase() === 'true';
 
 const POLL_MS = positiveInteger(
   'NORTHSTAR_POLL_MS',
@@ -577,23 +579,25 @@ async function writeCycle(sql) {
 
       // Only report CAUGHT_UP when there genuinely
       // isn't an eligible minute to process.
-      if (
-        processed === 0 &&
-        result.reason === 'CAUGHT_UP'
-      ) {
-        log('CAUGHT_UP');
-      }
+   if (!result.processed) {
+  log('CYCLE_STOPPED', {
+    reason: result.reason ?? 'UNKNOWN',
+    minutesProcessed: processed
+  });
 
-      break;
-    }
+  break;
+}
 
     processed += 1;
 
     // Convenience stop for the controlled test.
     // The PostgreSQL gate provides restart safety.
-    if (
-      process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT === 'true'
-    ) {
+    const stopAfterOneCommit =
+      String(
+        process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT ?? ''
+      ).trim().toLowerCase() === 'true';
+
+    if (stopAfterOneCommit) {
       log('ONE_COMMIT_TEST_COMPLETE', {
         minutesProcessed: processed
       });

@@ -565,8 +565,6 @@ async function writeCycle(sql) {
     const result = await processOneMinute(sql);
 
     if (!result.processed) {
-      // The database gate has already been exhausted.
-      // Stop polling rather than reporting CAUGHT_UP.
       if (result.reason === 'TEST_LIMIT_REACHED') {
         log('TEST_GATE_EXHAUSTED', {
           message:
@@ -574,24 +572,18 @@ async function writeCycle(sql) {
         });
 
         shuttingDown = true;
-        break;
+      } else {
+        log('CYCLE_STOPPED', {
+          reason: result.reason ?? 'UNKNOWN',
+          minutesProcessed: processed
+        });
       }
 
-      // Only report CAUGHT_UP when there genuinely
-      // isn't an eligible minute to process.
-   if (!result.processed) {
-  log('CYCLE_STOPPED', {
-    reason: result.reason ?? 'UNKNOWN',
-    minutesProcessed: processed
-  });
-
-  break;
-}
+      break;
+    }
 
     processed += 1;
 
-    // Convenience stop for the controlled test.
-    // The PostgreSQL gate provides restart safety.
     const stopAfterOneCommit =
       String(
         process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT ?? ''

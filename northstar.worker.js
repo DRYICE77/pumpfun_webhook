@@ -399,6 +399,7 @@ const minutesWritten = Number(
   diagnostics.minutes_written
 );
 
+// Validate aggregation diagnostics.
 if (
   !Number.isSafeInteger(qualifyingEvents) ||
   qualifyingEvents < 0 ||
@@ -410,15 +411,28 @@ if (
   );
 }
 
-// SAFETY: Do not advance the checkpoint through an
-// empty window until ingestion completeness is verified.
-// Throwing causes the surrounding transaction to roll back.
+// SAFETY: Never advance through an unverified empty window.
+// The surrounding transaction will roll back.
 if (qualifyingEvents === 0) {
   throw new Error(
     'EMPTY_WINDOW_UNVERIFIED: refusing to advance checkpoint'
   );
 }
 
+// Verify that qualifying events produced valid minute records.
+const minutesPrepared = Number(
+  diagnostics.minutes_prepared
+);
+
+if (
+  !Number.isSafeInteger(minutesPrepared) ||
+  minutesPrepared <= 0 ||
+  minutesWritten > minutesPrepared
+) {
+  throw new Error(
+    'Companion SQL returned inconsistent minute diagnostics'
+  );
+}
 const status = 'SUCCESS';
 
 await client.query(
@@ -549,7 +563,24 @@ async function writeCycle(sql) {
     const result = await processOneMinute(sql);
 
     if (!result.processed) {
-      if (processed === 0) {
+      // The database gate has already been exhausted.
+      // Stop polling rather than reporting CAUGHT_UP.
+      if (result.reason === 'TEST_LIMIT_REACHED') {
+        log('TEST_GATE_EXHAUSTED', {
+          message:
+            'One-commit test complete. No further writes permitted.'
+        });
+
+        shuttingDown = true;
+        break;
+      }
+
+      // Only report CAUGHT_UP when there genuinely
+      // isn't an eligible minute to process.
+      if (
+        processed === 0 &&
+        result.reason === 'CAUGHT_UP'
+      ) {
         log('CAUGHT_UP');
       }
 
@@ -558,8 +589,8 @@ async function writeCycle(sql) {
 
     processed += 1;
 
-    // CONTROLLED TEST:
-    // Stop after the first successful commit.
+    // Convenience stop for the controlled test.
+    // The PostgreSQL gate provides restart safety.
     if (
       process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT === 'true'
     ) {

@@ -350,63 +350,72 @@ async function processOneMinute(sql) {
 
     const diagnostics = aggregation.rows[0];
 
-    const qualifyingEvents = Number(
-      diagnostics.qualifying_events
-    );
+ const qualifyingEvents = Number(
+  diagnostics.qualifying_events
+);
 
-    const minutesWritten = Number(
-      diagnostics.minutes_written
-    );
+const minutesWritten = Number(
+  diagnostics.minutes_written
+);
 
-    if (
-      !Number.isSafeInteger(qualifyingEvents) ||
-      qualifyingEvents < 0 ||
-      !Number.isSafeInteger(minutesWritten) ||
-      minutesWritten < 0
-    ) {
-      throw new Error(
-        'Companion SQL returned invalid diagnostics'
-      );
-    }
+if (
+  !Number.isSafeInteger(qualifyingEvents) ||
+  qualifyingEvents < 0 ||
+  !Number.isSafeInteger(minutesWritten) ||
+  minutesWritten < 0
+) {
+  throw new Error(
+    'Companion SQL returned invalid diagnostics'
+  );
+}
 
-    const status =
-      qualifyingEvents === 0 ? 'EMPTY' : 'SUCCESS';
+// SAFETY: Do not advance the checkpoint through an
+// empty window until ingestion completeness is verified.
+// Throwing causes the surrounding transaction to roll back.
+if (qualifyingEvents === 0) {
+  throw new Error(
+    'EMPTY_WINDOW_UNVERIFIED: refusing to advance checkpoint'
+  );
+}
 
-    await client.query(
-      `
-        INSERT INTO public.northstar_worker_runs (
-          job_name,
-          started_at,
-          finished_at,
-          window_start,
-          window_end,
-          qualifying_events,
-          minutes_written,
-          status,
-          diagnostics
-        )
-        VALUES (
-          $1,
-          clock_timestamp(),
-          clock_timestamp(),
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7::jsonb
-        )
-      `,
-      [
-        JOB_NAME,
-        window.windowStart,
-        window.windowEnd,
-        qualifyingEvents,
-        minutesWritten,
-        status,
-        JSON.stringify(diagnostics)
-      ]
-    );
+const status = 'SUCCESS';
+
+await client.query(
+  `
+    INSERT INTO public.northstar_worker_runs (
+      job_name,
+      started_at,
+      finished_at,
+      window_start,
+      window_end,
+      qualifying_events,
+      minutes_written,
+      status,
+      diagnostics
+    )
+    VALUES (
+      $1,
+      clock_timestamp(),
+      clock_timestamp(),
+      $2,
+      $3,
+      $4,
+      $5,
+      $6,
+      $7::jsonb
+    )
+  `,
+  [
+    JOB_NAME,
+    window.windowStart,
+    window.windowEnd,
+    qualifyingEvents,
+    minutesWritten,
+    status,
+    JSON.stringify(diagnostics)
+  ]
+);
+     
 
     const advanced = await client.query(
       `

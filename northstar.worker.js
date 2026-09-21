@@ -501,6 +501,19 @@ async function writeCycle(sql) {
     }
 
     processed += 1;
+
+    // CONTROLLED TEST:
+    // Stop after the first successful commit.
+    if (
+      process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT === 'true'
+    ) {
+      log('ONE_COMMIT_TEST_COMPLETE', {
+        minutesProcessed: processed
+      });
+
+      shuttingDown = true;
+      break;
+    }
   }
 
   if (processed > 0) {

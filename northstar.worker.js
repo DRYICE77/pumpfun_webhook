@@ -279,7 +279,6 @@ async function dryRunCycle() {
     client.release();
   }
 }
-
 async function processOneMinute(sql) {
   const client = await pool.connect();
 
@@ -290,8 +289,50 @@ async function processOneMinute(sql) {
     transactionOpen = true;
 
     await client.query(
-  `SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`
-);
+      `SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`
+    );
+
+    // RESTART-SAFE TEST GATE
+    // Lock the gate before executing any aggregation SQL.
+    // The lock is held until COMMIT or ROLLBACK.
+    const gateResult = await client.query(
+      `
+        SELECT
+          max_commits,
+          commits_used
+        FROM public.northstar_worker_test_gate
+        WHERE job_name = $1
+        FOR UPDATE
+      `,
+      [JOB_NAME]
+    );
+
+    if (gateResult.rowCount !== 1) {
+      throw new Error(
+        'TEST_GATE_MISSING: refusing to write'
+      );
+    }
+
+    const gate = gateResult.rows[0];
+
+    if (gate.commits_used >= gate.max_commits) {
+      await client.query('ROLLBACK');
+      transactionOpen = false;
+
+      log('TEST_LIMIT_REACHED', {
+        maxCommits: gate.max_commits,
+        commitsUsed: gate.commits_used
+      });
+
+      return {
+        processed: false,
+        reason: 'TEST_LIMIT_REACHED'
+      };
+    }
+
+    // Keep your existing checkpoint-locking code here.
+    // It begins with:
+    // const checkpointResult = await client.query(...);
 
     // Serialize worker instances through the checkpoint row.
     const checkpointResult = await client.query(
@@ -440,6 +481,28 @@ await client.query(
       );
     }
 
+    // RESTART-SAFE TEST GATE
+    // Consume the allowance in the same transaction as
+    // the minute upsert and checkpoint advancement.
+    const gateUpdate = await client.query(
+      `
+        UPDATE public.northstar_worker_test_gate
+        SET
+          commits_used = commits_used + 1,
+          updated_at = clock_timestamp()
+        WHERE job_name = $1
+          AND commits_used < max_commits
+      `,
+      [JOB_NAME]
+    );
+
+    if (gateUpdate.rowCount !== 1) {
+      throw new Error(
+        'TEST_GATE_UPDATE_FAILED: rolling back'
+      );
+    }
+
+    // Aggregation, checkpoint and test gate commit together.
     await client.query('COMMIT');
     transactionOpen = false;
 
@@ -453,19 +516,11 @@ await client.query(
         window.nextCheckpoint.toISOString()
     });
 
-    if (status === 'EMPTY') {
-      log('EMPTY_WINDOW_WARNING', {
-        message:
-          'No qualifying events. This does not prove ingestion health.',
-        windowStart: window.windowStart.toISOString(),
-        windowEnd: window.windowEnd.toISOString()
-      });
-    }
-
     return {
       processed: true,
       status
     };
+
   } catch (error) {
     if (transactionOpen) {
       try {
@@ -478,6 +533,7 @@ await client.query(
     }
 
     throw error;
+
   } finally {
     client.release();
   }

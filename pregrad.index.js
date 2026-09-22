@@ -340,12 +340,20 @@ let staleDrainTimer = null;
 
 
 const stats = {
+  // ==========================================
+  // INGESTION
+  // ==========================================
+
   queued: 0,
   dequeued: 0,
   processed: 0,
   insertedEvents: 0,
   insertedTokens: 0,
   updatedMarketData: 0,
+
+  // ==========================================
+  // QUEUE SAFEGUARDS
+  // ==========================================
 
   intakePausedCount: 0,
   intakeResumedCount: 0,
@@ -354,29 +362,46 @@ const stats = {
   droppedStale: 0,
   droppedDuringPause: 0,
 
+  // ==========================================
+  // FILTERING
+  // ==========================================
+
   skippedSmallSolAmount: 0,
   skippedMarketDataUpdate: 0,
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
   skippedFailedTx: 0,
   skippedUnresolvedMint: 0,
-  unresolvedCreate: 0,
-unresolvedBuy: 0,
-unresolvedSell: 0,
-unresolvedMigrate: 0,
-unresolvedUnknown: 0,
 
-unresolvedNoTokenBalances: 0,
-unresolvedZeroCandidates: 0,
-unresolvedOneCandidate: 0,
-unresolvedMultipleCandidates: 0,
-unresolvedCandidatesNoPumpSuffix: 0,
-unresolvedCandidatesWithPumpSuffix: 0,
+  // ==========================================
+  // UNRESOLVED MINT DIAGNOSTICS
+  // ==========================================
+
+  unresolvedCreate: 0,
+  unresolvedBuy: 0,
+  unresolvedSell: 0,
+  unresolvedMigrate: 0,
+  unresolvedUnknown: 0,
+
+  unresolvedNoTokenBalances: 0,
+  unresolvedZeroCandidates: 0,
+  unresolvedOneCandidate: 0,
+  unresolvedMultipleCandidates: 0,
+  unresolvedCandidatesNoPumpSuffix: 0,
+  unresolvedCandidatesWithPumpSuffix: 0,
+
+  // ==========================================
+  // ERRORS
+  // ==========================================
 
   txFetchErrors: 0,
   workerErrors: 0,
   rpcRetries: 0,
   controlFetchErrors: 0,
+
+  // ==========================================
+  // EVENT CLASSIFICATION
+  // ==========================================
 
   classifiedCreate: 0,
   classifiedBuy: 0,
@@ -384,11 +409,46 @@ unresolvedCandidatesWithPumpSuffix: 0,
   classifiedMigrate: 0,
   classifiedUnknown: 0,
 
+  // ==========================================
+  // ENRICHMENT
+  // ==========================================
+
   safetyEnrichmentRuns: 0,
   safetyEnrichmentSkippedCooldown: 0,
   safetyEnrichmentErrors: 0,
-};
 
+  // ==========================================
+  // RPC FETCH PERFORMANCE
+  // ==========================================
+
+  rpcFetchSamples: 0,
+  rpcFetchTotalMs: 0,
+  rpcFetchMaxMs: 0,
+
+  // ==========================================
+  // DATABASE WRITE PERFORMANCE
+  // ==========================================
+
+  dbWriteSamples: 0,
+  dbWriteTotalMs: 0,
+  dbWriteMaxMs: 0,
+
+  // ==========================================
+  // TOTAL SIGNATURE PROCESSING PERFORMANCE
+  // ==========================================
+
+  processingSamples: 0,
+  processingTotalMs: 0,
+  processingMaxMs: 0,
+
+  // ==========================================
+  // INTAKE PAUSE PERFORMANCE
+  // ==========================================
+
+  intakePauseSamples: 0,
+  intakePauseTotalMs: 0,
+  intakePauseMaxMs: 0,
+};
 // ==================================================
 // 6. LOGGING / BASIC HELPERS
 // ==================================================
@@ -415,6 +475,7 @@ function sleep(ms) {
 
 function toNumber(value, fallback = null) {
   const number = Number(value);
+
   return Number.isFinite(number)
     ? number
     : fallback;
@@ -432,10 +493,143 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// ==================================================
+// 6A. PERFORMANCE DIAGNOSTICS
+//
+// Observation only:
+// • No database writes
+// • No per-transaction logging
+// • No changes to ingestion behavior
+//
+// Uses the counters added to const stats.
+// ==================================================
+
+function performanceNow() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+
+function recordPerformanceTiming(
+  category,
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  const counterMap = {
+    rpcFetch: {
+      samples: "rpcFetchSamples",
+      total: "rpcFetchTotalMs",
+      max: "rpcFetchMaxMs",
+    },
+
+    dbWrite: {
+      samples: "dbWriteSamples",
+      total: "dbWriteTotalMs",
+      max: "dbWriteMaxMs",
+    },
+
+    processing: {
+      samples: "processingSamples",
+      total: "processingTotalMs",
+      max: "processingMaxMs",
+    },
+
+    intakePause: {
+      samples: "intakePauseSamples",
+      total: "intakePauseTotalMs",
+      max: "intakePauseMaxMs",
+    },
+  };
+
+  const counters = counterMap[category];
+
+  if (!counters) {
+    return;
+  }
+
+  stats[counters.samples] += 1;
+
+  stats[counters.total] += durationMs;
+
+  stats[counters.max] = Math.max(
+    stats[counters.max],
+    durationMs
+  );
+}
+
+function getPerformanceSummary(
+  category
+) {
+  const counterMap = {
+    rpcFetch: [
+      "rpcFetchSamples",
+      "rpcFetchTotalMs",
+      "rpcFetchMaxMs",
+    ],
+
+    dbWrite: [
+      "dbWriteSamples",
+      "dbWriteTotalMs",
+      "dbWriteMaxMs",
+    ],
+
+    processing: [
+      "processingSamples",
+      "processingTotalMs",
+      "processingMaxMs",
+    ],
+
+    intakePause: [
+      "intakePauseSamples",
+      "intakePauseTotalMs",
+      "intakePauseMaxMs",
+    ],
+  };
+
+  const keys = counterMap[category];
+
+  if (!keys) {
+    return null;
+  }
+
+  const [sampleKey, totalKey, maxKey] = keys;
+
+  const samples = stats[sampleKey];
+  const totalMs = stats[totalKey];
+  const maxMs = stats[maxKey];
+
+  return {
+    samples,
+
+    avgMs:
+      samples > 0
+        ? Number(
+            (totalMs / samples).toFixed(2)
+          )
+        : null,
+
+    maxMs:
+      samples > 0
+        ? Number(maxMs.toFixed(2))
+        : null,
+  };
+}
+
+// ==================================================
+// 6B. SIGNATURE HELPERS
+// ==================================================
+
 function addSeenSignature(signature) {
   seenSignatures.add(signature);
 
-  if (seenSignatures.size > SEEN_SIGNATURE_LIMIT) {
+  if (
+    seenSignatures.size >
+    SEEN_SIGNATURE_LIMIT
+  ) {
     const oldest =
       seenSignatures.values().next().value;
 
@@ -450,6 +644,10 @@ function signatureIsKnown(signature) {
     inFlightSignatures.has(signature)
   );
 }
+
+// ==================================================
+// 6C. RETRY BACKOFF
+// ==================================================
 
 function backoffDelay(
   attempt,
@@ -467,7 +665,6 @@ function backoffDelay(
     60000
   );
 }
-
 // ==================================================
 // 7. SAFE CONTROL CACHE
 // ==================================================
@@ -576,6 +773,30 @@ function effectiveMinSolAmount() {
 
 // ==================================================
 // 8. QUEUE MANAGEMENT
+//
+// Performance diagnostics:
+// • Measure completed intake-pause durations
+// • Preserve existing queue safeguards
+// • Preserve existing signature handling
+// • Do not change queue limits or ingestion behavior
+// ==================================================
+
+
+// ==================================================
+// 8A. INTAKE PAUSE STATE
+//
+// Monotonic timestamp for the current pause.
+// Null means no pause is being measured.
+//
+// This is separate from intakePaused, which remains
+// the existing source of truth for queue behavior.
+// ==================================================
+
+let intakePausedAt = null;
+
+
+// ==================================================
+// 8B. PAUSE INTAKE
 // ==================================================
 
 function maybePauseIntake() {
@@ -587,6 +808,10 @@ function maybePauseIntake() {
     signatureQueue.length >= maxQueueSize
   ) {
     intakePaused = true;
+
+    // Begin measuring this pause.
+    intakePausedAt = performanceNow();
+
     stats.intakePausedCount += 1;
 
     logInfo("Intake paused", {
@@ -596,24 +821,59 @@ function maybePauseIntake() {
   }
 }
 
+
+// ==================================================
+// 8C. RESUME INTAKE
+// ==================================================
+
 function maybeResumeIntake() {
   if (
     intakePaused &&
     signatureQueue.length <= RESUME_QUEUE_SIZE &&
     isPregradEnabled()
   ) {
+    // Capture duration before clearing pause state.
+    const pauseDurationMs =
+      intakePausedAt === null
+        ? null
+        : performanceNow() - intakePausedAt;
+
     intakePaused = false;
+
+    // Record one sample per completed pause.
+    if (pauseDurationMs !== null) {
+      recordPerformanceTiming(
+        "intakePause",
+        pauseDurationMs
+      );
+    }
+
+    intakePausedAt = null;
+
     stats.intakeResumedCount += 1;
 
     logInfo("Intake resumed", {
       queueSize: signatureQueue.length,
       resumeQueueSize: RESUME_QUEUE_SIZE,
+
+      pauseDurationMs:
+        pauseDurationMs === null
+          ? null
+          : Number(
+              pauseDurationMs.toFixed(2)
+            ),
     });
   }
 }
 
+
+// ==================================================
+// 8D. STALE QUEUE MAINTENANCE
+// ==================================================
+
 function drainStaleQueueItems() {
   const now = Date.now();
+
   let dropped = 0;
 
   while (
@@ -624,7 +884,9 @@ function drainStaleQueueItems() {
     const item = signatureQueue.shift();
 
     if (item?.signature) {
-      queuedSignatures.delete(item.signature);
+      queuedSignatures.delete(
+        item.signature
+      );
     }
 
     dropped += 1;
@@ -642,12 +904,19 @@ function drainStaleQueueItems() {
   maybeResumeIntake();
 }
 
+
+// ==================================================
+// 8E. ENQUEUE SIGNATURE
+// ==================================================
+
 function enqueueSignature(
   signature,
   slot = null,
   blockTime = null
 ) {
-  if (!signature) return;
+  if (!signature) {
+    return;
+  }
 
   maybeResumeIntake();
   maybePauseIntake();
@@ -672,7 +941,9 @@ function enqueueSignature(
     effectiveMaxQueueSize()
   ) {
     stats.droppedQueueFull += 1;
+
     maybePauseIntake();
+
     return;
   }
 
@@ -687,9 +958,14 @@ function enqueueSignature(
 
   stats.queued += 1;
 }
-
 // ==================================================
 // 9. HELIUS RPC
+//
+// Performance diagnostics:
+// • Measure full transaction-fetch duration
+// • Include retries and retry delays
+// • Record successful and failed fetches
+// • Preserve existing RPC and retry behavior
 // ==================================================
 
 async function heliusRpc(method, params) {
@@ -728,63 +1004,88 @@ async function heliusRpc(method, params) {
   return json.result;
 }
 
+// ==================================================
+// 9A. FETCH FULL TRANSACTION
+//
+// The timer covers the entire function, including:
+// • Helius request time
+// • Null-response retries
+// • RPC error retries
+// • Retry backoff delays
+//
+// The finally block records timing on every exit.
+// ==================================================
+
 async function fetchFullTransaction(signature) {
+  const fetchStartedAt = performanceNow();
+
   let lastError = null;
 
-  for (
-    let attempt = 0;
-    attempt <= RPC_RETRY_COUNT;
-    attempt += 1
-  ) {
-    try {
-      const transaction = await heliusRpc(
-        "getTransaction",
-        [
-          signature,
-          {
-            encoding: "jsonParsed",
-            maxSupportedTransactionVersion: 1,
-            commitment: "confirmed",
-          },
-        ]
-      );
-
-      if (transaction) {
-        return transaction;
-      }
-
-      if (attempt < RPC_RETRY_COUNT) {
-        stats.rpcRetries += 1;
-
-        await sleep(
-          RPC_RETRY_DELAY_MS * (attempt + 1)
+  try {
+    for (
+      let attempt = 0;
+      attempt <= RPC_RETRY_COUNT;
+      attempt += 1
+    ) {
+      try {
+        const transaction = await heliusRpc(
+          "getTransaction",
+          [
+            signature,
+            {
+              encoding: "jsonParsed",
+              maxSupportedTransactionVersion: 1,
+              commitment: "confirmed",
+            },
+          ]
         );
-      }
-    } catch (error) {
-      lastError = error;
 
-      if (attempt < RPC_RETRY_COUNT) {
-        stats.rpcRetries += 1;
+        if (transaction) {
+          return transaction;
+        }
 
-        const wasRateLimited =
-          error?.status === 429 ||
-          String(error?.message || "").includes("429");
+        if (attempt < RPC_RETRY_COUNT) {
+          stats.rpcRetries += 1;
 
-        await sleep(
-          wasRateLimited
-            ? backoffDelay(attempt, true)
-            : RPC_RETRY_DELAY_MS * (attempt + 1)
-        );
+          await sleep(
+            RPC_RETRY_DELAY_MS * (attempt + 1)
+          );
+        }
+      } catch (error) {
+        lastError = error;
+
+        if (attempt < RPC_RETRY_COUNT) {
+          stats.rpcRetries += 1;
+
+          const wasRateLimited =
+            error?.status === 429 ||
+            String(error?.message || "").includes("429");
+
+          await sleep(
+            wasRateLimited
+              ? backoffDelay(attempt, true)
+              : RPC_RETRY_DELAY_MS * (attempt + 1)
+          );
+        }
       }
     }
-  }
 
-  if (lastError) {
-    throw lastError;
-  }
+    if (lastError) {
+      throw lastError;
+    }
 
-  return null;
+    return null;
+  } finally {
+    recordPerformanceTiming(
+      "rpcFetch",
+      performanceNow() - fetchStartedAt
+    );
+  }
 }
+
+// ==================================================
+// 9B. TOKEN SUPPLY
+// ==================================================
 
 async function fetchTokenSupply(
   mintAddress
@@ -794,6 +1095,10 @@ async function fetchTokenSupply(
     [mintAddress]
   );
 }
+
+// ==================================================
+// 9C. LARGEST TOKEN ACCOUNTS
+// ==================================================
 
 async function fetchLargestTokenAccounts(
   mintAddress
@@ -2457,28 +2762,13 @@ function dispatchTokenSafetyEnrichment(
 // Purpose:
 //
 // Process one queued Helius transaction signature
-// through the proven pre-grad ingestion pipeline.
+// through the existing pre-grad ingestion pipeline.
 //
-// Order:
-//
-// 1. Validate queue item
-// 2. Fetch hydrated transaction
-// 3. Optionally store raw transaction
-// 4. Classify Pump.fun event
-// 5. Apply minimum trade threshold
-// 6. Upsert token
-// 7. Insert event
-// 8. Update market data
-// 9. Mark migration
-// 10. Dispatch async holder enrichment
-//
-// Philosophy:
-//
-// • Preserve successful trade ingestion.
-// • Never let enrichment block event insertion.
-// • Never retry permanently invalid transactions.
-// • Allow temporary fetch failures to be retried later.
-// • Enrich only create and buy events.
+// Performance diagnostics:
+// • Measure total processing time
+// • Measure the database-write phase
+// • Record timing on success and failure
+// • Preserve existing ingestion behavior
 // ==================================================
 
 
@@ -2491,12 +2781,9 @@ async function processQueuedSignature(item) {
     return;
   }
 
-  const signature =
-    item.signature;
+  const signature = item.signature;
 
-  queuedSignatures.delete(
-    signature
-  );
+  queuedSignatures.delete(signature);
 
   if (
     seenSignatures.has(signature) ||
@@ -2507,8 +2794,7 @@ async function processQueuedSignature(item) {
   }
 
   if (
-    Date.now() -
-      item.enqueuedAt >
+    Date.now() - item.enqueuedAt >
     SIGNATURE_MAX_AGE_MS
   ) {
     stats.droppedStale += 1;
@@ -2520,30 +2806,33 @@ async function processQueuedSignature(item) {
     return;
   }
 
-  inFlightSignatures.add(
-    signature
-  );
-
+  inFlightSignatures.add(signature);
   stats.dequeued += 1;
+
+  // Begin timing only after the signature is accepted
+  // for processing. Queue waiting time is excluded.
+  const processingStartedAt = performanceNow();
 
   let permanentlySeen = false;
 
   try {
     // ----------------------------------------------
     // FETCH HYDRATED TRANSACTION
+    //
+    // fetchFullTransaction() already records its
+    // own RPC timing in Section 9.
     // ----------------------------------------------
 
-    const tx =
-      await fetchFullTransaction(
-        signature
-      );
+    const tx = await fetchFullTransaction(
+      signature
+    );
 
     if (!tx) {
       stats.skippedEmptyTx += 1;
 
-      // Leave the signature eligible for a future
-      // retry because this may be a temporary RPC
-      // availability issue.
+      // Preserve existing behavior:
+      // Do not mark a temporary null RPC response
+      // as permanently seen.
       return;
     }
 
@@ -2552,7 +2841,6 @@ async function processQueuedSignature(item) {
       permanentlySeen = true;
       return;
     }
-
 
     // ----------------------------------------------
     // OPTIONAL RAW STORAGE
@@ -2574,47 +2862,39 @@ async function processQueuedSignature(item) {
           item.blockTime ||
           null,
 
-        type:
-          "helius_ws_pregrad_tx",
+        type: "helius_ws_pregrad_tx",
 
-        payload:
-          tx,
+        payload: tx,
       });
     }
-
 
     // ----------------------------------------------
     // CLASSIFY PUMP.FUN EVENT
     // ----------------------------------------------
 
-    const classified =
-      classifyPregradEvent(
-        tx,
-        signature
-      );
+    const classified = classifyPregradEvent(
+      tx,
+      signature
+    );
 
-  if (!classified.ok) {
-  if (
-    classified.reason ===
-    "unresolved_token_mint"
-  ) {
-    stats.skippedUnresolvedMint += 1;
+    if (!classified.ok) {
+      if (
+        classified.reason ===
+        "unresolved_token_mint"
+      ) {
+        stats.skippedUnresolvedMint += 1;
 
-    // Diagnostics only.
-    // Does not change classification or ingestion behavior.
-    recordUnresolvedMintDiagnostics(tx);
-  }
+        // Diagnostics only.
+        // Mint selection remains unchanged.
+        recordUnresolvedMintDiagnostics(tx);
+      }
 
-  permanentlySeen = true;
-  return;
-}
+      permanentlySeen = true;
+      return;
+    }
 
-    const event =
-      classified.event;
-
-    const token =
-      classified.tokenUpsert;
-
+    const event = classified.event;
+    const token = classified.tokenUpsert;
 
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
@@ -2631,15 +2911,13 @@ async function processQueuedSignature(item) {
       const minSolAmount =
         effectiveMinSolAmount();
 
-      const solAmount =
-        Number(
-          event.sol_amount
-        );
+      const solAmount = Number(
+        event.sol_amount
+      );
 
       if (
         !Number.isFinite(solAmount) ||
-        solAmount <
-          minSolAmount
+        solAmount < minSolAmount
       ) {
         stats.skippedSmallSolAmount += 1;
         permanentlySeen = true;
@@ -2647,84 +2925,92 @@ async function processQueuedSignature(item) {
       }
     }
 
-
     // ----------------------------------------------
-    // PRIMARY TOKEN WRITE
+    // DATABASE WRITE PERFORMANCE
+    //
+    // Measures the complete primary write phase:
+    // • Token upsert
+    // • Event insert
+    // • Market-data update, when applicable
+    // • Graduation update, when applicable
+    //
+    // The inner finally records timing even if
+    // a database operation throws or returns early.
     // ----------------------------------------------
 
-    await upsertLaunchpadToken(
-      token
-    );
+    const dbWriteStartedAt = performanceNow();
 
+    let inserted = false;
 
-    // ----------------------------------------------
-    // PRIMARY EVENT WRITE
-    // ----------------------------------------------
+    try {
+      // --------------------------------------------
+      // PRIMARY TOKEN WRITE
+      // --------------------------------------------
 
-    const inserted =
-      await insertLaunchpadEvent(
+      await upsertLaunchpadToken(token);
+
+      // --------------------------------------------
+      // PRIMARY EVENT WRITE
+      // --------------------------------------------
+
+      inserted = await insertLaunchpadEvent(
         event
       );
 
-    permanentlySeen = true;
+      permanentlySeen = true;
 
-    if (!inserted) {
-      return;
-    }
+      if (!inserted) {
+        return;
+      }
 
+      // --------------------------------------------
+      // LIVE MARKET DATA
+      // --------------------------------------------
 
-    // ----------------------------------------------
-    // LIVE MARKET DATA
-    // ----------------------------------------------
+      if (
+        ["buy", "sell"].includes(
+          event.event_type
+        )
+      ) {
+        await updateLaunchpadMarketDataFromEvent(
+          event
+        );
+      }
 
-    if (
-      ["buy", "sell"].includes(
-        event.event_type
-      )
-    ) {
-      await updateLaunchpadMarketDataFromEvent(
-        event
+      // --------------------------------------------
+      // GRADUATION
+      // --------------------------------------------
+
+      if (
+        event.event_type === "migrate"
+      ) {
+        await markTokenGraduated(
+          event.token_address,
+          event.block_time
+        );
+      }
+    } finally {
+      recordPerformanceTiming(
+        "dbWrite",
+        performanceNow() - dbWriteStartedAt
       );
     }
-
-
-    // ----------------------------------------------
-    // GRADUATION
-    // ----------------------------------------------
-
-    if (
-      event.event_type ===
-      "migrate"
-    ) {
-      await markTokenGraduated(
-        event.token_address,
-        event.block_time
-      );
-    }
-
 
     // ----------------------------------------------
     // ASYNC HOLDER ENRICHMENT
     //
     // Only creates and buys initiate holder scans.
-    //
-    // Sells and migrations do not need to trigger
-    // another holder request.
-    //
     // This call is intentionally never awaited.
     // ----------------------------------------------
 
     if (
-      event.event_type ===
-        "create" ||
-      event.event_type ===
-        "buy"
+      event.event_type === "create" ||
+      event.event_type === "buy"
     ) {
       dispatchTokenSafetyEnrichment(
         event.token_address
       );
     }
-
 
     // ----------------------------------------------
     // SUCCESS STATS
@@ -2754,6 +3040,8 @@ async function processQueuedSignature(item) {
         break;
     }
   } catch (error) {
+    // Preserve the existing error counter and
+    // error-handling behavior.
     stats.txFetchErrors += 1;
 
     logError(
@@ -2761,22 +3049,35 @@ async function processQueuedSignature(item) {
       {
         signature,
 
-        error:
-          String(
-            error?.message ||
-            error
-          ),
+        error: String(
+          error?.message || error
+        ),
       }
     );
   } finally {
-    inFlightSignatures.delete(
-      signature
+    // ----------------------------------------------
+    // TOTAL PROCESSING PERFORMANCE
+    //
+    // Includes:
+    // • RPC fetch and retries
+    // • Optional raw storage
+    // • Classification
+    // • Database writes
+    //
+    // Excludes:
+    // • Time spent waiting in the queue
+    // • Async holder-enrichment execution
+    // ----------------------------------------------
+
+    recordPerformanceTiming(
+      "processing",
+      performanceNow() - processingStartedAt
     );
 
+    inFlightSignatures.delete(signature);
+
     if (permanentlySeen) {
-      addSeenSignature(
-        signature
-      );
+      addSeenSignature(signature);
     }
   }
 }
@@ -3285,23 +3586,28 @@ let previousLogAt =
 // ==================================================
 // 16C. SCANNER STATS LOGGER
 //
-// Produces one compact scanner-health record per log
-// interval.
+// Produces one compact scanner-health record per
+// logging interval.
 //
-// Includes:
-//
+// Existing diagnostics:
 // • WebSocket health
-// • Queue depth
-// • Oldest queued signature age
+// • Queue depth and oldest signature age
 // • In-flight transaction count
-// • Incoming transaction rate
-// • Worker drain rate
-// • Database insert rate
-// • Completed processing rate
+// • Incoming, drain, insert and processing rates
 // • Cumulative scanner counters
 //
-// The control query is shared through the safe control
-// cache and cannot fan out across workers.
+// Additional performance diagnostics:
+// • RPC fetch latency
+// • Database-write latency
+// • Total signature-processing latency
+// • Completed and ongoing intake-pause duration
+// • PostgreSQL connection-pool pressure
+// • Effective runtime configuration
+//
+// Timing summaries are cumulative since startup.
+// Rate measurements cover the current log interval.
+//
+// Observation only: does not modify ingestion.
 // ==================================================
 
 function startQueueLogger() {
@@ -3309,70 +3615,163 @@ function startQueueLogger() {
     return;
   }
 
+  // Prevent overlapping async logger executions.
+  let loggerRunning = false;
+
   queueLogTimer = setInterval(
     async () => {
+      if (loggerRunning) {
+        return;
+      }
+
+      loggerRunning = true;
+
       try {
-        // One shared control refresh.
+        // ------------------------------------------
+        // SHARED CONTROL REFRESH
+        // ------------------------------------------
+
         await getPregradControl();
 
-        const now =
-          Date.now();
+        const now = Date.now();
 
-        const seconds =
-          Math.max(
+        const seconds = Math.max(
+          (now - previousLogAt) / 1000,
+          1
+        );
+
+        const oldest = signatureQueue[0];
+
+        // ------------------------------------------
+        // INGESTION RATES
+        //
+        // These measure the interval since the
+        // previous successful stats log.
+        // ------------------------------------------
+
+        const incomingPerSecond = Number(
+          (
+            (stats.queued - previousStats.queued) /
+            seconds
+          ).toFixed(2)
+        );
+
+        const drainedPerSecond = Number(
+          (
+            (stats.dequeued - previousStats.dequeued) /
+            seconds
+          ).toFixed(2)
+        );
+
+        const insertedPerSecond = Number(
+          (
             (
-              now -
-              previousLogAt
-            ) / 1000,
-            1
-          );
+              stats.insertedEvents -
+              previousStats.insertedEvents
+            ) / seconds
+          ).toFixed(2)
+        );
 
-        const oldest =
-          signatureQueue[0];
-
-        const incomingPerSecond =
-          Number(
+        const processedPerSecond = Number(
+          (
             (
-              (
-                stats.queued -
-                previousStats.queued
-              ) /
-              seconds
-            ).toFixed(2)
-          );
+              stats.processed -
+              previousStats.processed
+            ) / seconds
+          ).toFixed(2)
+        );
 
-        const drainedPerSecond =
-          Number(
-            (
-              (
-                stats.dequeued -
-                previousStats.dequeued
-              ) /
-              seconds
-            ).toFixed(2)
-          );
+        // ------------------------------------------
+        // PERFORMANCE SUMMARIES
+        //
+        // Cumulative since scanner startup.
+        // Includes samples, average and maximum.
+        // ------------------------------------------
 
-        const insertedPerSecond =
-          Number(
-            (
-              (
-                stats.insertedEvents -
-                previousStats.insertedEvents
-              ) /
-              seconds
-            ).toFixed(2)
-          );
+        const rpcFetchPerformance =
+          getPerformanceSummary("rpcFetch");
 
-        const processedPerSecond =
-          Number(
-            (
-              (
-                stats.processed -
-                previousStats.processed
-              ) /
-              seconds
-            ).toFixed(2)
-          );
+        const dbWritePerformance =
+          getPerformanceSummary("dbWrite");
+
+        const processingPerformance =
+          getPerformanceSummary("processing");
+
+        const intakePausePerformance =
+          getPerformanceSummary("intakePause");
+
+        // ------------------------------------------
+        // CURRENT INTAKE PAUSE
+        //
+        // Completed pauses are recorded in stats.
+        // An ongoing pause must be measured here.
+        // ------------------------------------------
+
+        const currentPauseMs =
+          intakePaused &&
+          intakePausedAt !== null
+            ? Math.max(
+                Math.round(
+                  performanceNow() - intakePausedAt
+                ),
+                0
+              )
+            : 0;
+
+        // ------------------------------------------
+        // POSTGRESQL CONNECTION POOL
+        //
+        // These are synchronous pool properties.
+        // No additional database query is required.
+        // ------------------------------------------
+
+        const postgresPool = {
+          totalConnections:
+            pool.totalCount,
+
+          idleConnections:
+            pool.idleCount,
+
+          waitingRequests:
+            pool.waitingCount,
+
+          configuredMaxConnections:
+            pool.options.max,
+        };
+
+        // ------------------------------------------
+        // EFFECTIVE RUNTIME CONFIGURATION
+        //
+        // Queue limit and minimum SOL threshold may
+        // be overridden by pregrad_system_control.
+        // ------------------------------------------
+
+        const effectiveConfiguration = {
+          maxQueueSize:
+            effectiveMaxQueueSize(),
+
+          resumeQueueSize:
+            RESUME_QUEUE_SIZE,
+
+          signatureMaxAgeMs:
+            SIGNATURE_MAX_AGE_MS,
+
+          workerConcurrency:
+            WORKER_CONCURRENCY,
+
+          maxTxPerSecond:
+            MAX_TX_PER_SECOND,
+
+          minSolAmount:
+            effectiveMinSolAmount(),
+
+          storeRawEvents:
+            STORE_RAW_EVENTS,
+        };
+
+        // ------------------------------------------
+        // EMIT SCANNER HEALTH RECORD
+        // ------------------------------------------
 
         logInfo(
           "Scanner stats",
@@ -3387,8 +3786,7 @@ function startQueueLogger() {
               pregradControl.manual_override,
 
             websocketState:
-              ws?.readyState ??
-              null,
+              ws?.readyState ?? null,
 
             socketAlive,
 
@@ -3414,23 +3812,42 @@ function startQueueLogger() {
             oldestSignatureAgeMs:
               oldest
                 ? Math.max(
-                    now -
-                    oldest.enqueuedAt,
+                    now - oldest.enqueuedAt,
                     0
                   )
                 : 0,
 
+            // Interval rates
             incomingPerSecond,
-
             drainedPerSecond,
-
             insertedPerSecond,
-
             processedPerSecond,
 
+            // Cumulative latency summaries
+            rpcFetchPerformance,
+            dbWritePerformance,
+            processingPerformance,
+            intakePausePerformance,
+
+            // Ongoing pause duration
+            currentPauseMs,
+
+            // Database connection pressure
+            postgresPool,
+
+            // Actual active settings
+            effectiveConfiguration,
+
+            // Preserve every existing counter
             ...stats,
           }
         );
+
+        // ------------------------------------------
+        // UPDATE INTERVAL BASELINE
+        //
+        // Only advance after successful logging.
+        // ------------------------------------------
 
         previousStats = {
           queued:
@@ -3446,19 +3863,18 @@ function startQueueLogger() {
             stats.processed,
         };
 
-        previousLogAt =
-          now;
+        previousLogAt = now;
       } catch (error) {
         logError(
           "Scanner stats logging failed",
           {
-            error:
-              String(
-                error?.message ||
-                error
-              ),
+            error: String(
+              error?.message || error
+            ),
           }
         );
+      } finally {
+        loggerRunning = false;
       }
     },
     QUEUE_LOG_EVERY_MS

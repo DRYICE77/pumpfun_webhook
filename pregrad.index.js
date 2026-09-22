@@ -360,6 +360,18 @@ const stats = {
   skippedEmptyTx: 0,
   skippedFailedTx: 0,
   skippedUnresolvedMint: 0,
+  unresolvedCreate: 0,
+unresolvedBuy: 0,
+unresolvedSell: 0,
+unresolvedMigrate: 0,
+unresolvedUnknown: 0,
+
+unresolvedNoTokenBalances: 0,
+unresolvedZeroCandidates: 0,
+unresolvedOneCandidate: 0,
+unresolvedMultipleCandidates: 0,
+unresolvedCandidatesNoPumpSuffix: 0,
+unresolvedCandidatesWithPumpSuffix: 0,
 
   txFetchErrors: 0,
   workerErrors: 0,
@@ -1037,6 +1049,47 @@ function inferPrimaryMint(tx) {
   );
 
   return pumpMint || null;
+}
+
+// Diagnostic helper — does not change mint selection.
+function recordUnresolvedMintDiagnostics(tx) {
+  const eventType = inferEventTypeFromLogs(tx);
+
+  const eventCounter = {
+    create: "unresolvedCreate",
+    buy: "unresolvedBuy",
+    sell: "unresolvedSell",
+    migrate: "unresolvedMigrate",
+  }[eventType] || "unresolvedUnknown";
+
+  stats[eventCounter] += 1;
+
+  const preBalances = tx?.meta?.preTokenBalances || [];
+  const postBalances = tx?.meta?.postTokenBalances || [];
+
+  if (
+    preBalances.length === 0 &&
+    postBalances.length === 0
+  ) {
+    stats.unresolvedNoTokenBalances += 1;
+  }
+
+  const candidates =
+    getMintCandidatesFromTokenBalances(tx);
+
+  if (candidates.length === 0) {
+    stats.unresolvedZeroCandidates += 1;
+  } else if (candidates.length === 1) {
+    stats.unresolvedOneCandidate += 1;
+  } else {
+    stats.unresolvedMultipleCandidates += 1;
+  }
+
+  if (candidates.some((mint) => mint.endsWith("pump"))) {
+    stats.unresolvedCandidatesWithPumpSuffix += 1;
+  } else if (candidates.length > 0) {
+    stats.unresolvedCandidatesNoPumpSuffix += 1;
+  }
 }
 
 
@@ -2540,17 +2593,21 @@ async function processQueuedSignature(item) {
         signature
       );
 
-    if (!classified.ok) {
-      if (
-        classified.reason ===
-        "unresolved_token_mint"
-      ) {
-        stats.skippedUnresolvedMint += 1;
-      }
+  if (!classified.ok) {
+  if (
+    classified.reason ===
+    "unresolved_token_mint"
+  ) {
+    stats.skippedUnresolvedMint += 1;
 
-      permanentlySeen = true;
-      return;
-    }
+    // Diagnostics only.
+    // Does not change classification or ingestion behavior.
+    recordUnresolvedMintDiagnostics(tx);
+  }
+
+  permanentlySeen = true;
+  return;
+}
 
     const event =
       classified.event;

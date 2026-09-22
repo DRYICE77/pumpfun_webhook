@@ -731,7 +731,7 @@ async function fetchFullTransaction(signature) {
           signature,
           {
             encoding: "jsonParsed",
-            maxSupportedTransactionVersion: 0,
+            maxSupportedTransactionVersion: 1,
             commitment: "confirmed",
           },
         ]
@@ -745,8 +745,7 @@ async function fetchFullTransaction(signature) {
         stats.rpcRetries += 1;
 
         await sleep(
-          RPC_RETRY_DELAY_MS *
-          (attempt + 1)
+          RPC_RETRY_DELAY_MS * (attempt + 1)
         );
       }
     } catch (error) {
@@ -757,14 +756,12 @@ async function fetchFullTransaction(signature) {
 
         const wasRateLimited =
           error?.status === 429 ||
-          String(error?.message || "")
-            .includes("429");
+          String(error?.message || "").includes("429");
 
         await sleep(
           wasRateLimited
             ? backoffDelay(attempt, true)
-            : RPC_RETRY_DELAY_MS *
-              (attempt + 1)
+            : RPC_RETRY_DELAY_MS * (attempt + 1)
         );
       }
     }

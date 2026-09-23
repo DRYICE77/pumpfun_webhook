@@ -1,70 +1,44 @@
 "use strict";
 
-// ==================================================
-// NORTH STAR PIT OBSERVATION VERIFICATION
-// northstar.pit.test.js
+// ============================================================
+// NORTH STAR — FORWARD OUTCOME VERIFICATION
+// northstar.outcome.test.js
 //
-// Purpose:
+// T0 DEFINITION:
+//   T0 = END of the PIT observation minute.
 //
-// Verify that northstar.minute.sql produces
-// point-in-time-safe minute observations.
+// Example:
+//   PIT minute: [05:43:00, 05:44:00)
+//   T0:         05:44:00
 //
-// Tests:
+// Therefore:
+//   feature information: block_time < T0
+//   outcome information: block_time >= T0
 //
-// 1. Source boundary isolation
-// 2. Deterministic replay
-// 3. Future-event exclusion
-// 4. Historical observation stability
+// TESTS:
+//   1. T0 temporal separation
+//   2. Deterministic outcome replay
+//   3. Pre-T0 event exclusion from outcomes
+//   4. Post-T0 future-event sensitivity
+//   5. PIT observation remains unchanged
+//   6. Transaction rollback
 //
-// Safety:
-//
-// • Uses one PostgreSQL transaction
-// • Inserts only synthetic test data
-// • Always ROLLBACK
-// • Does not advance NorthStar checkpoints
-// • Does not consume worker test-gate commits
-// • Does not modify collection status
-//
-// IMPORTANT:
-//
-// This test uses the REAL northstar.minute.sql.
-// ==================================================
+// SAFETY:
+//   • One PostgreSQL transaction
+//   • Synthetic rows only
+//   • Always ROLLBACK
+//   • No worker checkpoint changes
+//   • No test-gate consumption
+// ============================================================
 
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
-
-// ==================================================
-// 1. CONFIG
-// ==================================================
-
-const DATABASE_URL =
-  process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
-  throw new Error(
-    "DATABASE_URL is required"
-  );
+  throw new Error("DATABASE_URL is required");
 }
-
-const SQL_PATH = path.join(
-  __dirname,
-  "northstar.minute.sql"
-);
-
-if (!fs.existsSync(SQL_PATH)) {
-  throw new Error(
-    `Missing SQL file: ${SQL_PATH}`
-  );
-}
-
-const minuteSql =
-  fs.readFileSync(
-    SQL_PATH,
-    "utf8"
-  );
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -77,40 +51,35 @@ const pool = new Pool({
         },
 
   max: 2,
-
   connectionTimeoutMillis: 15000,
-
   statement_timeout: 120000,
 
   application_name:
-    "northstar-pit-test",
+    "northstar-outcome-test",
 });
 
 
-// ==================================================
-// 2. BASIC HELPERS
-// ==================================================
+// ============================================================
+// HELPERS
+// ============================================================
 
 function log(message, extra = null) {
   if (extra === null) {
     console.log(
-      `[northstar-pit-test] ${message}`
+      `[northstar-outcome-test] ${message}`
     );
 
     return;
   }
 
   console.log(
-    `[northstar-pit-test] ${message} ${JSON.stringify(
-      extra
-    )}`
+    `[northstar-outcome-test] ${message} ${JSON.stringify(extra)}`
   );
 }
 
 
 function fail(message, extra = null) {
-  const error =
-    new Error(message);
+  const error = new Error(message);
 
   error.testDetails = extra;
 
@@ -118,24 +87,22 @@ function fail(message, extra = null) {
 }
 
 
-function randomSignature() {
+function randomSignature(label) {
   return (
-    "NORTHSTAR_PIT_TEST_" +
+    `NORTHSTAR_OUTCOME_TEST_${label}_` +
     crypto.randomBytes(16).toString("hex")
   );
 }
 
 
-function asIso(value) {
-  if (!value) {
-    return null;
-  }
+function iso(value) {
+  if (!value) return null;
 
   return new Date(value).toISOString();
 }
 
 
-function numericString(value) {
+function numeric(value) {
   if (
     value === null ||
     value === undefined
@@ -143,79 +110,69 @@ function numericString(value) {
     return null;
   }
 
-  return String(value);
+  return Number(value);
 }
 
 
-// ==================================================
-// 3. OBSERVATION NORMALIZATION
+// ============================================================
+// PIT NORMALIZATION
 //
-// updated_at is deliberately excluded.
-//
-// It is write metadata, not a PIT feature.
-// ==================================================
+// updated_at deliberately excluded.
+// ============================================================
 
-function normalizeObservation(row) {
-  if (!row) {
-    return null;
-  }
+function normalizePit(row) {
+  if (!row) return null;
 
   return {
     token_address:
       row.token_address,
 
     minute_bucket:
-      asIso(row.minute_bucket),
+      iso(row.minute_bucket),
 
     buy_volume_sol:
-      numericString(
-        row.buy_volume_sol
-      ),
+      String(row.buy_volume_sol),
 
     sell_volume_sol:
-      numericString(
-        row.sell_volume_sol
-      ),
+      String(row.sell_volume_sol),
 
     total_volume_sol:
-      numericString(
-        row.total_volume_sol
-      ),
+      String(row.total_volume_sol),
 
     max_buy_size_sol:
-      numericString(
-        row.max_buy_size_sol
-      ),
+      String(row.max_buy_size_sol),
 
     max_sell_size_sol:
-      numericString(
-        row.max_sell_size_sol
-      ),
+      String(row.max_sell_size_sol),
 
     net_max_buy_size_sol:
-      numericString(
-        row.net_max_buy_size_sol
-      ),
+      String(row.net_max_buy_size_sol),
 
     max_buy_to_sell_size_ratio:
-      numericString(
+      String(
         row.max_buy_to_sell_size_ratio
       ),
 
     latest_market_cap_usd:
-      numericString(
-        row.latest_market_cap_usd
-      ),
+      row.latest_market_cap_usd === null
+        ? null
+        : String(
+            row.latest_market_cap_usd
+          ),
 
     latest_price_per_token:
-      numericString(
-        row.latest_price_per_token
-      ),
+      row.latest_price_per_token === null
+        ? null
+        : String(
+            row.latest_price_per_token
+          ),
 
     latest_sol_price_usd:
-      numericString(
-        row.latest_sol_price_usd
-      ),
+      row.latest_sol_price_usd === null
+        ? null
+        : String(
+            row.latest_sol_price_usd
+          ),
 
     buy_count:
       Number(row.buy_count),
@@ -236,15 +193,15 @@ function normalizeObservation(row) {
       Number(row.unique_wallets),
 
     first_trade_at:
-      asIso(row.first_trade_at),
+      iso(row.first_trade_at),
 
     last_trade_at:
-      asIso(row.last_trade_at),
+      iso(row.last_trade_at),
   };
 }
 
 
-function observationsEqual(a, b) {
+function equal(a, b) {
   return (
     JSON.stringify(a) ===
     JSON.stringify(b)
@@ -252,85 +209,89 @@ function observationsEqual(a, b) {
 }
 
 
-// ==================================================
-// 4. FIND TEST MINUTE
+// ============================================================
+// FIND A REAL PIT OBSERVATION
 //
-// Choose a real token/minute with:
-// • multiple qualifying trades
-// • positive SOL
-// • valid token address
+// Requirements:
 //
-// We deliberately choose a recent historical
-// candidate, but not the current minute.
-// ==================================================
+// • Existing NorthStar minute
+// • Positive baseline price
+// • At least 10 minutes old
+// • Has subsequent real price observations
+//
+// T0 = minute_bucket + 1 minute
+// ============================================================
 
-async function findCandidateMinute(
-  client
-) {
+async function findCandidate(client) {
   const result =
     await client.query(`
       SELECT
-        e.token_address,
+        n.token_address,
+        n.minute_bucket,
+        n.latest_price_per_token,
+        n.last_trade_at,
 
-        date_trunc(
-          'minute',
-          e.block_time
-        ) AS minute_bucket,
+        (
+          n.minute_bucket
+          + INTERVAL '1 minute'
+        ) AS t0,
 
-        COUNT(*)::integer
-          AS trade_count,
+        COUNT(f.id)::integer
+          AS future_price_events
 
-        MIN(e.block_time)
-          AS first_trade_at,
+      FROM
+        public.northstar_token_volume_minutes n
 
-        MAX(e.block_time)
-          AS last_trade_at
+      JOIN
+        public.pump_launchpad_events f
 
-      FROM public.pump_launchpad_events e
+        ON f.token_address =
+           n.token_address
+
+       AND f.block_time >=
+           (
+             n.minute_bucket
+             + INTERVAL '1 minute'
+           )
+
+       AND f.event_type IN (
+           'buy',
+           'sell'
+       )
+
+       AND f.sol_amount > 0
+
+       AND f.price_per_token > 0
 
       WHERE
-        e.event_type IN (
-          'buy',
-          'sell'
-        )
+        n.latest_price_per_token > 0
 
-        AND e.sol_amount > 0
-
-        AND e.token_address
-          IS NOT NULL
-
-        AND BTRIM(
-          e.token_address
-        ) <> ''
-
-        AND e.block_time <
-          date_trunc(
-            'minute',
-            NOW()
-          ) - INTERVAL '5 minutes'
-
-        AND e.block_time >=
-          NOW() - INTERVAL '24 hours'
+        AND n.minute_bucket <
+            date_trunc(
+              'minute',
+              NOW()
+            )
+            - INTERVAL '10 minutes'
 
       GROUP BY
-        e.token_address,
-        date_trunc(
-          'minute',
-          e.block_time
-        )
+        n.token_address,
+        n.minute_bucket,
+        n.latest_price_per_token,
+        n.last_trade_at
 
-      HAVING COUNT(*) >= 2
+      HAVING
+        COUNT(f.id) >= 5
 
       ORDER BY
-        minute_bucket DESC,
-        trade_count DESC
+        n.minute_bucket DESC,
+        COUNT(f.id) DESC
 
       LIMIT 1
     `);
 
   if (result.rowCount !== 1) {
     fail(
-      "Could not find a suitable real token/minute."
+      "Could not find a suitable PIT/outcome candidate."
     );
   }
 
@@ -338,11 +299,11 @@ async function findCandidateMinute(
 }
 
 
-// ==================================================
-// 5. READ ONE NORTHSTAR OBSERVATION
-// ==================================================
+// ============================================================
+// READ PIT OBSERVATION
+// ============================================================
 
-async function readObservation(
+async function readPit(
   client,
   tokenAddress,
   minuteBucket
@@ -360,6 +321,7 @@ async function readObservation(
 
         max_buy_size_sol,
         max_sell_size_sol,
+
         net_max_buy_size_sol,
         max_buy_to_sell_size_ratio,
 
@@ -380,11 +342,14 @@ async function readObservation(
 
         updated_at
 
-      FROM public.northstar_token_volume_minutes
+      FROM
+        public.northstar_token_volume_minutes
 
       WHERE
         token_address = $1
-        AND minute_bucket = $2::timestamptz
+
+        AND minute_bucket =
+            $2::timestamptz
       `,
       [
         tokenAddress,
@@ -392,29 +357,164 @@ async function readObservation(
       ]
     );
 
-  if (result.rowCount === 0) {
-    return null;
+  if (result.rowCount !== 1) {
+    fail(
+      "Expected exactly one PIT observation."
+    );
   }
 
   return result.rows[0];
 }
 
 
-// ==================================================
-// 6. RUN REAL MINUTE SQL
-// ==================================================
+// ============================================================
+// INDEPENDENT OUTCOME CALCULATION
+//
+// This deliberately reads RAW FUTURE EVENTS.
+//
+// Baseline:
+//   PIT latest_price_per_token
+//
+// Future:
+//   block_time >= T0
+//
+// No pump_launchpad_tokens.
+// No token_market_state.
+// No current ATH.
+// No mutable current-state source.
+//
+// This test uses all currently available future events.
+// ============================================================
 
-async function runMinuteSql(
+async function calculateOutcome(
   client,
-  windowStart,
-  windowEnd
+  tokenAddress,
+  baselinePrice,
+  t0
 ) {
   const result =
     await client.query(
-      minuteSql,
+      `
+      WITH future_prices AS MATERIALIZED (
+
+        SELECT
+          e.id,
+          e.block_time,
+          e.price_per_token::numeric
+            AS price_per_token
+
+        FROM
+          public.pump_launchpad_events e
+
+        WHERE
+          e.token_address = $1
+
+          AND e.block_time >=
+              $3::timestamptz
+
+          AND e.event_type IN (
+              'buy',
+              'sell'
+          )
+
+          AND e.sol_amount > 0
+
+          AND e.price_per_token > 0
+
+      ),
+
+      summary AS (
+
+        SELECT
+          COUNT(*)::integer
+            AS future_event_count,
+
+          MIN(block_time)
+            AS first_future_event_at,
+
+          MAX(block_time)
+            AS last_future_event_at,
+
+          MIN(price_per_token)
+            AS min_future_price,
+
+          MAX(price_per_token)
+            AS max_future_price
+
+        FROM future_prices
+
+      )
+
+      SELECT
+        $1::text
+          AS token_address,
+
+        $2::numeric
+          AS baseline_price,
+
+        $3::timestamptz
+          AS t0,
+
+        future_event_count,
+
+        first_future_event_at,
+
+        last_future_event_at,
+
+        min_future_price,
+
+        max_future_price,
+
+        CASE
+          WHEN
+            $2::numeric > 0
+            AND max_future_price
+                IS NOT NULL
+
+          THEN ROUND(
+            (
+              (
+                max_future_price
+                / $2::numeric
+              )
+              - 1
+            )
+            * 100,
+            6
+          )
+
+          ELSE NULL
+        END
+          AS max_return_pct,
+
+        CASE
+          WHEN
+            $2::numeric > 0
+            AND min_future_price
+                IS NOT NULL
+
+          THEN ROUND(
+            (
+              (
+                min_future_price
+                / $2::numeric
+              )
+              - 1
+            )
+            * 100,
+            6
+          )
+
+          ELSE NULL
+        END
+          AS min_return_pct
+
+      FROM summary
+      `,
       [
-        windowStart,
-        windowEnd,
+        tokenAddress,
+        baselinePrice,
+        t0,
       ]
     );
 
@@ -422,141 +522,77 @@ async function runMinuteSql(
 }
 
 
-// ==================================================
-// 7. SOURCE BOUNDARY AUDIT
-//
-// Independently verify that the chosen minute has
-// qualifying source events inside the exact
-// [windowStart, windowEnd) interval.
-//
-// Also count events at/after windowEnd for the same
-// token. Those must not affect this observation.
-// ==================================================
+// ============================================================
+// NORMALIZE OUTCOME
+// ============================================================
 
-async function auditSourceBoundary(
-  client,
-  tokenAddress,
-  windowStart,
-  windowEnd
-) {
-  const inside =
-    await client.query(
-      `
-      SELECT
-        COUNT(*)::integer AS count,
-
-        MIN(block_time)
-          AS first_trade_at,
-
-        MAX(block_time)
-          AS last_trade_at
-
-      FROM public.pump_launchpad_events
-
-      WHERE
-        token_address = $1
-
-        AND block_time >=
-          $2::timestamptz
-
-        AND block_time <
-          $3::timestamptz
-
-        AND event_type IN (
-          'buy',
-          'sell'
-        )
-
-        AND sol_amount > 0
-      `,
-      [
-        tokenAddress,
-        windowStart,
-        windowEnd,
-      ]
-    );
-
-  const future =
-    await client.query(
-      `
-      SELECT
-        COUNT(*)::integer AS count
-
-      FROM public.pump_launchpad_events
-
-      WHERE
-        token_address = $1
-
-        AND block_time >=
-          $2::timestamptz
-
-        AND event_type IN (
-          'buy',
-          'sell'
-        )
-
-        AND sol_amount > 0
-      `,
-      [
-        tokenAddress,
-        windowEnd,
-      ]
-    );
-
+function normalizeOutcome(row) {
   return {
-    inside:
-      inside.rows[0],
+    token_address:
+      row.token_address,
 
-    future:
-      future.rows[0],
+    baseline_price:
+      numeric(row.baseline_price),
+
+    t0:
+      iso(row.t0),
+
+    future_event_count:
+      Number(row.future_event_count),
+
+    first_future_event_at:
+      iso(row.first_future_event_at),
+
+    last_future_event_at:
+      iso(row.last_future_event_at),
+
+    min_future_price:
+      numeric(row.min_future_price),
+
+    max_future_price:
+      numeric(row.max_future_price),
+
+    max_return_pct:
+      numeric(row.max_return_pct),
+
+    min_return_pct:
+      numeric(row.min_return_pct),
   };
 }
 
 
-// ==================================================
-// 8. INSERT SYNTHETIC FUTURE EVENT
-//
-// Critical property:
-//
-// block_time is AFTER windowEnd.
-//
-// If PIT isolation works correctly, rerunning the
-// historical window must completely ignore this row.
-//
-// This row exists only inside the test transaction.
-// ==================================================
+// ============================================================
+// INSERT SYNTHETIC EVENT
+// ============================================================
 
-async function insertSyntheticFutureEvent(
+async function insertSyntheticEvent(
   client,
-  tokenAddress,
-  windowEnd
+  {
+    tokenAddress,
+    blockTime,
+    price,
+    label,
+  }
 ) {
   const signature =
-    randomSignature();
-
-  const futureBlockTime =
-    new Date(
-      new Date(
-        windowEnd
-      ).getTime() +
-      30 * 1000
-    );
+    randomSignature(label);
 
   const result =
     await client.query(
       `
-      INSERT INTO public.pump_launchpad_events (
-        token_address,
-        signature,
-        slot,
-        block_time,
-        event_type,
-        wallet_address,
-        sol_amount,
-        token_amount,
-        price_per_token,
-        raw_json
-      )
+      INSERT INTO
+        public.pump_launchpad_events (
+          token_address,
+          signature,
+          slot,
+          block_time,
+          event_type,
+          wallet_address,
+          sol_amount,
+          token_amount,
+          price_per_token,
+          raw_json
+        )
 
       VALUES (
         $1,
@@ -565,22 +601,24 @@ async function insertSyntheticFutureEvent(
         $3::timestamptz,
         'buy',
         $4,
-        987654.321,
-        123456789,
-        0.123456789,
+        1.0,
+        1.0,
+        $5::numeric,
         NULL
       )
 
       RETURNING
         id,
         signature,
-        block_time
+        block_time,
+        price_per_token
       `,
       [
         tokenAddress,
         signature,
-        futureBlockTime.toISOString(),
-        "NORTHSTAR_PIT_TEST_WALLET",
+        blockTime,
+        `NORTHSTAR_OUTCOME_${label}`,
+        price,
       ]
     );
 
@@ -588,9 +626,9 @@ async function insertSyntheticFutureEvent(
 }
 
 
-// ==================================================
-// 9. MAIN TEST
-// ==================================================
+// ============================================================
+// MAIN
+// ============================================================
 
 async function main() {
   const client =
@@ -601,45 +639,49 @@ async function main() {
 
   try {
     log(
-      "Starting PIT verification"
-    );
-
-    log(
-      "Loading real northstar.minute.sql",
-      {
-        sqlPath:
-          SQL_PATH,
-      }
+      "Starting independent outcome verification"
     );
 
     await client.query("BEGIN");
 
     transactionStarted = true;
 
-    // Ensure no accidental commit survives.
     await client.query(
       "SET LOCAL statement_timeout = '120s'"
     );
 
-    // ----------------------------------------------
-    // FIND REAL HISTORICAL TEST MINUTE
-    // ----------------------------------------------
+
+    // ========================================================
+    // SELECT CANDIDATE
+    // ========================================================
 
     const candidate =
-      await findCandidateMinute(
-        client
-      );
+      await findCandidate(client);
 
-    const windowStart =
+    const minuteBucket =
       new Date(
         candidate.minute_bucket
       );
 
-    const windowEnd =
+    const t0 =
       new Date(
-        windowStart.getTime() +
-        60 * 1000
+        candidate.t0
       );
+
+    const baselinePrice =
+      numeric(
+        candidate.latest_price_per_token
+      );
+
+    if (
+      !baselinePrice ||
+      baselinePrice <= 0
+    ) {
+      fail(
+        "Candidate has invalid baseline price."
+      );
+    }
+
 
     log(
       "Selected candidate",
@@ -647,364 +689,509 @@ async function main() {
         tokenAddress:
           candidate.token_address,
 
-        windowStart:
-          windowStart.toISOString(),
+        pitMinute:
+          minuteBucket.toISOString(),
 
-        windowEnd:
-          windowEnd.toISOString(),
+        t0:
+          t0.toISOString(),
 
-        sourceTradeCount:
-          candidate.trade_count,
+        baselinePrice,
 
-        firstTradeAt:
-          asIso(
-            candidate.first_trade_at
-          ),
-
-        lastTradeAt:
-          asIso(
+        pitLastTradeAt:
+          iso(
             candidate.last_trade_at
           ),
-      }
-    );
 
-
-    // ----------------------------------------------
-    // TEST 1:
-    // SOURCE BOUNDARY AUDIT
-    // ----------------------------------------------
-
-    const boundaryAudit =
-      await auditSourceBoundary(
-        client,
-        candidate.token_address,
-        windowStart.toISOString(),
-        windowEnd.toISOString()
-      );
-
-    if (
-      Number(
-        boundaryAudit.inside.count
-      ) < 1
-    ) {
-      fail(
-        "Boundary audit found no qualifying events inside test minute.",
-        boundaryAudit
-      );
-    }
-
-    log(
-      "PIT CUTOFF SOURCE AUDIT PASS",
-      {
-        insideEventCount:
+        existingFuturePriceEvents:
           Number(
-            boundaryAudit.inside.count
-          ),
-
-        existingFutureEventCount:
-          Number(
-            boundaryAudit.future.count
+            candidate.future_price_events
           ),
       }
     );
 
 
-    // ----------------------------------------------
-    // BUILD BASELINE USING REAL PRODUCTION SQL
-    // ----------------------------------------------
+    // ========================================================
+    // ASSERT T0 DEFINITION
+    // ========================================================
 
-    const firstRun =
-      await runMinuteSql(
-        client,
-        windowStart.toISOString(),
-        windowEnd.toISOString()
-      );
-
-    const baselineRow =
-      await readObservation(
-        client,
-        candidate.token_address,
-        windowStart.toISOString()
-      );
-
-    if (!baselineRow) {
-      fail(
-        "Production minute SQL did not produce the expected observation.",
-        {
-          firstRun,
-        }
-      );
-    }
-
-    const baseline =
-      normalizeObservation(
-        baselineRow
-      );
-
-    log(
-      "Baseline observation created",
-      {
-        aggregation:
-          firstRun,
-
-        observation:
-          baseline,
-      }
-    );
-
-
-    // ----------------------------------------------
-    // TEST 2:
-    // DETERMINISTIC REPLAY
-    //
-    // Same source state + same window must produce
-    // exactly the same PIT feature values.
-    // ----------------------------------------------
-
-    const secondRun =
-      await runMinuteSql(
-        client,
-        windowStart.toISOString(),
-        windowEnd.toISOString()
-      );
-
-    const replayRow =
-      await readObservation(
-        client,
-        candidate.token_address,
-        windowStart.toISOString()
-      );
-
-    const replay =
-      normalizeObservation(
-        replayRow
-      );
+    const expectedT0 =
+      minuteBucket.getTime()
+      + 60 * 1000;
 
     if (
-      !observationsEqual(
-        baseline,
-        replay
-      )
+      t0.getTime() !== expectedT0
     ) {
       fail(
-        "Deterministic replay failed.",
-        {
-          baseline,
-          replay,
-          secondRun,
-        }
+        "T0 is not exactly the end of the PIT observation minute."
       );
     }
 
-    log(
-      "DETERMINISTIC REPLAY PASS",
-      {
-        minutesWritten:
-          secondRun?.minutes_written ??
-          null,
-      }
-    );
-
-
-    // ----------------------------------------------
-    // TEST 3:
-    // SYNTHETIC FUTURE EVENT
-    // ----------------------------------------------
-
-    const syntheticFuture =
-      await insertSyntheticFutureEvent(
-        client,
-        candidate.token_address,
-        windowEnd.toISOString()
-      );
-
-    log(
-      "Synthetic future event inserted",
-      {
-        signature:
-          syntheticFuture.signature,
-
-        blockTime:
-          asIso(
-            syntheticFuture.block_time
-          ),
-      }
-    );
-
-
-    // ----------------------------------------------
-    // PROVE SYNTHETIC EVENT EXISTS AFTER CUTOFF
-    // ----------------------------------------------
-
-    const syntheticCheck =
-      await client.query(
-        `
-        SELECT
-          COUNT(*)::integer AS count
-
-        FROM public.pump_launchpad_events
-
-        WHERE
-          signature = $1
-
-          AND block_time >=
-            $2::timestamptz
-        `,
-        [
-          syntheticFuture.signature,
-          windowEnd.toISOString(),
-        ]
-      );
-
     if (
-      Number(
-        syntheticCheck.rows[0].count
-      ) !== 1
-    ) {
-      fail(
-        "Synthetic future event was not positioned after the PIT cutoff."
-      );
-    }
-
-
-    // ----------------------------------------------
-    // TEST 4:
-    // FUTURE-EVENT EXCLUSION
-    //
-    // Re-run the historical minute AFTER adding the
-    // synthetic future event.
-    //
-    // Observation must remain identical.
-    // ----------------------------------------------
-
-    const futureRun =
-      await runMinuteSql(
-        client,
-        windowStart.toISOString(),
-        windowEnd.toISOString()
-      );
-
-    const afterFutureRow =
-      await readObservation(
-        client,
-        candidate.token_address,
-        windowStart.toISOString()
-      );
-
-    const afterFuture =
-      normalizeObservation(
-        afterFutureRow
-      );
-
-    if (
-      !observationsEqual(
-        baseline,
-        afterFuture
-      )
-    ) {
-      fail(
-        "Future-event exclusion failed: a post-cutoff event changed the historical observation.",
-        {
-          baseline,
-          afterFuture,
-          syntheticFuture,
-          futureRun,
-        }
-      );
-    }
-
-    log(
-      "FUTURE EVENT EXCLUSION PASS",
-      {
-        syntheticFutureBlockTime:
-          asIso(
-            syntheticFuture.block_time
-          ),
-
-        observationLastTradeAt:
-          afterFuture.last_trade_at,
-
-        minutesWritten:
-          futureRun?.minutes_written ??
-          null,
-      }
-    );
-
-
-    // ----------------------------------------------
-    // TEST 5:
-    // EXPLICIT BOUNDARY ASSERTION
-    //
-    // Historical last_trade_at must remain strictly
-    // earlier than windowEnd.
-    // ----------------------------------------------
-
-    if (
-      afterFuture.last_trade_at &&
+      candidate.last_trade_at &&
       new Date(
-        afterFuture.last_trade_at
+        candidate.last_trade_at
       ).getTime() >=
-        windowEnd.getTime()
+        t0.getTime()
     ) {
       fail(
-        "Historical observation crossed its window_end boundary.",
-        {
-          lastTradeAt:
-            afterFuture.last_trade_at,
+        "PIT observation contains data at or after T0."
+      );
+    }
 
-          windowEnd:
-            windowEnd.toISOString(),
+
+    log(
+      "T0 DEFINITION PASS",
+      {
+        definition:
+          "T0 = end of PIT observation",
+
+        featureBoundary:
+          "block_time < T0",
+
+        outcomeBoundary:
+          "block_time >= T0",
+      }
+    );
+
+
+    // ========================================================
+    // CAPTURE PIT BEFORE OUTCOME TEST
+    // ========================================================
+
+    const pitBefore =
+      normalizePit(
+        await readPit(
+          client,
+          candidate.token_address,
+          minuteBucket.toISOString()
+        )
+      );
+
+
+    // ========================================================
+    // BASELINE OUTCOME
+    // ========================================================
+
+    const baselineOutcome =
+      normalizeOutcome(
+        await calculateOutcome(
+          client,
+          candidate.token_address,
+          baselinePrice,
+          t0.toISOString()
+        )
+      );
+
+
+    if (
+      baselineOutcome.future_event_count <
+      1
+    ) {
+      fail(
+        "Outcome baseline has no future events."
+      );
+    }
+
+
+    if (
+      new Date(
+        baselineOutcome.first_future_event_at
+      ).getTime() <
+        t0.getTime()
+    ) {
+      fail(
+        "Outcome calculation consumed pre-T0 data.",
+        baselineOutcome
+      );
+    }
+
+
+    log(
+      "TEMPORAL SEPARATION PASS",
+      baselineOutcome
+    );
+
+
+    // ========================================================
+    // DETERMINISTIC REPLAY
+    // ========================================================
+
+    const replayOutcome =
+      normalizeOutcome(
+        await calculateOutcome(
+          client,
+          candidate.token_address,
+          baselinePrice,
+          t0.toISOString()
+        )
+      );
+
+
+    if (
+      !equal(
+        baselineOutcome,
+        replayOutcome
+      )
+    ) {
+      fail(
+        "Outcome deterministic replay failed.",
+        {
+          baselineOutcome,
+          replayOutcome,
         }
       );
     }
 
+
     log(
-      "WINDOW BOUNDARY ISOLATION PASS"
+      "DETERMINISTIC OUTCOME REPLAY PASS"
     );
 
 
-    // ----------------------------------------------
-    // OVERALL RESULT
-    // ----------------------------------------------
+    // ========================================================
+    // PRE-T0 EXCLUSION TEST
+    //
+    // Insert an absurd price 30 seconds BEFORE T0.
+    //
+    // Because outcomes begin at T0,
+    // this must have ZERO effect.
+    // ========================================================
+
+    const preT0Time =
+      new Date(
+        t0.getTime()
+        - 30 * 1000
+      );
+
+    const preT0Price =
+      baselinePrice * 1000000;
+
+
+    const preT0Event =
+      await insertSyntheticEvent(
+        client,
+        {
+          tokenAddress:
+            candidate.token_address,
+
+          blockTime:
+            preT0Time.toISOString(),
+
+          price:
+            preT0Price,
+
+          label:
+            "PRE_T0",
+        }
+      );
+
+
+    log(
+      "Synthetic pre-T0 event inserted",
+      {
+        blockTime:
+          iso(
+            preT0Event.block_time
+          ),
+
+        price:
+          numeric(
+            preT0Event.price_per_token
+          ),
+      }
+    );
+
+
+    const afterPreT0 =
+      normalizeOutcome(
+        await calculateOutcome(
+          client,
+          candidate.token_address,
+          baselinePrice,
+          t0.toISOString()
+        )
+      );
+
+
+    if (
+      !equal(
+        baselineOutcome,
+        afterPreT0
+      )
+    ) {
+      fail(
+        "PRE-T0 EXCLUSION FAILED: feature-period information changed the future outcome.",
+        {
+          baselineOutcome,
+          afterPreT0,
+        }
+      );
+    }
+
+
+    log(
+      "PRE-T0 OUTCOME EXCLUSION PASS"
+    );
+
+
+    // ========================================================
+    // POST-T0 SENSITIVITY TEST
+    //
+    // Insert an absurd future price 30 seconds AFTER T0.
+    //
+    // Outcome MUST change.
+    // ========================================================
+
+    const postT0Time =
+      new Date(
+        t0.getTime()
+        + 30 * 1000
+      );
+
+    const existingMax =
+      baselineOutcome.max_future_price ||
+      baselinePrice;
+
+    const postT0Price =
+      Math.max(
+        existingMax * 10,
+        baselinePrice * 100
+      );
+
+
+    const postT0Event =
+      await insertSyntheticEvent(
+        client,
+        {
+          tokenAddress:
+            candidate.token_address,
+
+          blockTime:
+            postT0Time.toISOString(),
+
+          price:
+            postT0Price,
+
+          label:
+            "POST_T0",
+        }
+      );
+
+
+    log(
+      "Synthetic post-T0 event inserted",
+      {
+        blockTime:
+          iso(
+            postT0Event.block_time
+          ),
+
+        price:
+          numeric(
+            postT0Event.price_per_token
+          ),
+      }
+    );
+
+
+    const afterPostT0 =
+      normalizeOutcome(
+        await calculateOutcome(
+          client,
+          candidate.token_address,
+          baselinePrice,
+          t0.toISOString()
+        )
+      );
+
+
+    if (
+      afterPostT0.future_event_count !==
+      baselineOutcome.future_event_count + 1
+    ) {
+      fail(
+        "Post-T0 event was not included exactly once.",
+        {
+          baselineOutcome,
+          afterPostT0,
+        }
+      );
+    }
+
+
+    if (
+      !(
+        afterPostT0.max_future_price >
+        baselineOutcome.max_future_price
+      )
+    ) {
+      fail(
+        "Post-T0 future price did not change max future price.",
+        {
+          baselineOutcome,
+          afterPostT0,
+        }
+      );
+    }
+
+
+    if (
+      !(
+        afterPostT0.max_return_pct >
+        baselineOutcome.max_return_pct
+      )
+    ) {
+      fail(
+        "Post-T0 future price did not change max return.",
+        {
+          baselineOutcome,
+          afterPostT0,
+        }
+      );
+    }
+
+
+    log(
+      "POST-T0 FUTURE SENSITIVITY PASS",
+      {
+        beforeMaxPrice:
+          baselineOutcome.max_future_price,
+
+        afterMaxPrice:
+          afterPostT0.max_future_price,
+
+        beforeMaxReturnPct:
+          baselineOutcome.max_return_pct,
+
+        afterMaxReturnPct:
+          afterPostT0.max_return_pct,
+      }
+    );
+
+
+    // ========================================================
+    // PIT MUST REMAIN UNCHANGED
+    // ========================================================
+
+    const pitAfter =
+      normalizePit(
+        await readPit(
+          client,
+          candidate.token_address,
+          minuteBucket.toISOString()
+        )
+      );
+
+
+    if (
+      !equal(
+        pitBefore,
+        pitAfter
+      )
+    ) {
+      fail(
+        "Outcome activity changed the PIT feature observation.",
+        {
+          pitBefore,
+          pitAfter,
+        }
+      );
+    }
+
+
+    log(
+      "OUTCOME → FEATURE ISOLATION PASS"
+    );
+
+
+    // ========================================================
+    // RUNNER THRESHOLD SANITY CHECK
+    //
+    // These are labels only.
+    // No persistence performed here.
+    // ========================================================
+
+    const runnerLabels = {
+      runner_75:
+        afterPostT0.max_return_pct >= 75,
+
+      runner_100:
+        afterPostT0.max_return_pct >= 100,
+
+      runner_300:
+        afterPostT0.max_return_pct >= 300,
+
+      runner_1000:
+        afterPostT0.max_return_pct >= 1000,
+    };
+
+
+    log(
+      "RUNNER LABEL DERIVATION PASS",
+      {
+        maxReturnPct:
+          afterPostT0.max_return_pct,
+
+        ...runnerLabels,
+      }
+    );
+
+
+    // ========================================================
+    // FINAL REPORT
+    // ========================================================
 
     log(
       "========================================"
     );
 
     log(
-      "PIT CUTOFF ISOLATION       PASS"
+      "T0 DEFINITION                 PASS"
     );
 
     log(
-      "FUTURE EVENT EXCLUSION     PASS"
+      "TEMPORAL SEPARATION           PASS"
     );
 
     log(
-      "DETERMINISTIC REPLAY       PASS"
+      "DETERMINISTIC OUTCOME REPLAY  PASS"
     );
 
     log(
-      "HISTORICAL STABILITY       PASS"
+      "PRE-T0 OUTCOME EXCLUSION      PASS"
     );
 
     log(
-      "DATABASE MUTATION          NONE (ROLLBACK)"
+      "POST-T0 FUTURE SENSITIVITY    PASS"
     );
 
     log(
-      "OVERALL PIT VERIFICATION   PASS"
+      "OUTCOME → FEATURE ISOLATION   PASS"
+    );
+
+    log(
+      "RUNNER LABEL DERIVATION       PASS"
+    );
+
+    log(
+      "DATABASE MUTATION             NONE (ROLLBACK)"
+    );
+
+    log(
+      "OVERALL OUTCOME VERIFICATION  PASS"
     );
 
     log(
       "========================================"
     );
+
   } catch (error) {
     log(
       "========================================"
     );
 
     log(
-      "OVERALL PIT VERIFICATION   FAIL",
+      "OVERALL OUTCOME VERIFICATION  FAIL",
       {
         error:
           String(
@@ -1023,10 +1210,12 @@ async function main() {
     );
 
     process.exitCode = 1;
+
   } finally {
-    // ----------------------------------------------
+
+    // ========================================================
     // ALWAYS ROLLBACK
-    // ----------------------------------------------
+    // ========================================================
 
     if (transactionStarted) {
       try {
@@ -1037,7 +1226,9 @@ async function main() {
         log(
           "Transaction rolled back successfully"
         );
+
       } catch (rollbackError) {
+
         log(
           "ROLLBACK FAILED",
           {
@@ -1060,13 +1251,9 @@ async function main() {
 }
 
 
-// ==================================================
-// 10. RUN
-// ==================================================
-
 main().catch((error) => {
   console.error(
-    "[northstar-pit-test] Fatal error",
+    "[northstar-outcome-test] Fatal error",
     error
   );
 

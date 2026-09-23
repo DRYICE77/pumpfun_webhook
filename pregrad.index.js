@@ -397,7 +397,7 @@ sqlGraduationUpdateMaxMs: 0,
   // ==========================================
   // UNRESOLVED MINT DIAGNOSTICS
   // ==========================================
-
+  resolvedOneCandidatePumpConfirmed: 0,
   unresolvedCreate: 0,
   unresolvedBuy: 0,
   unresolvedSell: 0,
@@ -1492,19 +1492,131 @@ function getMintCandidatesFromTokenBalances(tx) {
 // resolution rule yet.
 // ==================================================
 
+// ==================================================
+// INFER PRIMARY PUMP.FUN MINT
+//
+// Resolution order:
+//
+// 1. Preserve the existing high-confidence rule:
+//    if a token-balance candidate ends in "pump",
+//    resolve it immediately.
+//
+// 2. If there is exactly one non-wSOL candidate,
+//    inspect both outer and inner instructions.
+//
+//    If the Pump.fun program explicitly references
+//    that candidate as one of its instruction accounts,
+//    resolve it.
+//
+// 3. Otherwise remain unresolved.
+//
+// IMPORTANT:
+// - We do NOT resolve a mint merely because it is the
+//   only token-balance candidate.
+// - We do NOT assume a fixed Pump account position.
+// - We do NOT require parsed SPL-token confirmation.
+// ==================================================
+
 function inferPrimaryMint(tx) {
   const candidates =
     getMintCandidatesFromTokenBalances(tx);
 
-  const pumpMint = candidates.find(
-    (mint) =>
-      typeof mint === "string" &&
-      mint.endsWith("pump")
-  );
+  // ----------------------------------------------
+  // RULE 1:
+  // EXISTING PUMP-SUFFIX RESOLUTION
+  // ----------------------------------------------
 
-  return pumpMint || null;
+  const pumpSuffixMint =
+    candidates.find(
+      mint =>
+        typeof mint === "string" &&
+        mint.endsWith("pump")
+    );
+
+  if (pumpSuffixMint) {
+    return pumpSuffixMint;
+  }
+
+  // ----------------------------------------------
+  // RULE 2:
+  // PUMP-CONFIRMED ONE-CANDIDATE FALLBACK
+  // ----------------------------------------------
+
+  if (candidates.length !== 1) {
+    return null;
+  }
+
+  const candidateMint =
+    candidates[0];
+
+// ----------------------------------------------
+// OUTER INSTRUCTIONS
+// ----------------------------------------------
+
+const outerInstructions =
+  getInstructions(tx) || [];
+
+for (const ix of outerInstructions) {
+  if (
+    ix?.programId !==
+    PUMP_LAUNCHPAD_PROGRAM_ID
+  ) {
+    continue;
+  }
+
+  const accounts =
+    Array.isArray(ix.accounts)
+      ? ix.accounts
+      : [];
+
+  if (
+    accounts.includes(candidateMint)
+  ) {
+    stats.resolvedOneCandidatePumpConfirmed += 1;
+
+    return candidateMint;
+  }
 }
 
+// ----------------------------------------------
+// INNER INSTRUCTIONS
+// ----------------------------------------------
+
+const innerGroups =
+  getInnerInstructions(tx) || [];
+
+for (const group of innerGroups) {
+  const instructions =
+    group?.instructions || [];
+
+  for (const ix of instructions) {
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    const accounts =
+      Array.isArray(ix.accounts)
+        ? ix.accounts
+        : [];
+
+    if (
+      accounts.includes(candidateMint)
+    ) {
+      stats.resolvedOneCandidatePumpConfirmed += 1;
+
+      return candidateMint;
+    }
+  }
+}
+  // ----------------------------------------------
+  // NO SAFE RESOLUTION
+  // ----------------------------------------------
+
+  return null;
+}
 
 // ==================================================
 // 10D-3. ONE-CANDIDATE VALIDATION DIAGNOSTIC

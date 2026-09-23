@@ -373,6 +373,27 @@ const stats = {
   skippedFailedTx: 0,
   skippedUnresolvedMint: 0,
 
+  // Individual SQL operation performance
+sqlTokenUpsertSamples: 0,
+sqlTokenUpsertTotalMs: 0,
+sqlTokenUpsertMaxMs: 0,
+
+sqlEventInsertSamples: 0,
+sqlEventInsertTotalMs: 0,
+sqlEventInsertMaxMs: 0,
+
+sqlMarketTokenUpdateSamples: 0,
+sqlMarketTokenUpdateTotalMs: 0,
+sqlMarketTokenUpdateMaxMs: 0,
+
+sqlMarketEventUpdateSamples: 0,
+sqlMarketEventUpdateTotalMs: 0,
+sqlMarketEventUpdateMaxMs: 0,
+
+sqlGraduationUpdateSamples: 0,
+sqlGraduationUpdateTotalMs: 0,
+sqlGraduationUpdateMaxMs: 0,
+
   // ==========================================
   // UNRESOLVED MINT DIAGNOSTICS
   // ==========================================
@@ -493,33 +514,42 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+
 // ==================================================
 // 6A. PERFORMANCE DIAGNOSTICS
 //
 // Observation only:
-// • No database writes
+// • No additional database queries
 // • No per-transaction logging
 // • No changes to ingestion behavior
 //
-// Uses the counters added to const stats.
+// Measures:
+//
+// • Helius transaction fetch
+// • Complete database-write phase
+// • Complete signature processing
+// • Intake pauses
+//
+// Individual SQL operations:
+//
+// • Token upsert
+// • Event insert
+// • Market token update
+// • Market event update
+// • Graduation update
+//
+// Uses counters defined in const stats.
 // ==================================================
 
 function performanceNow() {
-  return Number(process.hrtime.bigint()) / 1e6;
+  return Number(
+    process.hrtime.bigint()
+  ) / 1e6;
 }
 
-function recordPerformanceTiming(
-  category,
-  durationMs
-) {
-  if (
-    !Number.isFinite(durationMs) ||
-    durationMs < 0
-  ) {
-    return;
-  }
 
-  const counterMap = {
+function getPerformanceCounterMap() {
+  return {
     rpcFetch: {
       samples: "rpcFetchSamples",
       total: "rpcFetchTotalMs",
@@ -543,9 +573,53 @@ function recordPerformanceTiming(
       total: "intakePauseTotalMs",
       max: "intakePauseMaxMs",
     },
-  };
 
-  const counters = counterMap[category];
+    sqlTokenUpsert: {
+      samples: "sqlTokenUpsertSamples",
+      total: "sqlTokenUpsertTotalMs",
+      max: "sqlTokenUpsertMaxMs",
+    },
+
+    sqlEventInsert: {
+      samples: "sqlEventInsertSamples",
+      total: "sqlEventInsertTotalMs",
+      max: "sqlEventInsertMaxMs",
+    },
+
+    sqlMarketTokenUpdate: {
+      samples: "sqlMarketTokenUpdateSamples",
+      total: "sqlMarketTokenUpdateTotalMs",
+      max: "sqlMarketTokenUpdateMaxMs",
+    },
+
+    sqlMarketEventUpdate: {
+      samples: "sqlMarketEventUpdateSamples",
+      total: "sqlMarketEventUpdateTotalMs",
+      max: "sqlMarketEventUpdateMaxMs",
+    },
+
+    sqlGraduationUpdate: {
+      samples: "sqlGraduationUpdateSamples",
+      total: "sqlGraduationUpdateTotalMs",
+      max: "sqlGraduationUpdateMaxMs",
+    },
+  };
+}
+
+
+function recordPerformanceTiming(
+  category,
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  const counters =
+    getPerformanceCounterMap()[category];
 
   if (!counters) {
     return;
@@ -553,7 +627,8 @@ function recordPerformanceTiming(
 
   stats[counters.samples] += 1;
 
-  stats[counters.total] += durationMs;
+  stats[counters.total] +=
+    durationMs;
 
   stats[counters.max] = Math.max(
     stats[counters.max],
@@ -561,46 +636,25 @@ function recordPerformanceTiming(
   );
 }
 
+
 function getPerformanceSummary(
   category
 ) {
-  const counterMap = {
-    rpcFetch: [
-      "rpcFetchSamples",
-      "rpcFetchTotalMs",
-      "rpcFetchMaxMs",
-    ],
+  const counters =
+    getPerformanceCounterMap()[category];
 
-    dbWrite: [
-      "dbWriteSamples",
-      "dbWriteTotalMs",
-      "dbWriteMaxMs",
-    ],
-
-    processing: [
-      "processingSamples",
-      "processingTotalMs",
-      "processingMaxMs",
-    ],
-
-    intakePause: [
-      "intakePauseSamples",
-      "intakePauseTotalMs",
-      "intakePauseMaxMs",
-    ],
-  };
-
-  const keys = counterMap[category];
-
-  if (!keys) {
+  if (!counters) {
     return null;
   }
 
-  const [sampleKey, totalKey, maxKey] = keys;
+  const samples =
+    stats[counters.samples];
 
-  const samples = stats[sampleKey];
-  const totalMs = stats[totalKey];
-  const maxMs = stats[maxKey];
+  const totalMs =
+    stats[counters.total];
+
+  const maxMs =
+    stats[counters.max];
 
   return {
     samples,
@@ -608,19 +662,71 @@ function getPerformanceSummary(
     avgMs:
       samples > 0
         ? Number(
-            (totalMs / samples).toFixed(2)
+            (
+              totalMs /
+              samples
+            ).toFixed(2)
           )
         : null,
 
     maxMs:
       samples > 0
-        ? Number(maxMs.toFixed(2))
+        ? Number(
+            maxMs.toFixed(2)
+          )
         : null,
   };
 }
 
+
 // ==================================================
-// 6B. SIGNATURE HELPERS
+// 6B. TIMED DATABASE QUERY
+//
+// Wraps an existing pool.query() without changing
+// the SQL, parameters, return value, or error behavior.
+//
+// Timing includes:
+//
+// • Waiting for an available pool connection
+// • PostgreSQL query execution
+// • Result delivery back to Node
+//
+// The finally block records failed queries too.
+//
+// IMPORTANT:
+//
+// This helper does not:
+// • Retry queries
+// • Catch/suppress query errors
+// • Open transactions
+// • Add database queries
+// • Change SQL behavior
+// ==================================================
+
+async function timedPoolQuery(
+  category,
+  sql,
+  params = []
+) {
+  const startedAt =
+    performanceNow();
+
+  try {
+    return await pool.query(
+      sql,
+      params
+    );
+  } finally {
+    recordPerformanceTiming(
+      category,
+      performanceNow() - startedAt
+    );
+  }
+}
+
+
+// ==================================================
+// 6C. SIGNATURE HELPERS
 // ==================================================
 
 function addSeenSignature(signature) {
@@ -637,6 +743,7 @@ function addSeenSignature(signature) {
   }
 }
 
+
 function signatureIsKnown(signature) {
   return (
     seenSignatures.has(signature) ||
@@ -645,8 +752,9 @@ function signatureIsKnown(signature) {
   );
 }
 
+
 // ==================================================
-// 6C. RETRY BACKOFF
+// 6D. RETRY BACKOFF
 // ==================================================
 
 function backoffDelay(
@@ -655,13 +763,21 @@ function backoffDelay(
 ) {
   if (wasRateLimited) {
     return Math.min(
-      60000 * 2 ** Math.min(attempt, 4),
+      60000 *
+        2 ** Math.min(
+          attempt,
+          4
+        ),
       600000
     );
   }
 
   return Math.min(
-    2000 * 2 ** Math.min(attempt, 5),
+    2000 *
+      2 ** Math.min(
+        attempt,
+        5
+      ),
     60000
   );
 }

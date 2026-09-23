@@ -1513,6 +1513,9 @@ function inferPrimaryMint(tx) {
 // token-balance candidate corresponds to the actual mint
 // used by the Pump.fun instruction.
 //
+// Once the bounded sample reaches its limit, emit the
+// complete diagnostic sample exactly once.
+//
 // This function has NO effect on event classification.
 // ==================================================
 
@@ -1522,6 +1525,8 @@ function recordOneCandidateMintSample(
   eventType,
   candidateMint
 ) {
+  // Stop collecting after the diagnostic sample
+  // has reached its configured limit.
   if (
     oneCandidateMintSamples.length >=
     ONE_CANDIDATE_SAMPLE_LIMIT
@@ -1563,8 +1568,32 @@ function recordOneCandidateMintSample(
     logs:
       getLogMessages(tx),
   });
-}
 
+  // ----------------------------------------------
+  // ONE-TIME DIAGNOSTIC OUTPUT
+  // ----------------------------------------------
+  //
+  // The 100th sample triggers this output.
+  //
+  // Future calls return at the top of the function,
+  // so the completed sample is logged only once.
+
+  if (
+    oneCandidateMintSamples.length ===
+    ONE_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    logInfo(
+      "One-candidate mint diagnostic sample complete",
+      {
+        sampleCount:
+          oneCandidateMintSamples.length,
+
+        samples:
+          oneCandidateMintSamples,
+      }
+    );
+  }
+}
 
 // ==================================================
 // 10D-4. UNRESOLVED MINT DIAGNOSTICS

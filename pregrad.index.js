@@ -1507,16 +1507,20 @@ function inferPrimaryMint(tx) {
 
 
 // ==================================================
-// 10D-3. ONE-CANDIDATE DIAGNOSTIC SAMPLE
+// 10D-3. ONE-CANDIDATE VALIDATION DIAGNOSTIC
 //
-// Capture enough evidence to inspect whether the sole
-// token-balance candidate corresponds to the actual mint
-// used by the Pump.fun instruction.
+// For unresolved transactions with exactly one non-wSOL
+// token-balance candidate, collect a compact validation
+// record showing whether that candidate is independently
+// confirmed by:
 //
-// Once the bounded sample reaches its limit, emit the
-// complete diagnostic sample exactly once.
+//   1. A Pump.fun instruction account
+//   2. A parsed SPL-token instruction mint
 //
-// This function has NO effect on event classification.
+// Both outer and inner instructions are inspected.
+//
+// This diagnostic does NOT affect event classification
+// or production mint selection.
 // ==================================================
 
 function recordOneCandidateMintSample(
@@ -1525,8 +1529,7 @@ function recordOneCandidateMintSample(
   eventType,
   candidateMint
 ) {
-  // Stop collecting after the diagnostic sample
-  // has reached its configured limit.
+  // Stop after the configured sample size.
   if (
     oneCandidateMintSamples.length >=
     ONE_CANDIDATE_SAMPLE_LIMIT
@@ -1534,15 +1537,130 @@ function recordOneCandidateMintSample(
     return;
   }
 
+  // ----------------------------------------------
+  // 1. COLLECT OUTER + INNER INSTRUCTIONS
+  // ----------------------------------------------
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  const innerInstructions =
+    innerGroups.flatMap(
+      group => group?.instructions || []
+    );
+
+  const allInstructions = [
+    ...outerInstructions.map(ix => ({
+      ...ix,
+      diagnosticLocation: "outer",
+    })),
+
+    ...innerInstructions.map(ix => ({
+      ...ix,
+      diagnosticLocation: "inner",
+    })),
+  ];
+
+  // ----------------------------------------------
+  // 2. FIND PUMP INSTRUCTIONS REFERENCING CANDIDATE
+  // ----------------------------------------------
+
+  const pumpMatches = [];
+
+  for (const ix of allInstructions) {
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    const accounts =
+      Array.isArray(ix.accounts)
+        ? ix.accounts
+        : [];
+
+    const candidateIndexes = [];
+
+    for (
+      let i = 0;
+      i < accounts.length;
+      i += 1
+    ) {
+      if (
+        accounts[i] ===
+        candidateMint
+      ) {
+        candidateIndexes.push(i);
+      }
+    }
+
+    if (candidateIndexes.length) {
+      pumpMatches.push({
+        location:
+          ix.diagnosticLocation,
+
+        candidateIndexes,
+
+        accountCount:
+          accounts.length,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // 3. FIND PARSED TOKEN INSTRUCTIONS
+  //    THAT EXPLICITLY NAME CANDIDATE AS MINT
+  // ----------------------------------------------
+
+  const tokenMintMatches = [];
+
+  for (const ix of allInstructions) {
+    const parsed =
+      ix?.parsed || null;
+
+    const info =
+      parsed?.info || null;
+
+    if (
+      info?.mint !==
+      candidateMint
+    ) {
+      continue;
+    }
+
+    tokenMintMatches.push({
+      location:
+        ix.diagnosticLocation,
+
+      programId:
+        ix?.programId || null,
+
+      type:
+        parsed?.type || null,
+    });
+  }
+
+  // ----------------------------------------------
+  // 4. BUILD COMPACT VALIDATION RECORD
+  // ----------------------------------------------
+
+  const pumpConfirmed =
+    pumpMatches.length > 0;
+
+  const tokenInstructionConfirmed =
+    tokenMintMatches.length > 0;
+
+  const confirmedByBoth =
+    pumpConfirmed &&
+    tokenInstructionConfirmed;
+
   oneCandidateMintSamples.push({
     signature:
       signature || null,
-
-    slot:
-      tx?.slot ?? null,
-
-    blockTime:
-      tx?.blockTime ?? null,
 
     eventType:
       eventType || "unknown",
@@ -1550,43 +1668,61 @@ function recordOneCandidateMintSample(
     candidateMint:
       candidateMint || null,
 
-    preTokenBalances:
-      tx?.meta?.preTokenBalances || [],
+    pumpConfirmed,
 
-    postTokenBalances:
-      tx?.meta?.postTokenBalances || [],
+    pumpMatches,
 
-    accountKeys:
-      getAccountKeys(tx),
+    tokenInstructionConfirmed,
 
-    outerInstructions:
-      getInstructions(tx),
+    tokenMintMatches,
 
-    innerInstructions:
-      getInnerInstructions(tx),
-
-    logs:
-      getLogMessages(tx),
+    confirmedByBoth,
   });
 
   // ----------------------------------------------
-  // ONE-TIME DIAGNOSTIC OUTPUT
+  // 5. OUTPUT SUMMARY ONCE SAMPLE IS COMPLETE
   // ----------------------------------------------
-  //
-  // The 100th sample triggers this output.
-  //
-  // Future calls return at the top of the function,
-  // so the completed sample is logged only once.
 
   if (
     oneCandidateMintSamples.length ===
     ONE_CANDIDATE_SAMPLE_LIMIT
   ) {
+    const pumpConfirmedCount =
+      oneCandidateMintSamples.filter(
+        row => row.pumpConfirmed
+      ).length;
+
+    const tokenInstructionConfirmedCount =
+      oneCandidateMintSamples.filter(
+        row =>
+          row.tokenInstructionConfirmed
+      ).length;
+
+    const confirmedByBothCount =
+      oneCandidateMintSamples.filter(
+        row => row.confirmedByBoth
+      ).length;
+
+    const neitherConfirmedCount =
+      oneCandidateMintSamples.filter(
+        row =>
+          !row.pumpConfirmed &&
+          !row.tokenInstructionConfirmed
+      ).length;
+
     logInfo(
-      "One-candidate mint diagnostic sample complete",
+      "One-candidate mint validation sample complete",
       {
         sampleCount:
           oneCandidateMintSamples.length,
+
+        pumpConfirmedCount,
+
+        tokenInstructionConfirmedCount,
+
+        confirmedByBothCount,
+
+        neitherConfirmedCount,
 
         samples:
           oneCandidateMintSamples,

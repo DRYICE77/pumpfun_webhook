@@ -2183,49 +2183,6 @@ function recordUnresolvedMintDiagnostics(
 }
 
 
-  // ----------------------------------------------
-  // Candidate population
-  // ----------------------------------------------
-
-  if (candidates.length === 0) {
-    stats.unresolvedZeroCandidates += 1;
-  }
-
-  else if (candidates.length === 1) {
-    stats.unresolvedOneCandidate += 1;
-
-    recordOneCandidateMintSample(
-      tx,
-      signature,
-      eventType,
-      candidates[0]
-    );
-  }
-
-  else {
-    stats.unresolvedMultipleCandidates += 1;
-  }
-
-
-  // ----------------------------------------------
-  // Pump suffix diagnostic
-  // ----------------------------------------------
-
-  const hasPumpSuffix =
-    candidates.some(
-      (mint) =>
-        typeof mint === "string" &&
-        mint.endsWith("pump")
-    );
-
-  if (hasPumpSuffix) {
-    stats.unresolvedCandidatesWithPumpSuffix += 1;
-  }
-
-  else if (candidates.length > 0) {
-    stats.unresolvedCandidatesNoPumpSuffix += 1;
-  }
-}
 
 // ==================================================
 // 10E. CREATE METADATA

@@ -1410,17 +1410,39 @@ function inferEventTypeFromLogs(tx) {
 // ==================================================
 // 10D. PUMP MINT IDENTIFICATION
 //
-// Only confirmed Pump.fun mint addresses are accepted.
+// Production behavior:
 //
-// We intentionally do not fall back to the first
-// arbitrary token-balance address because that can be:
+// • Only confirmed Pump.fun mint addresses are accepted.
+// • The current proven resolver accepts a token-balance
+//   candidate only when the mint ends in "pump".
+// • We do NOT promote unresolved candidates into production
+//   events yet.
 //
-// • A wrapped SOL mint
-// • An unrelated token mint
-// • A vault-related account
-// • Another token touched by the transaction
+// Diagnostic behavior:
 //
-// This prevents invalid holder-enrichment requests.
+// • Classify unresolved transactions by candidate count.
+// • Capture a bounded sample of one-candidate failures.
+// • Preserve enough raw transaction structure to determine
+//   whether the sole candidate can be independently confirmed
+//   from the Pump.fun instruction layout.
+// • Diagnostics never change mint selection.
+//
+// This lets us study unresolved mint completeness safely
+// before adding any new resolution path.
+// ==================================================
+
+const WSOL_MINT =
+  "So11111111111111111111111111111111111111112";
+
+// Keep the diagnostic sample bounded so a long-running
+// process cannot accumulate unlimited transaction data.
+const ONE_CANDIDATE_SAMPLE_LIMIT = 100;
+
+const oneCandidateMintSamples = [];
+
+
+// ==================================================
+// 10D-1. TOKEN-BALANCE MINT CANDIDATES
 // ==================================================
 
 function getMintCandidatesFromTokenBalances(tx) {
@@ -1437,10 +1459,8 @@ function getMintCandidatesFromTokenBalances(tx) {
         continue;
       }
 
-      if (
-        mint ===
-        "So11111111111111111111111111111111111111112"
-      ) {
+      // Wrapped SOL is never the Pump token mint.
+      if (mint === WSOL_MINT) {
         continue;
       }
 
@@ -1459,6 +1479,19 @@ function getMintCandidatesFromTokenBalances(tx) {
   return [...candidates];
 }
 
+
+// ==================================================
+// 10D-2. CURRENT PRODUCTION MINT RESOLVER
+//
+// IMPORTANT:
+//
+// Preserve current production behavior while diagnostics
+// are running.
+//
+// We are intentionally NOT using "one candidate" as a
+// resolution rule yet.
+// ==================================================
+
 function inferPrimaryMint(tx) {
   const candidates =
     getMintCandidatesFromTokenBalances(tx);
@@ -1472,9 +1505,82 @@ function inferPrimaryMint(tx) {
   return pumpMint || null;
 }
 
-// Diagnostic helper — does not change mint selection.
-function recordUnresolvedMintDiagnostics(tx) {
-  const eventType = inferEventTypeFromLogs(tx);
+
+// ==================================================
+// 10D-3. ONE-CANDIDATE DIAGNOSTIC SAMPLE
+//
+// Capture enough evidence to inspect whether the sole
+// token-balance candidate corresponds to the actual mint
+// used by the Pump.fun instruction.
+//
+// This function has NO effect on event classification.
+// ==================================================
+
+function recordOneCandidateMintSample(
+  tx,
+  signature,
+  eventType,
+  candidateMint
+) {
+  if (
+    oneCandidateMintSamples.length >=
+    ONE_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  oneCandidateMintSamples.push({
+    signature:
+      signature || null,
+
+    slot:
+      tx?.slot ?? null,
+
+    blockTime:
+      tx?.blockTime ?? null,
+
+    eventType:
+      eventType || "unknown",
+
+    candidateMint:
+      candidateMint || null,
+
+    preTokenBalances:
+      tx?.meta?.preTokenBalances || [],
+
+    postTokenBalances:
+      tx?.meta?.postTokenBalances || [],
+
+    accountKeys:
+      getAccountKeys(tx),
+
+    outerInstructions:
+      getInstructions(tx),
+
+    innerInstructions:
+      getInnerInstructions(tx),
+
+    logs:
+      getLogMessages(tx),
+  });
+}
+
+
+// ==================================================
+// 10D-4. UNRESOLVED MINT DIAGNOSTICS
+//
+// Count unresolved populations and collect one-candidate
+// samples for later inspection.
+//
+// This function does NOT modify mint selection.
+// ==================================================
+
+function recordUnresolvedMintDiagnostics(
+  tx,
+  signature = null
+) {
+  const eventType =
+    inferEventTypeFromLogs(tx);
 
   const eventCounter = {
     create: "unresolvedCreate",
@@ -1483,10 +1589,17 @@ function recordUnresolvedMintDiagnostics(tx) {
     migrate: "unresolvedMigrate",
   }[eventType] || "unresolvedUnknown";
 
-  stats[eventCounter] += 1;
+  if (
+    typeof stats[eventCounter] === "number"
+  ) {
+    stats[eventCounter] += 1;
+  }
 
-  const preBalances = tx?.meta?.preTokenBalances || [];
-  const postBalances = tx?.meta?.postTokenBalances || [];
+  const preBalances =
+    tx?.meta?.preTokenBalances || [];
+
+  const postBalances =
+    tx?.meta?.postTokenBalances || [];
 
   if (
     preBalances.length === 0 &&
@@ -1498,21 +1611,50 @@ function recordUnresolvedMintDiagnostics(tx) {
   const candidates =
     getMintCandidatesFromTokenBalances(tx);
 
+
+  // ----------------------------------------------
+  // Candidate population
+  // ----------------------------------------------
+
   if (candidates.length === 0) {
     stats.unresolvedZeroCandidates += 1;
-  } else if (candidates.length === 1) {
+  }
+
+  else if (candidates.length === 1) {
     stats.unresolvedOneCandidate += 1;
-  } else {
+
+    recordOneCandidateMintSample(
+      tx,
+      signature,
+      eventType,
+      candidates[0]
+    );
+  }
+
+  else {
     stats.unresolvedMultipleCandidates += 1;
   }
 
-  if (candidates.some((mint) => mint.endsWith("pump"))) {
+
+  // ----------------------------------------------
+  // Pump suffix diagnostic
+  // ----------------------------------------------
+
+  const hasPumpSuffix =
+    candidates.some(
+      (mint) =>
+        typeof mint === "string" &&
+        mint.endsWith("pump")
+    );
+
+  if (hasPumpSuffix) {
     stats.unresolvedCandidatesWithPumpSuffix += 1;
-  } else if (candidates.length > 0) {
+  }
+
+  else if (candidates.length > 0) {
     stats.unresolvedCandidatesNoPumpSuffix += 1;
   }
 }
-
 
 // ==================================================
 // 10E. CREATE METADATA
@@ -3068,7 +3210,10 @@ async function processQueuedSignature(item) {
 
         // Diagnostics only.
         // Mint selection remains unchanged.
-        recordUnresolvedMintDiagnostics(tx);
+        recordUnresolvedMintDiagnostics(
+          tx,
+          signature
+        );
       }
 
       permanentlySeen = true;

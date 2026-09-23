@@ -1928,6 +1928,36 @@ function classifyPregradEvent(
 
 // ==================================================
 // 11. PROVEN DATABASE WRITE PATH
+//
+// Performance diagnostics:
+//
+// Individual primary SQL operations are timed through
+// timedPoolQuery().
+//
+// This does NOT change:
+// • SQL statements
+// • SQL parameters
+// • Query ordering
+// • Return values
+// • Error behavior
+// • Database transaction behavior
+//
+// Timed operations:
+//
+// • Token upsert
+// • Event insert
+// • Market token update
+// • Market event update
+// • Graduation update
+//
+// Raw-event storage remains unchanged because it is
+// disabled by default and is outside the current
+// primary ingestion bottleneck investigation.
+// ==================================================
+
+
+// ==================================================
+// 11A. OPTIONAL RAW EVENT STORAGE
 // ==================================================
 
 async function insertRawPregradEvent({
@@ -1961,12 +1991,18 @@ async function insertRawPregradEvent({
   );
 }
 
+
+// ==================================================
+// 11B. TOKEN UPSERT
+// ==================================================
+
 async function upsertLaunchpadToken(token) {
   if (!token?.token_address) {
     return false;
   }
 
-  const result = await pool.query(
+  const result = await timedPoolQuery(
+    "sqlTokenUpsert",
     `
     INSERT INTO pump_launchpad_tokens (
       token_address,
@@ -2088,8 +2124,14 @@ async function upsertLaunchpadToken(token) {
   return false;
 }
 
+
+// ==================================================
+// 11C. EVENT INSERT
+// ==================================================
+
 async function insertLaunchpadEvent(event) {
-  const result = await pool.query(
+  const result = await timedPoolQuery(
+    "sqlEventInsert",
     `
     INSERT INTO pump_launchpad_events (
       token_address,
@@ -2133,6 +2175,11 @@ async function insertLaunchpadEvent(event) {
   return false;
 }
 
+
+// ==================================================
+// 11D. LIVE MARKET DATA
+// ==================================================
+
 async function updateLaunchpadMarketDataFromEvent(
   event
 ) {
@@ -2169,7 +2216,13 @@ async function updateLaunchpadMarketDataFromEvent(
       ? marketCapSol * SOL_PRICE_USD
       : null;
 
-  await pool.query(
+
+  // ----------------------------------------------
+  // TOKEN MARKET-DATA UPDATE
+  // ----------------------------------------------
+
+  await timedPoolQuery(
+    "sqlMarketTokenUpdate",
     `
     UPDATE pump_launchpad_tokens
     SET
@@ -2243,7 +2296,13 @@ async function updateLaunchpadMarketDataFromEvent(
     ]
   );
 
-  await pool.query(
+
+  // ----------------------------------------------
+  // EVENT MARKET-DATA UPDATE
+  // ----------------------------------------------
+
+  await timedPoolQuery(
+    "sqlMarketEventUpdate",
     `
     UPDATE pump_launchpad_events
     SET
@@ -2263,8 +2322,14 @@ async function updateLaunchpadMarketDataFromEvent(
   );
 
   stats.updatedMarketData += 1;
+
   return true;
 }
+
+
+// ==================================================
+// 11E. GRADUATION UPDATE
+// ==================================================
 
 async function markTokenGraduated(
   tokenAddress,
@@ -2272,7 +2337,8 @@ async function markTokenGraduated(
 ) {
   if (!tokenAddress) return;
 
-  await pool.query(
+  await timedPoolQuery(
+    "sqlGraduationUpdate",
     `
     UPDATE pump_launchpad_tokens
     SET

@@ -1434,11 +1434,15 @@ function inferEventTypeFromLogs(tx) {
 const WSOL_MINT =
   "So11111111111111111111111111111111111111112";
 
-// Keep the diagnostic sample bounded so a long-running
+// Keep the diagnostic samples bounded so a long-running
 // process cannot accumulate unlimited transaction data.
 const ONE_CANDIDATE_SAMPLE_LIMIT = 100;
 
 const oneCandidateMintSamples = [];
+
+const MULTIPLE_CANDIDATE_SAMPLE_LIMIT = 100;
+
+const multipleCandidateMintSamples = [];
 
 
 // ==================================================
@@ -1844,6 +1848,246 @@ function recordOneCandidateMintSample(
 }
 
 // ==================================================
+// MULTIPLE-CANDIDATE MINT VALIDATION DIAGNOSTIC
+//
+// For unresolved transactions containing 2+ non-wSOL
+// token-balance candidates:
+//
+// 1. Inspect all outer + inner Pump.fun instructions.
+// 2. Determine which candidate mints are explicitly
+//    referenced by Pump.fun.
+// 3. Record whether Pump references:
+//      - zero candidates
+//      - exactly one candidate
+//      - multiple candidates
+//
+// Diagnostic only.
+// Does NOT affect production mint resolution.
+// ==================================================
+
+function recordMultipleCandidateMintSample(
+  tx,
+  signature,
+  eventType,
+  candidates
+) {
+  if (
+    multipleCandidateMintSamples.length >=
+    MULTIPLE_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // COLLECT OUTER + INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const pumpInstructions = [];
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    pumpInstructions.push({
+      location: "outer",
+      outerIndex,
+      innerIndex: null,
+      accounts:
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [],
+    });
+  }
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      pumpInstructions.push({
+        location: "inner",
+        outerIndex:
+          group?.index ?? null,
+        innerIndex,
+        accounts:
+          Array.isArray(ix.accounts)
+            ? ix.accounts
+            : [],
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // CHECK EACH CANDIDATE AGAINST PUMP
+  // ----------------------------------------------
+
+  const candidateResults =
+    candidates.map(candidateMint => {
+      const pumpMatches = [];
+
+      for (
+        const pumpIx
+        of pumpInstructions
+      ) {
+        const candidateIndexes = [];
+
+        for (
+          let i = 0;
+          i < pumpIx.accounts.length;
+          i += 1
+        ) {
+          if (
+            pumpIx.accounts[i] ===
+            candidateMint
+          ) {
+            candidateIndexes.push(i);
+          }
+        }
+
+        if (
+          candidateIndexes.length > 0
+        ) {
+          pumpMatches.push({
+            location:
+              pumpIx.location,
+
+            outerIndex:
+              pumpIx.outerIndex,
+
+            innerIndex:
+              pumpIx.innerIndex,
+
+            candidateIndexes,
+          });
+        }
+      }
+
+      return {
+        candidateMint,
+
+        pumpConfirmed:
+          pumpMatches.length > 0,
+
+        pumpMatches,
+      };
+    });
+
+  // ----------------------------------------------
+  // FIND ALL PUMP-CONFIRMED CANDIDATES
+  // ----------------------------------------------
+
+  const pumpConfirmedCandidates =
+    candidateResults
+      .filter(
+        row => row.pumpConfirmed
+      )
+      .map(
+        row => row.candidateMint
+      );
+
+  const pumpConfirmedCandidateCount =
+    pumpConfirmedCandidates.length;
+
+  // ----------------------------------------------
+  // STORE COMPACT SAMPLE
+  // ----------------------------------------------
+
+  multipleCandidateMintSamples.push({
+    signature:
+      signature || null,
+
+    eventType:
+      eventType || "unknown",
+
+    candidateCount:
+      candidates.length,
+
+    candidates,
+
+    pumpConfirmedCandidateCount,
+
+    pumpConfirmedCandidates,
+
+    candidateResults,
+  });
+
+  // ----------------------------------------------
+  // OUTPUT SUMMARY WHEN SAMPLE REACHES LIMIT
+  // ----------------------------------------------
+
+  if (
+    multipleCandidateMintSamples.length ===
+    MULTIPLE_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    const zeroPumpConfirmedCount =
+      multipleCandidateMintSamples.filter(
+        row =>
+          row.pumpConfirmedCandidateCount === 0
+      ).length;
+
+    const onePumpConfirmedCount =
+      multipleCandidateMintSamples.filter(
+        row =>
+          row.pumpConfirmedCandidateCount === 1
+      ).length;
+
+    const multiplePumpConfirmedCount =
+      multipleCandidateMintSamples.filter(
+        row =>
+          row.pumpConfirmedCandidateCount > 1
+      ).length;
+
+    logInfo(
+      "Multiple-candidate mint validation sample complete",
+      {
+        sampleCount:
+          multipleCandidateMintSamples.length,
+
+        zeroPumpConfirmedCount,
+
+        onePumpConfirmedCount,
+
+        multiplePumpConfirmedCount,
+
+        samples:
+          multipleCandidateMintSamples,
+      }
+    );
+  }
+}
+
+// ==================================================
 // 10D-4. UNRESOLVED MINT DIAGNOSTICS
 //
 // Count unresolved populations and collect one-candidate
@@ -1887,6 +2131,56 @@ function recordUnresolvedMintDiagnostics(
 
   const candidates =
     getMintCandidatesFromTokenBalances(tx);
+
+  // ----------------------------------------------
+  // CANDIDATE POPULATION
+  // ----------------------------------------------
+
+  if (candidates.length === 0) {
+    stats.unresolvedZeroCandidates += 1;
+  }
+
+  else if (candidates.length === 1) {
+    stats.unresolvedOneCandidate += 1;
+
+    recordOneCandidateMintSample(
+      tx,
+      signature,
+      eventType,
+      candidates[0]
+    );
+  }
+
+  else {
+    stats.unresolvedMultipleCandidates += 1;
+
+    recordMultipleCandidateMintSample(
+      tx,
+      signature,
+      eventType,
+      candidates
+    );
+  }
+
+  // ----------------------------------------------
+  // PUMP SUFFIX DIAGNOSTIC
+  // ----------------------------------------------
+
+  const hasPumpSuffix =
+    candidates.some(
+      (mint) =>
+        typeof mint === "string" &&
+        mint.endsWith("pump")
+    );
+
+  if (hasPumpSuffix) {
+    stats.unresolvedCandidatesWithPumpSuffix += 1;
+  }
+
+  else if (candidates.length > 0) {
+    stats.unresolvedCandidatesNoPumpSuffix += 1;
+  }
+}
 
 
   // ----------------------------------------------

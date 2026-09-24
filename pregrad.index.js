@@ -1445,6 +1445,9 @@ const MULTIPLE_CANDIDATE_SAMPLE_LIMIT = 100;
 
 const multipleCandidateMintSamples = [];
 
+const ZERO_CANDIDATE_SAMPLE_LIMIT = 100;
+const zeroCandidateMintSamples = [];
+
 
 // ==================================================
 // 10D-1. TOKEN-BALANCE MINT CANDIDATES
@@ -2138,6 +2141,337 @@ function recordMultipleCandidateMintSample(
 }
 
 // ==================================================
+// ZERO-CANDIDATE EVENT DIAGNOSTIC
+//
+// Diagnostic only.
+//
+// Investigates transactions where token balances
+// produce zero usable non-wSOL mint candidates.
+//
+// Goals:
+// 1. Determine whether token balances are absent
+//    or merely unusable.
+// 2. Inspect Pump instructions directly.
+// 3. Determine whether these appear to be events
+//    NorthStar actually wants to capture.
+// 4. Gather evidence for a future Pump-only
+//    mint resolver.
+//
+// This function does NOT modify mint selection.
+// ==================================================
+
+function recordZeroCandidateMintSample(
+  tx,
+  signature,
+  eventType
+) {
+  if (
+    zeroCandidateMintSamples.length >=
+    ZERO_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  const preTokenBalances =
+    tx?.meta?.preTokenBalances || [];
+
+  const postTokenBalances =
+    tx?.meta?.postTokenBalances || [];
+
+  const hasAnyTokenBalances =
+    preTokenBalances.length > 0 ||
+    postTokenBalances.length > 0;
+
+  // ----------------------------------------------
+  // OUTER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const pumpInstructions = [];
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    pumpInstructions.push({
+      location: "outer",
+
+      outerIndex,
+
+      innerIndex: null,
+
+      accounts:
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [],
+
+      data:
+        ix?.data ?? null,
+
+      parsed:
+        ix?.parsed ?? null,
+    });
+  }
+
+  // ----------------------------------------------
+  // INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      pumpInstructions.push({
+        location: "inner",
+
+        outerIndex:
+          group?.index ?? null,
+
+        innerIndex,
+
+        accounts:
+          Array.isArray(ix.accounts)
+            ? ix.accounts
+            : [],
+
+        data:
+          ix?.data ?? null,
+
+        parsed:
+          ix?.parsed ?? null,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // PARSED TOKEN-RELATED INSTRUCTIONS
+  //
+  // Useful for seeing whether a mint appears in
+  // parsed instruction data even though it did not
+  // appear in pre/post token balances.
+  // ----------------------------------------------
+
+  const parsedMintReferences = [];
+
+  const inspectParsedInstruction = (
+    ix,
+    location,
+    outerIndex = null,
+    innerIndex = null
+  ) => {
+    const parsed =
+      ix?.parsed || null;
+
+    const info =
+      parsed?.info || null;
+
+    const mint =
+      info?.mint || null;
+
+    if (
+      typeof mint !== "string" ||
+      !mint
+    ) {
+      return;
+    }
+
+    parsedMintReferences.push({
+      mint,
+
+      location,
+
+      outerIndex,
+
+      innerIndex,
+
+      programId:
+        ix?.programId || null,
+
+      type:
+        parsed?.type || null,
+    });
+  };
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectParsedInstruction(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectParsedInstruction(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // LOGS
+  // ----------------------------------------------
+
+  const logs =
+    getLogMessages(tx) || [];
+
+  // ----------------------------------------------
+  // SAVE SAMPLE
+  // ----------------------------------------------
+
+  zeroCandidateMintSamples.push({
+    signature:
+      signature || null,
+
+    slot:
+      tx?.slot ?? null,
+
+    blockTime:
+      tx?.blockTime ?? null,
+
+    eventType:
+      eventType || "unknown",
+
+    hasAnyTokenBalances,
+
+    preTokenBalanceCount:
+      preTokenBalances.length,
+
+    postTokenBalanceCount:
+      postTokenBalances.length,
+
+    preTokenBalances,
+
+    postTokenBalances,
+
+    pumpInstructionCount:
+      pumpInstructions.length,
+
+    pumpInstructions,
+
+    parsedMintReferenceCount:
+      parsedMintReferences.length,
+
+    parsedMintReferences,
+
+    logs,
+  });
+
+  // ----------------------------------------------
+  // SUMMARY AFTER 100 SAMPLES
+  // ----------------------------------------------
+
+  if (
+    zeroCandidateMintSamples.length ===
+    ZERO_CANDIDATE_SAMPLE_LIMIT
+  ) {
+    const noTokenBalancesCount =
+      zeroCandidateMintSamples.filter(
+        row =>
+          !row.hasAnyTokenBalances
+      ).length;
+
+    const hasTokenBalancesCount =
+      zeroCandidateMintSamples.filter(
+        row =>
+          row.hasAnyTokenBalances
+      ).length;
+
+    const hasPumpInstructionCount =
+      zeroCandidateMintSamples.filter(
+        row =>
+          row.pumpInstructionCount > 0
+      ).length;
+
+    const hasParsedMintReferenceCount =
+      zeroCandidateMintSamples.filter(
+        row =>
+          row.parsedMintReferenceCount > 0
+      ).length;
+
+    const eventTypeCounts = {};
+
+    for (
+      const row
+      of zeroCandidateMintSamples
+    ) {
+      const key =
+        row.eventType || "unknown";
+
+      eventTypeCounts[key] =
+        (eventTypeCounts[key] || 0) + 1;
+    }
+
+    logInfo(
+      "Zero-candidate event validation sample complete",
+      {
+        sampleCount:
+          zeroCandidateMintSamples.length,
+
+        noTokenBalancesCount,
+
+        hasTokenBalancesCount,
+
+        hasPumpInstructionCount,
+
+        hasParsedMintReferenceCount,
+
+        eventTypeCounts,
+
+        samples:
+          zeroCandidateMintSamples,
+      }
+    );
+  }
+}
+
+// ==================================================
 // 10D-4. UNRESOLVED MINT DIAGNOSTICS
 //
 // Count unresolved populations and collect one-candidate
@@ -2186,9 +2520,15 @@ function recordUnresolvedMintDiagnostics(
   // CANDIDATE POPULATION
   // ----------------------------------------------
 
-  if (candidates.length === 0) {
-    stats.unresolvedZeroCandidates += 1;
-  }
+ if (candidates.length === 0) {
+  stats.unresolvedZeroCandidates += 1;
+
+  recordZeroCandidateMintSample(
+    tx,
+    signature,
+    eventType
+  );
+}
 
   else if (candidates.length === 1) {
     stats.unresolvedOneCandidate += 1;

@@ -400,6 +400,7 @@ sqlGraduationUpdateMaxMs: 0,
   // ==========================================
   resolvedOneCandidatePumpConfirmed: 0,
   resolvedMultipleCandidatePumpConfirmed: 0,
+  resolvedMultipleCandidateRule4: 0,
   unresolvedCreate: 0,
   unresolvedBuy: 0,
   unresolvedSell: 0,
@@ -2264,10 +2265,15 @@ function inferPrimaryMint(tx) {
   // ----------------------------------------------
   // COLLECT ALL CANDIDATES REFERENCED BY
   // OUTER OR INNER PUMP INSTRUCTIONS
+  //
+  // Also preserve the Pump instructions themselves
+  // for the Rule 4 schema check below.
   // ----------------------------------------------
 
   const pumpConfirmedCandidates =
     new Set();
+
+  const pumpInstructions = [];
 
   // ----------------------------------------------
   // OUTER INSTRUCTIONS
@@ -2288,6 +2294,10 @@ function inferPrimaryMint(tx) {
       Array.isArray(ix.accounts)
         ? ix.accounts
         : [];
+
+    pumpInstructions.push({
+      accounts,
+    });
 
     for (const candidateMint of candidates) {
       if (
@@ -2323,6 +2333,10 @@ function inferPrimaryMint(tx) {
         Array.isArray(ix.accounts)
           ? ix.accounts
           : [];
+
+      pumpInstructions.push({
+        accounts,
+      });
 
       for (
         const candidateMint
@@ -2374,11 +2388,161 @@ function inferPrimaryMint(tx) {
   }
 
   // ----------------------------------------------
+  // RULE 4:
+  // VALIDATED MULTIPLE-PUMP-MINT TRADE SCHEMA
+  //
+  // Shadow diagnostic result:
+  //
+  //   500 examined
+  //   500 resolvable
+  //   0 conflicts
+  //   0 expected-mint-not-candidate
+  //   0 unsupported schemas
+  //
+  // Validated unresolved schemas:
+  //
+  //   BUY:
+  //     27 accounts -> mint at index 1
+  //     28 accounts -> mint at index 1
+  //
+  //   SELL:
+  //     26 accounts -> mint at index 1
+  //     27 accounts -> mint at index 1
+  //
+  // SAFETY:
+  //
+  // - Only applies to multiple-candidate cases.
+  // - Only applies when Rules 1-3 failed.
+  // - Expected mint MUST be a token-balance candidate.
+  // - Every qualifying Pump instruction must agree
+  //   on exactly one expected mint.
+  // - Anything outside the validated schemas remains
+  //   unresolved.
+  // ----------------------------------------------
+
+  if (
+    candidates.length > 1 &&
+    confirmedCandidates.length > 1
+  ) {
+    const candidateSet =
+      new Set(candidates);
+
+    const rule4ExpectedMints =
+      new Set();
+
+    let qualifyingInstructionCount = 0;
+
+    for (const pumpIx of pumpInstructions) {
+      const accounts =
+        pumpIx.accounts || [];
+
+      const accountCount =
+        accounts.length;
+
+      let schemaMatches = false;
+
+      // ------------------------------------------
+      // VALIDATED BUY SCHEMAS
+      // ------------------------------------------
+
+      if (
+        inferEventTypeFromLogs(tx) === "buy" &&
+        (
+          accountCount === 27 ||
+          accountCount === 28
+        )
+      ) {
+        schemaMatches = true;
+      }
+
+      // ------------------------------------------
+      // VALIDATED SELL SCHEMAS
+      // ------------------------------------------
+
+      else if (
+        inferEventTypeFromLogs(tx) === "sell" &&
+        (
+          accountCount === 26 ||
+          accountCount === 27
+        )
+      ) {
+        schemaMatches = true;
+      }
+
+      if (!schemaMatches) {
+        continue;
+      }
+
+      qualifyingInstructionCount += 1;
+
+      // All four validated schemas use account[1].
+      const expectedMint =
+        accounts[1] || null;
+
+      // ------------------------------------------
+      // EXPECTED MINT MUST BE A REAL
+      // TOKEN-BALANCE CANDIDATE
+      // ------------------------------------------
+
+      if (
+        typeof expectedMint !== "string" ||
+        !candidateSet.has(expectedMint)
+      ) {
+        // A qualifying schema produced something
+        // outside our candidate set.
+        //
+        // Fail closed rather than guessing.
+        return null;
+      }
+
+      rule4ExpectedMints.add(
+        expectedMint
+      );
+    }
+
+    // --------------------------------------------
+    // REQUIRE AT LEAST ONE QUALIFYING INSTRUCTION
+    // --------------------------------------------
+
+    if (
+      qualifyingInstructionCount === 0
+    ) {
+      return null;
+    }
+
+    // --------------------------------------------
+    // ALL QUALIFYING INSTRUCTIONS MUST AGREE
+    //
+    // Exactly one unique expected mint means the
+    // schema produced a deterministic answer.
+    // --------------------------------------------
+
+    if (
+      rule4ExpectedMints.size === 1
+    ) {
+      const resolvedMint =
+        Array.from(
+          rule4ExpectedMints
+        )[0];
+
+      stats.resolvedMultipleCandidateRule4 += 1;
+
+      return resolvedMint;
+    }
+
+    // Multiple qualifying instructions disagreed.
+    // Fail closed.
+    return null;
+  }
+
+  // ----------------------------------------------
   // NO SAFE RESOLUTION
   //
   // Includes:
   // - no Pump-confirmed candidate
-  // - multiple Pump-confirmed candidates
+  // - unsupported multiple-candidate schema
+  // - Rule 4 expected mint not in candidate set
+  // - Rule 4 qualifying instructions disagree
   // ----------------------------------------------
 
   return null;

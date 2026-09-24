@@ -1720,7 +1720,442 @@ function recordPumpV2MintRoleSample(
     );
   }
 }
+// ================================================
+// RULE 4 SHADOW DIAGNOSTIC
+//
+// PURPOSE:
+//
+// Test the proposed Pump trade account-schema rule
+// against transactions that CURRENTLY remain
+// unresolved.
+//
+// IMPORTANT:
+//
+// This diagnostic does NOT resolve the mint.
+// It only measures whether Rule 4 WOULD have
+// resolved it.
+//
+// CONTROL EVIDENCE:
+//
+// BUY:
+//   18 accounts -> mint at index 2
+//   19 accounts -> mint at index 2
+//   27 accounts -> mint at index 1
+//   28 accounts -> mint at index 1
+//
+// SELL:
+//   16 accounts -> mint at index 2
+//   17 accounts -> mint at index 2
+//   26 accounts -> mint at index 1
+//   27 accounts -> mint at index 1
+//
+// SAFETY:
+//
+// The expected account must also exist in the
+// token-balance candidate set.
+// ================================================
 
+function getRule4ExpectedMintIndex(
+  eventType,
+  accountCount
+) {
+  if (eventType === "buy") {
+    if (
+      accountCount === 18 ||
+      accountCount === 19
+    ) {
+      return 2;
+    }
+
+    if (
+      accountCount === 27 ||
+      accountCount === 28
+    ) {
+      return 1;
+    }
+  }
+
+  if (eventType === "sell") {
+    if (
+      accountCount === 16 ||
+      accountCount === 17
+    ) {
+      return 2;
+    }
+
+    if (
+      accountCount === 26 ||
+      accountCount === 27
+    ) {
+      return 1;
+    }
+  }
+
+  return null;
+}
+
+
+function recordRule4ShadowDiagnostic(
+  tx,
+  signature,
+  eventType,
+  candidates
+) {
+  if (
+    rule4DiagnosticSummary.examined >=
+    RULE4_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  if (
+    eventType !== "buy" &&
+    eventType !== "sell"
+  ) {
+    return;
+  }
+
+  if (
+    !Array.isArray(candidates) ||
+    candidates.length < 2
+  ) {
+    return;
+  }
+
+  rule4DiagnosticSummary.examined += 1;
+
+  const candidateSet =
+    new Set(candidates);
+
+  const pumpInstructions = [];
+
+  // ----------------------------------------------
+  // OUTER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    pumpInstructions.push({
+      location: "outer",
+      outerIndex,
+      innerIndex: null,
+
+      accounts:
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [],
+
+      data:
+        ix?.data ?? null,
+    });
+  }
+
+  // ----------------------------------------------
+  // INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      pumpInstructions.push({
+        location: "inner",
+
+        outerIndex:
+          group?.index ?? null,
+
+        innerIndex,
+
+        accounts:
+          Array.isArray(ix.accounts)
+            ? ix.accounts
+            : [],
+
+        data:
+          ix?.data ?? null,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // TEST RECOGNIZED RULE-4 SCHEMAS
+  // ----------------------------------------------
+
+  const matches = [];
+
+  for (const ix of pumpInstructions) {
+    const accountCount =
+      ix.accounts.length;
+
+    const expectedMintIndex =
+      getRule4ExpectedMintIndex(
+        eventType,
+        accountCount
+      );
+
+    if (expectedMintIndex === null) {
+      continue;
+    }
+
+    const expectedMint =
+      ix.accounts[expectedMintIndex] || null;
+
+    const expectedMintIsCandidate =
+      typeof expectedMint === "string" &&
+      candidateSet.has(expectedMint);
+
+    matches.push({
+      location:
+        ix.location,
+
+      outerIndex:
+        ix.outerIndex,
+
+      innerIndex:
+        ix.innerIndex,
+
+      accountCount,
+
+      expectedMintIndex,
+
+      expectedMint,
+
+      expectedMintIsCandidate,
+
+      instructionData:
+        ix.data,
+    });
+  }
+
+  // ----------------------------------------------
+  // NO RECOGNIZED SCHEMA
+  // ----------------------------------------------
+
+  if (!matches.length) {
+    rule4DiagnosticSummary.unsupportedSchema += 1;
+    rule4DiagnosticSummary.stillUnresolved += 1;
+
+    maybeFinishRule4Diagnostic();
+
+    return;
+  }
+
+  // ----------------------------------------------
+  // ONLY ACCEPT EXPECTED MINTS THAT ARE ALSO
+  // TOKEN-BALANCE CANDIDATES
+  // ----------------------------------------------
+
+  const validMatches =
+    matches.filter(
+      row =>
+        row.expectedMintIsCandidate
+    );
+
+  if (!validMatches.length) {
+    rule4DiagnosticSummary.expectedMintNotCandidate += 1;
+    rule4DiagnosticSummary.stillUnresolved += 1;
+
+    maybeFinishRule4Diagnostic();
+
+    return;
+  }
+
+  // ----------------------------------------------
+  // DEDUPLICATE EXPECTED MINTS
+  //
+  // Multiple Pump instructions can agree on the
+  // same mint. That's still deterministic.
+  // ----------------------------------------------
+
+  const expectedMints =
+    [
+      ...new Set(
+        validMatches.map(
+          row => row.expectedMint
+        )
+      ),
+    ];
+
+  // ----------------------------------------------
+  // RULE 4 WOULD RESOLVE
+  // ----------------------------------------------
+
+  if (expectedMints.length === 1) {
+    const expectedMint =
+      expectedMints[0];
+
+    rule4DiagnosticSummary.resolvable += 1;
+
+    for (const match of validMatches) {
+      const schemaKey =
+        [
+          eventType,
+          match.accountCount,
+          match.expectedMintIndex,
+        ].join("|");
+
+      if (
+        !rule4DiagnosticSummary.bySchema[
+          schemaKey
+        ]
+      ) {
+        rule4DiagnosticSummary.bySchema[
+          schemaKey
+        ] = {
+          eventType,
+          accountCount:
+            match.accountCount,
+          expectedMintIndex:
+            match.expectedMintIndex,
+          count: 0,
+        };
+      }
+
+      rule4DiagnosticSummary.bySchema[
+        schemaKey
+      ].count += 1;
+    }
+
+    if (
+      rule4DiagnosticSamples.length < 20
+    ) {
+      rule4DiagnosticSamples.push({
+        signature:
+          signature || null,
+
+        eventType,
+
+        candidateCount:
+          candidates.length,
+
+        candidates,
+
+        expectedMint,
+
+        validMatches,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // CONFLICT:
+  // recognized schemas pointed to >1 candidate
+  // ----------------------------------------------
+
+  else {
+    rule4DiagnosticSummary.stillUnresolved += 1;
+
+    if (
+      rule4DiagnosticSamples.length < 20
+    ) {
+      rule4DiagnosticSamples.push({
+        signature:
+          signature || null,
+
+        eventType,
+
+        candidateCount:
+          candidates.length,
+
+        candidates,
+
+        conflict: true,
+
+        expectedMints,
+
+        validMatches,
+      });
+    }
+  }
+
+  maybeFinishRule4Diagnostic();
+}
+
+
+// ================================================
+// RULE 4 DIAGNOSTIC COMPLETION LOGGER
+// ================================================
+
+function maybeFinishRule4Diagnostic() {
+  if (
+    rule4DiagnosticSummary.examined !==
+    RULE4_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  logInfo(
+    "Rule 4 shadow diagnostic complete",
+    {
+      examined:
+        rule4DiagnosticSummary.examined,
+
+      resolvable:
+        rule4DiagnosticSummary.resolvable,
+
+      stillUnresolved:
+        rule4DiagnosticSummary.stillUnresolved,
+
+      expectedMintNotCandidate:
+        rule4DiagnosticSummary
+          .expectedMintNotCandidate,
+
+      unsupportedSchema:
+        rule4DiagnosticSummary
+          .unsupportedSchema,
+
+      resolutionRate:
+        rule4DiagnosticSummary.examined > 0
+          ? (
+              rule4DiagnosticSummary.resolvable /
+              rule4DiagnosticSummary.examined
+            )
+          : 0,
+
+      bySchema:
+        Object.values(
+          rule4DiagnosticSummary.bySchema
+        ),
+
+      examples:
+        rule4DiagnosticSamples,
+    }
+  );
+}
 
 // ==================================================
 // 10D-1. TOKEN-BALANCE MINT CANDIDATES

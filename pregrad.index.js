@@ -1364,30 +1364,47 @@ function looksRelevantFromLogs(value) {
 
 function inferEventTypeFromLogs(tx) {
   const logs = getLogMessages(tx).map(
-    (line) =>
-      String(line).toLowerCase()
+    line =>
+      String(line)
+        .trim()
+        .toLowerCase()
   );
 
   const hasCreate = logs.some(
-    (line) =>
-      line.includes("instruction: create") ||
-      line.includes("create_v2")
+    line =>
+      line.endsWith(
+        "instruction: create"
+      ) ||
+      line.endsWith(
+        "instruction: createv2"
+      ) ||
+      line.endsWith(
+        "instruction: create_v2"
+      )
   );
 
   const hasBuy = logs.some(
-    (line) =>
-      line.includes("instruction: buy")
+    line =>
+      line.includes(
+        "instruction: buy"
+      )
   );
 
   const hasSell = logs.some(
-    (line) =>
-      line.includes("instruction: sell")
+    line =>
+      line.includes(
+        "instruction: sell"
+      )
   );
 
   const hasMigrate = logs.some(
-    (line) =>
-      line.includes("migrate") ||
-      line.includes("graduate")
+    line =>
+      line.endsWith(
+        "instruction: migrate"
+      ) ||
+      line.endsWith(
+        "instruction: graduate"
+      )
   );
 
   if (hasCreate) {

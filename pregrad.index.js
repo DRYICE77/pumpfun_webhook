@@ -371,6 +371,7 @@ const stats = {
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
   skippedFailedTx: 0,
+  skippedUnsupportedPumpInstruction: 0,
   skippedUnresolvedMint: 0,
 
   // Individual SQL operation performance
@@ -1407,6 +1408,14 @@ function inferEventTypeFromLogs(tx) {
   return "unknown";
 }
 
+function isScoringEventType(eventType) {
+  return (
+    eventType === "create" ||
+    eventType === "buy" ||
+    eventType === "sell" ||
+    eventType === "migrate"
+  );
+}
 
 // ==================================================
 // 10D. PUMP MINT IDENTIFICATION
@@ -2825,6 +2834,10 @@ function classifyPregradEvent(
   tx,
   signature
 ) {
+  // ----------------------------------------------
+  // BASIC TRANSACTION VALIDATION
+  // ----------------------------------------------
+
   if (
     !tx ||
     !tx.meta ||
@@ -2845,6 +2858,10 @@ function classifyPregradEvent(
     };
   }
 
+  // ----------------------------------------------
+  // CONFIRM PUMP / LAUNCHPAD ACTIVITY
+  // ----------------------------------------------
+
   if (!txTouchesLaunchpadProgram(tx)) {
     return {
       ok: false,
@@ -2853,8 +2870,46 @@ function classifyPregradEvent(
     };
   }
 
+  // ----------------------------------------------
+  // EVENT TYPE
+  // ----------------------------------------------
+
   const eventType =
     inferEventTypeFromLogs(tx);
+
+  // ----------------------------------------------
+  // SCORING EVENT FILTER
+  //
+  // A transaction can touch the Pump program
+  // without representing a token event that
+  // NorthStar wants to score.
+  //
+  // Examples observed:
+  // - creator fee collection
+  // - fee distribution
+  // - cashback claims
+  // - accumulator/account maintenance
+  //
+  // Only recognized scoring events continue
+  // into mint resolution.
+  // ----------------------------------------------
+
+  if (!isScoringEventType(eventType)) {
+    return {
+      ok: false,
+      reason:
+        "unsupported_pump_instruction",
+
+      eventType,
+    };
+  }
+
+  // ----------------------------------------------
+  // MINT RESOLUTION
+  //
+  // Only attempt this after confirming that the
+  // transaction represents a scoring event.
+  // ----------------------------------------------
 
   const tokenAddress =
     inferPrimaryMint(tx);
@@ -2864,14 +2919,28 @@ function classifyPregradEvent(
       ok: false,
       reason:
         "unresolved_token_mint",
+
+      eventType,
     };
   }
+
+  // ----------------------------------------------
+  // WALLET
+  // ----------------------------------------------
 
   const walletAddress =
     getSignerWallet(tx);
 
+  // ----------------------------------------------
+  // CREATE METADATA
+  // ----------------------------------------------
+
   const { name, symbol } =
     parseCreateMetadata(tx);
+
+  // ----------------------------------------------
+  // TRADE AMOUNTS
+  // ----------------------------------------------
 
   const solAmount =
     extractSolAmount(
@@ -2885,6 +2954,10 @@ function classifyPregradEvent(
       tokenAddress
     );
 
+  // ----------------------------------------------
+  // PRICE
+  // ----------------------------------------------
+
   const pricePerToken =
     Number.isFinite(solAmount) &&
     solAmount > 0 &&
@@ -2893,11 +2966,19 @@ function classifyPregradEvent(
       ? solAmount / tokenAmount
       : null;
 
+  // ----------------------------------------------
+  // BLOCK TIME
+  // ----------------------------------------------
+
   const blockTime =
     getBlockTime(tx);
 
   const isMigrate =
     eventType === "migrate";
+
+  // ----------------------------------------------
+  // FINAL CLASSIFICATION
+  // ----------------------------------------------
 
   return {
     ok: true,
@@ -4114,29 +4195,35 @@ async function processQueuedSignature(item) {
     // CLASSIFY PUMP.FUN EVENT
     // ----------------------------------------------
 
-    const classified = classifyPregradEvent(
+ const classified =
+  classifyPregradEvent(
+    tx,
+    signature
+  );
+
+if (!classified.ok) {
+  if (
+    classified.reason ===
+    "unsupported_pump_instruction"
+  ) {
+    stats.skippedUnsupportedPumpInstruction += 1;
+  }
+
+  else if (
+    classified.reason ===
+    "unresolved_token_mint"
+  ) {
+    stats.skippedUnresolvedMint += 1;
+
+    recordUnresolvedMintDiagnostics(
       tx,
       signature
     );
+  }
 
-    if (!classified.ok) {
-      if (
-        classified.reason ===
-        "unresolved_token_mint"
-      ) {
-        stats.skippedUnresolvedMint += 1;
-
-        // Diagnostics only.
-        // Mint selection remains unchanged.
-        recordUnresolvedMintDiagnostics(
-          tx,
-          signature
-        );
-      }
-
-      permanentlySeen = true;
-      return;
-    }
+  permanentlySeen = true;
+  return;
+}
 
     const event = classified.event;
     const token = classified.tokenUpsert;

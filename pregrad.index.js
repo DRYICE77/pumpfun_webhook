@@ -1498,6 +1498,27 @@ let rule4DiagnosticSummary = {
 };
 
 // ============================================================
+// RULE 5 SHADOW DIAGNOSTIC
+//
+// PURPOSE:
+//
+// Test whether unresolved genuine Create transactions can be
+// safely resolved using agreement between:
+//
+//   Pump Create / CreateV2 account[0]
+//              +
+//   SPL Token InitializeMint / InitializeMint2 mint
+//
+// This diagnostic NEVER changes production mint resolution.
+// ============================================================
+
+const RULE5_SHADOW_SAMPLE_LIMIT = 50;
+
+const rule5ShadowSamples = [];
+
+let rule5ShadowDiagnosticComplete = false;
+
+// ============================================================
 // UNRESOLVED CREATE MINT DIAGNOSTIC
 // ============================================================
 
@@ -1651,6 +1672,703 @@ function recordUnresolvedCreateMintSample(
       });
     }
   }
+
+  function recordRule5ShadowDiagnostic(
+  tx,
+  signature = null
+) {
+  // ----------------------------------------------
+  // STOP AFTER SAMPLE LIMIT
+  // ----------------------------------------------
+
+  if (
+    rule5ShadowDiagnosticComplete ||
+    rule5ShadowSamples.length >=
+      RULE5_SHADOW_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // ONLY CREATE EVENTS
+  // ----------------------------------------------
+
+  const eventType =
+    inferEventTypeFromLogs(tx);
+
+  if (eventType !== "create") {
+    return;
+  }
+
+  // ----------------------------------------------
+  // TOKEN-BALANCE CANDIDATES
+  // ----------------------------------------------
+
+  const candidates =
+    getMintCandidatesFromTokenBalances(tx);
+
+  const candidateSet =
+    new Set(candidates);
+
+  // ----------------------------------------------
+  // COLLECT INSTRUCTIONS
+  // ----------------------------------------------
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  // ----------------------------------------------
+  // FIND PUMP CREATE INSTRUCTIONS
+  //
+  // We identify the actual Create instruction by
+  // pairing Pump instructions with the transaction
+  // logs conservatively.
+  //
+  // For the shadow test, account[0] is the mint
+  // hypothesis we are testing.
+  // ----------------------------------------------
+
+  const pumpCreateInstructions = [];
+
+  // Genuine CreateV2 transactions observed so far
+  // use a 20-account Pump instruction.
+  //
+  // IMPORTANT:
+  // This is diagnostic-only. We are testing this
+  // schema, not promoting it to production.
+  function inspectPumpInstruction(
+    ix,
+    location,
+    outerIndex,
+    innerIndex
+  ) {
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      return;
+    }
+
+    const accounts =
+      Array.isArray(ix.accounts)
+        ? ix.accounts
+        : [];
+
+    // --------------------------------------------
+    // SHADOW CREATE SCHEMA
+    //
+    // Current observed CreateV2:
+    // accountCount = 20
+    // expected mint = account[0]
+    // --------------------------------------------
+
+    if (accounts.length !== 20) {
+      return;
+    }
+
+    const expectedMint =
+      accounts[0] || null;
+
+    pumpCreateInstructions.push({
+      location,
+      outerIndex,
+      innerIndex,
+
+      accountCount:
+        accounts.length,
+
+      expectedMint,
+
+      expectedMintIsCandidate:
+        typeof expectedMint === "string" &&
+        candidateSet.has(expectedMint),
+
+      accounts,
+    });
+  }
+
+  // ----------------------------------------------
+  // OUTER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectPumpInstruction(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  // ----------------------------------------------
+  // INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectPumpInstruction(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // FIND INITIALIZE MINT INSTRUCTIONS
+  // ----------------------------------------------
+
+  const initializeMintInstructions = [];
+
+  // ----------------------------------------------
+  // FIND MINTTO INSTRUCTIONS
+  //
+  // This is supporting evidence only.
+  // ----------------------------------------------
+
+  const mintToInstructions = [];
+
+  function inspectParsedTokenInstruction(
+    ix,
+    location,
+    outerIndex,
+    innerIndex
+  ) {
+    const parsed =
+      ix?.parsed ?? null;
+
+    if (!parsed) {
+      return;
+    }
+
+    const type =
+      parsed?.type ?? null;
+
+    const info =
+      parsed?.info ?? null;
+
+    if (
+      type === "initializeMint" ||
+      type === "initializeMint2"
+    ) {
+      const mint =
+        info?.mint ?? null;
+
+      initializeMintInstructions.push({
+        location,
+        outerIndex,
+        innerIndex,
+        type,
+        mint,
+
+        mintIsCandidate:
+          typeof mint === "string" &&
+          candidateSet.has(mint),
+      });
+
+      return;
+    }
+
+    if (
+      type === "mintTo" ||
+      type === "mintToChecked"
+    ) {
+      const mint =
+        info?.mint ?? null;
+
+      mintToInstructions.push({
+        location,
+        outerIndex,
+        innerIndex,
+        type,
+        mint,
+
+        mintIsCandidate:
+          typeof mint === "string" &&
+          candidateSet.has(mint),
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // OUTER PARSED TOKEN INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectParsedTokenInstruction(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  // ----------------------------------------------
+  // INNER PARSED TOKEN INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectParsedTokenInstruction(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // UNIQUE CREATE MINT HYPOTHESES
+  // ----------------------------------------------
+
+  const createExpectedMints =
+    new Set(
+      pumpCreateInstructions
+        .map(ix => ix.expectedMint)
+        .filter(
+          mint =>
+            typeof mint === "string"
+        )
+    );
+
+  // ----------------------------------------------
+  // UNIQUE INITIALIZE-MINT HYPOTHESES
+  // ----------------------------------------------
+
+  const initializeMints =
+    new Set(
+      initializeMintInstructions
+        .map(ix => ix.mint)
+        .filter(
+          mint =>
+            typeof mint === "string"
+        )
+    );
+
+  // ----------------------------------------------
+  // UNIQUE MINTTO HYPOTHESES
+  // ----------------------------------------------
+
+  const mintToMints =
+    new Set(
+      mintToInstructions
+        .map(ix => ix.mint)
+        .filter(
+          mint =>
+            typeof mint === "string"
+        )
+    );
+
+  // ----------------------------------------------
+  // DERIVE SHADOW RESULT
+  // ----------------------------------------------
+
+  const createMint =
+    createExpectedMints.size === 1
+      ? Array.from(
+          createExpectedMints
+        )[0]
+      : null;
+
+  const initializeMint =
+    initializeMints.size === 1
+      ? Array.from(
+          initializeMints
+        )[0]
+      : null;
+
+  const mintToMint =
+    mintToMints.size === 1
+      ? Array.from(
+          mintToMints
+        )[0]
+      : null;
+
+  const createMintIsCandidate =
+    typeof createMint === "string" &&
+    candidateSet.has(createMint);
+
+  const initializeMintIsCandidate =
+    typeof initializeMint === "string" &&
+    candidateSet.has(initializeMint);
+
+  const createVsInitializeMatch =
+    createMint !== null &&
+    initializeMint !== null &&
+    createMint === initializeMint;
+
+  const initializeVsMintToMatch =
+    initializeMint !== null &&
+    mintToMint !== null &&
+    initializeMint === mintToMint;
+
+  // ----------------------------------------------
+  // STRICT RULE 5 SHADOW RESOLUTION
+  //
+  // Production candidate would require:
+  //
+  // 1. exactly one Create account[0] hypothesis
+  // 2. exactly one InitializeMint hypothesis
+  // 3. both are token-balance candidates
+  // 4. both independently identify same mint
+  //
+  // MintTo is recorded as additional evidence but
+  // is NOT required yet.
+  // ----------------------------------------------
+
+  const resolvable =
+    createExpectedMints.size === 1 &&
+    initializeMints.size === 1 &&
+    createMintIsCandidate &&
+    initializeMintIsCandidate &&
+    createVsInitializeMatch;
+
+  // ----------------------------------------------
+  // RECORD SAMPLE
+  // ----------------------------------------------
+
+  const sample = {
+    signature,
+
+    eventType,
+
+    candidateCount:
+      candidates.length,
+
+    candidates,
+
+    pumpCreateInstructionCount:
+      pumpCreateInstructions.length,
+
+    pumpCreateInstructions,
+
+    initializeMintInstructionCount:
+      initializeMintInstructions.length,
+
+    initializeMintInstructions,
+
+    mintToInstructionCount:
+      mintToInstructions.length,
+
+    mintToInstructions,
+
+    uniqueCreateExpectedMintCount:
+      createExpectedMints.size,
+
+    uniqueInitializeMintCount:
+      initializeMints.size,
+
+    uniqueMintToMintCount:
+      mintToMints.size,
+
+    createMint,
+
+    initializeMint,
+
+    mintToMint,
+
+    createMintIsCandidate,
+
+    initializeMintIsCandidate,
+
+    createVsInitializeMatch,
+
+    initializeVsMintToMatch,
+
+    resolvable,
+  };
+
+  rule5ShadowSamples.push(sample);
+
+  // ----------------------------------------------
+  // LOG EACH SAMPLE
+  // ----------------------------------------------
+
+  logInfo(
+    "Rule 5 shadow diagnostic sample",
+    {
+      sampleNumber:
+        rule5ShadowSamples.length,
+
+      signature,
+
+      candidateCount:
+        candidates.length,
+
+      pumpCreateInstructionCount:
+        pumpCreateInstructions.length,
+
+      initializeMintInstructionCount:
+        initializeMintInstructions.length,
+
+      mintToInstructionCount:
+        mintToInstructions.length,
+
+      createMint,
+
+      initializeMint,
+
+      mintToMint,
+
+      createMintIsCandidate,
+
+      initializeMintIsCandidate,
+
+      createVsInitializeMatch,
+
+      initializeVsMintToMatch,
+
+      resolvable,
+    }
+  );
+
+  // ----------------------------------------------
+  // FINAL SUMMARY
+  // ----------------------------------------------
+
+  if (
+    rule5ShadowSamples.length >=
+    RULE5_SHADOW_SAMPLE_LIMIT
+  ) {
+    rule5ShadowDiagnosticComplete =
+      true;
+
+    let resolvableCount = 0;
+
+    let stillUnresolved = 0;
+
+    let createInstructionMissing = 0;
+
+    let initializeMintMissing = 0;
+
+    let mintToMissing = 0;
+
+    let createMintNotCandidate = 0;
+
+    let initializeMintNotCandidate = 0;
+
+    let createVsInitializeMismatch = 0;
+
+    let initializeVsMintToMismatch = 0;
+
+    let multipleCreateExpectedMints = 0;
+
+    let multipleInitializeMints = 0;
+
+    let multipleMintToMints = 0;
+
+    const candidateCountDistribution = {};
+
+    const createAccountCountDistribution = {};
+
+    for (
+      const row
+      of rule5ShadowSamples
+    ) {
+      // ------------------------------------------
+      // RESOLUTION
+      // ------------------------------------------
+
+      if (row.resolvable) {
+        resolvableCount += 1;
+      } else {
+        stillUnresolved += 1;
+      }
+
+      // ------------------------------------------
+      // MISSING SIGNALS
+      // ------------------------------------------
+
+      if (
+        row.pumpCreateInstructionCount === 0
+      ) {
+        createInstructionMissing += 1;
+      }
+
+      if (
+        row.initializeMintInstructionCount === 0
+      ) {
+        initializeMintMissing += 1;
+      }
+
+      if (
+        row.mintToInstructionCount === 0
+      ) {
+        mintToMissing += 1;
+      }
+
+      // ------------------------------------------
+      // CANDIDATE VALIDATION
+      // ------------------------------------------
+
+      if (
+        row.createMint !== null &&
+        !row.createMintIsCandidate
+      ) {
+        createMintNotCandidate += 1;
+      }
+
+      if (
+        row.initializeMint !== null &&
+        !row.initializeMintIsCandidate
+      ) {
+        initializeMintNotCandidate += 1;
+      }
+
+      // ------------------------------------------
+      // DISAGREEMENTS
+      // ------------------------------------------
+
+      if (
+        row.createMint !== null &&
+        row.initializeMint !== null &&
+        !row.createVsInitializeMatch
+      ) {
+        createVsInitializeMismatch += 1;
+      }
+
+      if (
+        row.initializeMint !== null &&
+        row.mintToMint !== null &&
+        !row.initializeVsMintToMatch
+      ) {
+        initializeVsMintToMismatch += 1;
+      }
+
+      // ------------------------------------------
+      // MULTIPLE HYPOTHESES
+      // ------------------------------------------
+
+      if (
+        row.uniqueCreateExpectedMintCount > 1
+      ) {
+        multipleCreateExpectedMints += 1;
+      }
+
+      if (
+        row.uniqueInitializeMintCount > 1
+      ) {
+        multipleInitializeMints += 1;
+      }
+
+      if (
+        row.uniqueMintToMintCount > 1
+      ) {
+        multipleMintToMints += 1;
+      }
+
+      // ------------------------------------------
+      // CANDIDATE COUNT DISTRIBUTION
+      // ------------------------------------------
+
+      const candidateKey =
+        String(row.candidateCount);
+
+      candidateCountDistribution[
+        candidateKey
+      ] =
+        (
+          candidateCountDistribution[
+            candidateKey
+          ] || 0
+        ) + 1;
+
+      // ------------------------------------------
+      // CREATE ACCOUNT COUNT DISTRIBUTION
+      // ------------------------------------------
+
+      for (
+        const ix
+        of row.pumpCreateInstructions
+      ) {
+        const accountKey =
+          String(ix.accountCount);
+
+        createAccountCountDistribution[
+          accountKey
+        ] =
+          (
+            createAccountCountDistribution[
+              accountKey
+            ] || 0
+          ) + 1;
+      }
+    }
+
+    logInfo(
+      "Rule 5 shadow diagnostic complete",
+      {
+        examined:
+          rule5ShadowSamples.length,
+
+        resolvable:
+          resolvableCount,
+
+        stillUnresolved,
+
+        resolutionRate:
+          rule5ShadowSamples.length > 0
+            ? resolvableCount /
+              rule5ShadowSamples.length
+            : 0,
+
+        createInstructionMissing,
+
+        initializeMintMissing,
+
+        mintToMissing,
+
+        createMintNotCandidate,
+
+        initializeMintNotCandidate,
+
+        createVsInitializeMismatch,
+
+        initializeVsMintToMismatch,
+
+        multipleCreateExpectedMints,
+
+        multipleInitializeMints,
+
+        multipleMintToMints,
+
+        candidateCountDistribution,
+
+        createAccountCountDistribution,
+
+        samples:
+          rule5ShadowSamples,
+      }
+    );
+  }
+}
 
   // ----------------------------------------------
   // COLLECT ALL PARSED TOKEN INSTRUCTIONS
@@ -4414,21 +5132,29 @@ function recordUnresolvedMintDiagnostics(
     getMintCandidatesFromTokenBalances(tx);
 
   // ----------------------------------------------
-  // UNRESOLVED CREATE DIAGNOSTIC
+  // UNRESOLVED CREATE DIAGNOSTICS
   //
-  // Capture every unresolved Create regardless
-  // of candidate population:
+  // These run only for unresolved Create events.
   //
-  // - zero candidates
-  // - one candidate
-  // - multiple candidates
+  // 1. General Create diagnostic captures the
+  //    full transaction structure.
   //
-  // This is diagnostic-only and does not change
-  // production mint resolution.
+  // 2. Rule 5 shadow diagnostic tests whether
+  //    CreateV2 account[0] and InitializeMint /
+  //    InitializeMint2 independently identify
+  //    the same mint.
+  //
+  // Neither diagnostic changes production mint
+  // resolution.
   // ----------------------------------------------
 
   if (eventType === "create") {
     recordUnresolvedCreateMintSample(
+      tx,
+      signature
+    );
+
+    recordRule5ShadowDiagnostic(
       tx,
       signature
     );

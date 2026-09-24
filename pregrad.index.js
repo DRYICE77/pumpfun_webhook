@@ -1480,6 +1480,460 @@ let rule4DiagnosticSummary = {
   bySchema: {},
 };
 
+// ============================================================
+// UNRESOLVED CREATE MINT DIAGNOSTIC
+// ============================================================
+
+const UNRESOLVED_CREATE_SAMPLE_LIMIT = 50;
+
+const unresolvedCreateMintSamples = [];
+
+let unresolvedCreateMintDiagnosticComplete = false;
+
+function recordUnresolvedCreateMintSample(
+  tx,
+  signature
+) {
+  // ----------------------------------------------
+  // STOP AFTER SAMPLE LIMIT
+  // ----------------------------------------------
+
+  if (
+    unresolvedCreateMintDiagnosticComplete ||
+    unresolvedCreateMintSamples.length >=
+      UNRESOLVED_CREATE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // ONLY UNRESOLVED CREATE EVENTS
+  // ----------------------------------------------
+
+  const eventType =
+    inferEventTypeFromLogs(tx);
+
+  if (eventType !== "create") {
+    return;
+  }
+
+  // ----------------------------------------------
+  // TOKEN-BALANCE MINT CANDIDATES
+  // ----------------------------------------------
+
+  const candidates =
+    getMintCandidatesFromTokenBalances(tx);
+
+  const candidateSet =
+    new Set(candidates);
+
+  // ----------------------------------------------
+  // COLLECT OUTER + INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const pumpInstructions = [];
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    const accounts =
+      Array.isArray(ix.accounts)
+        ? ix.accounts
+        : [];
+
+    pumpInstructions.push({
+      location: "outer",
+      outerIndex,
+      innerIndex: null,
+
+      accountCount:
+        accounts.length,
+
+      accounts:
+        accounts.map(
+          (account, index) => ({
+            index,
+            account,
+
+            isCandidate:
+              candidateSet.has(account),
+          })
+        ),
+
+      data:
+        ix?.data ?? null,
+    });
+  }
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      const accounts =
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [];
+
+      pumpInstructions.push({
+        location: "inner",
+
+        outerIndex:
+          group?.index ?? null,
+
+        innerIndex,
+
+        accountCount:
+          accounts.length,
+
+        accounts:
+          accounts.map(
+            (account, index) => ({
+              index,
+              account,
+
+              isCandidate:
+                candidateSet.has(account),
+            })
+          ),
+
+        data:
+          ix?.data ?? null,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // COLLECT ALL PARSED TOKEN INSTRUCTIONS
+  //
+  // We specifically want to see whether Create
+  // transactions expose InitializeMint,
+  // InitializeMint2, MintTo, etc.
+  // ----------------------------------------------
+
+  const tokenInstructions = [];
+
+  function inspectTokenInstruction(
+    ix,
+    location,
+    outerIndex,
+    innerIndex
+  ) {
+    const parsed =
+      ix?.parsed ?? null;
+
+    if (!parsed) {
+      return;
+    }
+
+    const type =
+      parsed?.type ?? null;
+
+    const info =
+      parsed?.info ?? null;
+
+    const interestingTypes =
+      new Set([
+        "initializeMint",
+        "initializeMint2",
+        "mintTo",
+        "mintToChecked",
+        "initializeAccount",
+        "initializeAccount2",
+        "initializeAccount3",
+      ]);
+
+    if (
+      !interestingTypes.has(type)
+    ) {
+      return;
+    }
+
+    tokenInstructions.push({
+      location,
+      outerIndex,
+      innerIndex,
+
+      program:
+        ix?.program ?? null,
+
+      programId:
+        ix?.programId ?? null,
+
+      type,
+
+      info,
+    });
+  }
+
+  // ----------------------------------------------
+  // PARSED OUTER TOKEN INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectTokenInstruction(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  // ----------------------------------------------
+  // PARSED INNER TOKEN INSTRUCTIONS
+  // ----------------------------------------------
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectTokenInstruction(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // RAW PRE / POST TOKEN BALANCES
+  //
+  // Important for the zero-candidate cases.
+  // ----------------------------------------------
+
+  const preTokenBalances =
+    tx?.meta?.preTokenBalances ?? [];
+
+  const postTokenBalances =
+    tx?.meta?.postTokenBalances ?? [];
+
+  // ----------------------------------------------
+  // ACCOUNT KEYS
+  //
+  // Useful if Create initializes a mint but no
+  // token balance exists yet.
+  // ----------------------------------------------
+
+  const accountKeys =
+    Array.isArray(
+      tx?.transaction?.message?.accountKeys
+    )
+      ? tx.transaction.message.accountKeys
+      : [];
+
+  // ----------------------------------------------
+  // LOGS
+  //
+  // Keep only useful instruction / Pump-related
+  // lines so diagnostic output stays manageable.
+  // ----------------------------------------------
+
+  const logs =
+    tx?.meta?.logMessages ?? [];
+
+  const relevantLogs =
+    logs.filter(log => {
+      if (typeof log !== "string") {
+        return false;
+      }
+
+      const lower =
+        log.toLowerCase();
+
+      return (
+        lower.includes("instruction:") ||
+        lower.includes("initialize") ||
+        lower.includes("mint") ||
+        lower.includes("create")
+      );
+    });
+
+  // ----------------------------------------------
+  // RECORD SAMPLE
+  // ----------------------------------------------
+
+  unresolvedCreateMintSamples.push({
+    signature:
+      signature || null,
+
+    eventType,
+
+    candidateCount:
+      candidates.length,
+
+    candidates,
+
+    pumpInstructionCount:
+      pumpInstructions.length,
+
+    pumpInstructions,
+
+    tokenInstructionCount:
+      tokenInstructions.length,
+
+    tokenInstructions,
+
+    preTokenBalances,
+
+    postTokenBalances,
+
+    accountKeys,
+
+    relevantLogs,
+  });
+
+  // ----------------------------------------------
+  // LOG EACH SAMPLE IMMEDIATELY
+  //
+  // Creates are rare enough that we don't want
+  // to wait for all 50 before seeing anything.
+  // ----------------------------------------------
+
+  logInfo(
+    "Unresolved create mint diagnostic sample",
+    {
+      sampleNumber:
+        unresolvedCreateMintSamples.length,
+
+      sample:
+        unresolvedCreateMintSamples[
+          unresolvedCreateMintSamples.length - 1
+        ],
+    }
+  );
+
+  // ----------------------------------------------
+  // FINAL SUMMARY
+  // ----------------------------------------------
+
+  if (
+    unresolvedCreateMintSamples.length >=
+    UNRESOLVED_CREATE_SAMPLE_LIMIT
+  ) {
+    unresolvedCreateMintDiagnosticComplete =
+      true;
+
+    const candidateCountDistribution =
+      {};
+
+    const pumpAccountCountDistribution =
+      {};
+
+    const tokenInstructionTypeCounts =
+      {};
+
+    for (
+      const sample
+      of unresolvedCreateMintSamples
+    ) {
+      const candidateKey =
+        String(sample.candidateCount);
+
+      candidateCountDistribution[
+        candidateKey
+      ] =
+        (
+          candidateCountDistribution[
+            candidateKey
+          ] || 0
+        ) + 1;
+
+      for (
+        const ix
+        of sample.pumpInstructions
+      ) {
+        const accountKey =
+          String(ix.accountCount);
+
+        pumpAccountCountDistribution[
+          accountKey
+        ] =
+          (
+            pumpAccountCountDistribution[
+              accountKey
+            ] || 0
+          ) + 1;
+      }
+
+      for (
+        const ix
+        of sample.tokenInstructions
+      ) {
+        const typeKey =
+          ix.type || "unknown";
+
+        tokenInstructionTypeCounts[
+          typeKey
+        ] =
+          (
+            tokenInstructionTypeCounts[
+              typeKey
+            ] || 0
+          ) + 1;
+      }
+    }
+
+    logInfo(
+      "Unresolved create mint diagnostic complete",
+      {
+        sampleCount:
+          unresolvedCreateMintSamples.length,
+
+        candidateCountDistribution,
+
+        pumpAccountCountDistribution,
+
+        tokenInstructionTypeCounts,
+
+        samples:
+          unresolvedCreateMintSamples,
+      }
+    );
+  }
+}
+
 function recordPumpV2MintRoleSample(
   tx,
   signature,
@@ -3943,6 +4397,27 @@ function recordUnresolvedMintDiagnostics(
     getMintCandidatesFromTokenBalances(tx);
 
   // ----------------------------------------------
+  // UNRESOLVED CREATE DIAGNOSTIC
+  //
+  // Capture every unresolved Create regardless
+  // of candidate population:
+  //
+  // - zero candidates
+  // - one candidate
+  // - multiple candidates
+  //
+  // This is diagnostic-only and does not change
+  // production mint resolution.
+  // ----------------------------------------------
+
+  if (eventType === "create") {
+    recordUnresolvedCreateMintSample(
+      tx,
+      signature
+    );
+  }
+
+  // ----------------------------------------------
   // CANDIDATE POPULATION
   // ----------------------------------------------
 
@@ -3994,22 +4469,6 @@ function recordUnresolvedMintDiagnostics(
       eventType,
       candidates
     );
-
-    // --------------------------------------------
-    // RULE 4 SHADOW DIAGNOSTIC
-    //
-    // Test whether the proposed Pump instruction
-    // account-schema rule WOULD resolve this mint.
-    //
-    // This does NOT change production resolution.
-    // --------------------------------------------
-
-    recordRule4ShadowDiagnostic(
-      tx,
-      signature,
-      eventType,
-      candidates
-    );
   }
 
   // ----------------------------------------------
@@ -4018,7 +4477,7 @@ function recordUnresolvedMintDiagnostics(
 
   const hasPumpSuffix =
     candidates.some(
-      (mint) =>
+      mint =>
         typeof mint === "string" &&
         mint.endsWith("pump")
     );

@@ -3065,17 +3065,28 @@ function recordUnresolvedMintDiagnostics(
   const candidates =
     getMintCandidatesFromTokenBalances(tx);
 
-  // ----------------------------------------------
-  // CANDIDATE POPULATION
-  // ----------------------------------------------
+// ----------------------------------------------
+// CANDIDATE POPULATION
+// ----------------------------------------------
 
- if (candidates.length === 0) {
+if (candidates.length === 0) {
   stats.unresolvedZeroCandidates += 1;
 
   recordZeroCandidateMintSample(
     tx,
     signature,
     eventType
+  );
+}
+
+else if (candidates.length === 1) {
+  stats.unresolvedOneCandidate += 1;
+
+  recordOneCandidateMintSample(
+    tx,
+    signature,
+    eventType,
+    candidates[0]
   );
 }
 
@@ -3096,18 +3107,6 @@ else {
     candidates
   );
 }
-
-  else {
-    stats.unresolvedMultipleCandidates += 1;
-
-    recordMultipleCandidateMintSample(
-      tx,
-      signature,
-      eventType,
-      candidates
-    );
-  }
-
   // ----------------------------------------------
   // PUMP SUFFIX DIAGNOSTIC
   // ----------------------------------------------

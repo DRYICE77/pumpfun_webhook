@@ -398,6 +398,7 @@ sqlGraduationUpdateMaxMs: 0,
   // UNRESOLVED MINT DIAGNOSTICS
   // ==========================================
   resolvedOneCandidatePumpConfirmed: 0,
+  resolvedMultipleCandidatePumpConfirmed: 0,
   unresolvedCreate: 0,
   unresolvedBuy: 0,
   unresolvedSell: 0,
@@ -1542,58 +1543,29 @@ function inferPrimaryMint(tx) {
   }
 
   // ----------------------------------------------
-  // RULE 2:
-  // PUMP-CONFIRMED ONE-CANDIDATE FALLBACK
+  // NO TOKEN-BALANCE CANDIDATES
   // ----------------------------------------------
 
-  if (candidates.length !== 1) {
+  if (candidates.length === 0) {
     return null;
   }
 
-  const candidateMint =
-    candidates[0];
+  // ----------------------------------------------
+  // COLLECT ALL CANDIDATES REFERENCED BY
+  // OUTER OR INNER PUMP INSTRUCTIONS
+  // ----------------------------------------------
 
-// ----------------------------------------------
-// OUTER INSTRUCTIONS
-// ----------------------------------------------
+  const pumpConfirmedCandidates =
+    new Set();
 
-const outerInstructions =
-  getInstructions(tx) || [];
+  // ----------------------------------------------
+  // OUTER INSTRUCTIONS
+  // ----------------------------------------------
 
-for (const ix of outerInstructions) {
-  if (
-    ix?.programId !==
-    PUMP_LAUNCHPAD_PROGRAM_ID
-  ) {
-    continue;
-  }
+  const outerInstructions =
+    getInstructions(tx) || [];
 
-  const accounts =
-    Array.isArray(ix.accounts)
-      ? ix.accounts
-      : [];
-
-  if (
-    accounts.includes(candidateMint)
-  ) {
-    stats.resolvedOneCandidatePumpConfirmed += 1;
-
-    return candidateMint;
-  }
-}
-
-// ----------------------------------------------
-// INNER INSTRUCTIONS
-// ----------------------------------------------
-
-const innerGroups =
-  getInnerInstructions(tx) || [];
-
-for (const group of innerGroups) {
-  const instructions =
-    group?.instructions || [];
-
-  for (const ix of instructions) {
+  for (const ix of outerInstructions) {
     if (
       ix?.programId !==
       PUMP_LAUNCHPAD_PROGRAM_ID
@@ -1606,22 +1578,100 @@ for (const group of innerGroups) {
         ? ix.accounts
         : [];
 
-    if (
-      accounts.includes(candidateMint)
-    ) {
-      stats.resolvedOneCandidatePumpConfirmed += 1;
-
-      return candidateMint;
+    for (const candidateMint of candidates) {
+      if (
+        accounts.includes(candidateMint)
+      ) {
+        pumpConfirmedCandidates.add(
+          candidateMint
+        );
+      }
     }
   }
-}
+
+  // ----------------------------------------------
+  // INNER INSTRUCTIONS
+  // ----------------------------------------------
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (const ix of instructions) {
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      const accounts =
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [];
+
+      for (
+        const candidateMint
+        of candidates
+      ) {
+        if (
+          accounts.includes(candidateMint)
+        ) {
+          pumpConfirmedCandidates.add(
+            candidateMint
+          );
+        }
+      }
+    }
+  }
+
+  const confirmedCandidates =
+    Array.from(
+      pumpConfirmedCandidates
+    );
+
+  // ----------------------------------------------
+  // RULE 2:
+  // PUMP-CONFIRMED ONE-CANDIDATE FALLBACK
+  // ----------------------------------------------
+
+  if (
+    candidates.length === 1 &&
+    confirmedCandidates.length === 1
+  ) {
+    stats.resolvedOneCandidatePumpConfirmed += 1;
+
+    return confirmedCandidates[0];
+  }
+
+  // ----------------------------------------------
+  // RULE 3:
+  // MULTIPLE TOKEN-BALANCE CANDIDATES,
+  // BUT EXACTLY ONE PUMP-CONFIRMED CANDIDATE
+  // ----------------------------------------------
+
+  if (
+    candidates.length > 1 &&
+    confirmedCandidates.length === 1
+  ) {
+    stats.resolvedMultipleCandidatePumpConfirmed += 1;
+
+    return confirmedCandidates[0];
+  }
+
   // ----------------------------------------------
   // NO SAFE RESOLUTION
+  //
+  // Includes:
+  // - no Pump-confirmed candidate
+  // - multiple Pump-confirmed candidates
   // ----------------------------------------------
 
   return null;
 }
-
 // ==================================================
 // 10D-3. ONE-CANDIDATE VALIDATION DIAGNOSTIC
 //

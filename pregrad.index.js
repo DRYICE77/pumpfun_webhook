@@ -1461,6 +1461,252 @@ const AMBIGUOUS_MULTIPLE_SAMPLE_LIMIT = 100;
 
 const ambiguousMultipleMintSamples = [];
 
+const PUMP_V2_MINT_ROLE_SAMPLE_LIMIT = 500;
+
+const pumpV2MintRoleSamples = [];
+
+function recordPumpV2MintRoleSample(
+  tx,
+  signature,
+  eventType,
+  resolvedMint
+) {
+  if (
+    pumpV2MintRoleSamples.length >=
+    PUMP_V2_MINT_ROLE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  if (
+    eventType !== "buy" &&
+    eventType !== "sell"
+  ) {
+    return;
+  }
+
+  if (
+    typeof resolvedMint !== "string" ||
+    !resolvedMint
+  ) {
+    return;
+  }
+
+  const pumpInstructions = [];
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    pumpInstructions.push({
+      location: "outer",
+      outerIndex,
+      innerIndex: null,
+      accounts:
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [],
+      data:
+        ix?.data ?? null,
+    });
+  }
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      pumpInstructions.push({
+        location: "inner",
+        outerIndex:
+          group?.index ?? null,
+        innerIndex,
+        accounts:
+          Array.isArray(ix.accounts)
+            ? ix.accounts
+            : [],
+        data:
+          ix?.data ?? null,
+      });
+    }
+  }
+
+  // We only care about Pump instructions that:
+  //
+  // 1. have account indexes 1 and 2
+  // 2. contain the mint we already resolved
+  //
+  // This keeps unrelated Pump CPIs out of the sample.
+
+  const matchingInstructions =
+    pumpInstructions.filter(ix => {
+      if (ix.accounts.length < 3) {
+        return false;
+      }
+
+      return (
+        ix.accounts[1] === resolvedMint ||
+        ix.accounts[2] === resolvedMint
+      );
+    });
+
+  if (!matchingInstructions.length) {
+    return;
+  }
+
+  for (const ix of matchingInstructions) {
+    if (
+      pumpV2MintRoleSamples.length >=
+      PUMP_V2_MINT_ROLE_SAMPLE_LIMIT
+    ) {
+      break;
+    }
+
+    const resolvedMintIndex =
+      ix.accounts[1] === resolvedMint
+        ? 1
+        : ix.accounts[2] === resolvedMint
+          ? 2
+          : null;
+
+    pumpV2MintRoleSamples.push({
+      signature:
+        signature || null,
+
+      eventType,
+
+      resolvedMint,
+
+      resolvedMintIndex,
+
+      account1:
+        ix.accounts[1] || null,
+
+      account2:
+        ix.accounts[2] || null,
+
+      account1EqualsResolvedMint:
+        ix.accounts[1] === resolvedMint,
+
+      account2EqualsResolvedMint:
+        ix.accounts[2] === resolvedMint,
+
+      accountCount:
+        ix.accounts.length,
+
+      instructionData:
+        ix.data,
+
+      // Short prefix makes grouping instruction
+      // variants much easier in the output.
+      instructionDataPrefix:
+        typeof ix.data === "string"
+          ? ix.data.slice(0, 16)
+          : null,
+
+      location:
+        ix.location,
+
+      outerIndex:
+        ix.outerIndex,
+
+      innerIndex:
+        ix.innerIndex,
+    });
+  }
+
+  if (
+    pumpV2MintRoleSamples.length ===
+    PUMP_V2_MINT_ROLE_SAMPLE_LIMIT
+  ) {
+    const summary = {};
+
+    for (const row of pumpV2MintRoleSamples) {
+      const key = [
+        row.eventType,
+        row.instructionDataPrefix,
+        row.accountCount,
+      ].join("|");
+
+      if (!summary[key]) {
+        summary[key] = {
+          eventType:
+            row.eventType,
+
+          instructionDataPrefix:
+            row.instructionDataPrefix,
+
+          accountCount:
+            row.accountCount,
+
+          sampleCount: 0,
+
+          resolvedAtIndex1: 0,
+
+          resolvedAtIndex2: 0,
+        };
+      }
+
+      summary[key].sampleCount += 1;
+
+      if (row.resolvedMintIndex === 1) {
+        summary[key].resolvedAtIndex1 += 1;
+      }
+
+      if (row.resolvedMintIndex === 2) {
+        summary[key].resolvedAtIndex2 += 1;
+      }
+    }
+
+    logInfo(
+      "Pump V2 mint-role sample complete",
+      {
+        sampleCount:
+          pumpV2MintRoleSamples.length,
+
+        summary:
+          Object.values(summary),
+
+        // Only include a few examples.
+        // No more enormous Railway line.
+        examples:
+          pumpV2MintRoleSamples.slice(0, 10),
+      }
+    );
+  }
+}
+
 
 // ==================================================
 // 10D-1. TOKEN-BALANCE MINT CANDIDATES
@@ -3375,7 +3621,6 @@ function extractTokenAmount(
 // ==================================================
 // 10H. FINAL EVENT CLASSIFICATION
 // ==================================================
-
 function classifyPregradEvent(
   tx,
   signature
@@ -3469,6 +3714,26 @@ function classifyPregradEvent(
       eventType,
     };
   }
+
+  // ----------------------------------------------
+  // PUMP V2 MINT-ROLE DIAGNOSTIC
+  //
+  // Diagnostic only.
+  //
+  // Uses successfully resolved buy/sell events as
+  // the control population so we can determine
+  // which Pump V2 instruction account position
+  // corresponds to the resolved traded mint.
+  //
+  // This does NOT affect mint resolution.
+  // ----------------------------------------------
+
+  recordPumpV2MintRoleSample(
+    tx,
+    signature,
+    eventType,
+    tokenAddress
+  );
 
   // ----------------------------------------------
   // WALLET

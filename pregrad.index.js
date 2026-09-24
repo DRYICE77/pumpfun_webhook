@@ -1457,6 +1457,10 @@ const multipleCandidateMintSamples = [];
 const ZERO_CANDIDATE_SAMPLE_LIMIT = 100;
 const zeroCandidateMintSamples = [];
 
+const AMBIGUOUS_MULTIPLE_SAMPLE_LIMIT = 100;
+
+const ambiguousMultipleMintSamples = [];
+
 
 // ==================================================
 // 10D-1. TOKEN-BALANCE MINT CANDIDATES
@@ -2150,6 +2154,542 @@ function recordMultipleCandidateMintSample(
 }
 
 // ==================================================
+// AMBIGUOUS MULTIPLE-CANDIDATE DIAGNOSTIC
+//
+// Diagnostic only.
+//
+// Runs only for unresolved scoring events where:
+//
+// • 2+ non-wSOL token-balance candidates exist
+// • 2+ candidates are explicitly referenced by Pump
+//
+// Goal:
+//
+// Determine whether the real traded Pump mint can be
+// identified deterministically using:
+//
+// • Pump instruction account position
+// • Pump instruction data / discriminator
+// • Candidate token-balance changes
+// • Parsed token instructions
+// • Event type
+//
+// This function NEVER changes production mint
+// resolution.
+// ==================================================
+
+function recordAmbiguousMultipleMintSample(
+  tx,
+  signature,
+  eventType,
+  candidates
+) {
+  if (
+    ambiguousMultipleMintSamples.length >=
+    AMBIGUOUS_MULTIPLE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  if (
+    !Array.isArray(candidates) ||
+    candidates.length < 2
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // TOKEN BALANCES
+  // ----------------------------------------------
+
+  const preTokenBalances =
+    tx?.meta?.preTokenBalances || [];
+
+  const postTokenBalances =
+    tx?.meta?.postTokenBalances || [];
+
+  // ----------------------------------------------
+  // COLLECT PUMP INSTRUCTIONS
+  // ----------------------------------------------
+
+  const pumpInstructions = [];
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId !==
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      continue;
+    }
+
+    pumpInstructions.push({
+      location: "outer",
+
+      outerIndex,
+
+      innerIndex: null,
+
+      accounts:
+        Array.isArray(ix.accounts)
+          ? ix.accounts
+          : [],
+
+      data:
+        ix?.data ?? null,
+
+      parsed:
+        ix?.parsed ?? null,
+    });
+  }
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId !==
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        continue;
+      }
+
+      pumpInstructions.push({
+        location: "inner",
+
+        outerIndex:
+          group?.index ?? null,
+
+        innerIndex,
+
+        accounts:
+          Array.isArray(ix.accounts)
+            ? ix.accounts
+            : [],
+
+        data:
+          ix?.data ?? null,
+
+        parsed:
+          ix?.parsed ?? null,
+      });
+    }
+  }
+
+  // ----------------------------------------------
+  // DETERMINE WHICH CANDIDATES ARE
+  // EXPLICITLY REFERENCED BY PUMP
+  // ----------------------------------------------
+
+  const candidateResults =
+    candidates.map(candidateMint => {
+      const pumpMatches = [];
+
+      for (const pumpIx of pumpInstructions) {
+        const candidateIndexes = [];
+
+        for (
+          let i = 0;
+          i < pumpIx.accounts.length;
+          i += 1
+        ) {
+          if (
+            pumpIx.accounts[i] ===
+            candidateMint
+          ) {
+            candidateIndexes.push(i);
+          }
+        }
+
+        if (candidateIndexes.length > 0) {
+          pumpMatches.push({
+            location:
+              pumpIx.location,
+
+            outerIndex:
+              pumpIx.outerIndex,
+
+            innerIndex:
+              pumpIx.innerIndex,
+
+            candidateIndexes,
+
+            accountCount:
+              pumpIx.accounts.length,
+
+            instructionData:
+              pumpIx.data,
+          });
+        }
+      }
+
+      return {
+        candidateMint,
+
+        pumpConfirmed:
+          pumpMatches.length > 0,
+
+        pumpMatches,
+      };
+    });
+
+  const pumpConfirmedCandidates =
+    candidateResults
+      .filter(
+        row => row.pumpConfirmed
+      )
+      .map(
+        row => row.candidateMint
+      );
+
+  // ----------------------------------------------
+  // THIS DIAGNOSTIC ONLY WANTS TRUE AMBIGUOUS
+  // MULTIPLE-CONFIRMED CASES
+  // ----------------------------------------------
+
+  if (
+    pumpConfirmedCandidates.length < 2
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // TOKEN-BALANCE DELTA BY CANDIDATE
+  //
+  // We aggregate raw integer token amounts across
+  // all accounts belonging to each mint.
+  //
+  // rawDelta:
+  //   positive = aggregate token balance increased
+  //   negative = aggregate token balance decreased
+  // ----------------------------------------------
+
+  const getRawAmount = row => {
+    const raw =
+      row?.uiTokenAmount?.amount;
+
+    if (
+      typeof raw !== "string" &&
+      typeof raw !== "number"
+    ) {
+      return 0n;
+    }
+
+    try {
+      return BigInt(raw);
+    } catch {
+      return 0n;
+    }
+  };
+
+  const candidateBalanceChanges =
+    candidates.map(candidateMint => {
+      let preRaw = 0n;
+      let postRaw = 0n;
+
+      let decimals = null;
+
+      const preRows =
+        preTokenBalances.filter(
+          row =>
+            row?.mint === candidateMint
+        );
+
+      const postRows =
+        postTokenBalances.filter(
+          row =>
+            row?.mint === candidateMint
+        );
+
+      for (const row of preRows) {
+        preRaw += getRawAmount(row);
+
+        if (
+          decimals === null &&
+          Number.isFinite(
+            row?.uiTokenAmount?.decimals
+          )
+        ) {
+          decimals =
+            row.uiTokenAmount.decimals;
+        }
+      }
+
+      for (const row of postRows) {
+        postRaw += getRawAmount(row);
+
+        if (
+          decimals === null &&
+          Number.isFinite(
+            row?.uiTokenAmount?.decimals
+          )
+        ) {
+          decimals =
+            row.uiTokenAmount.decimals;
+        }
+      }
+
+      const rawDelta =
+        postRaw - preRaw;
+
+      return {
+        candidateMint,
+
+        decimals,
+
+        preRaw:
+          preRaw.toString(),
+
+        postRaw:
+          postRaw.toString(),
+
+        rawDelta:
+          rawDelta.toString(),
+
+        direction:
+          rawDelta > 0n
+            ? "increase"
+            : rawDelta < 0n
+              ? "decrease"
+              : "unchanged",
+
+        preAccountCount:
+          preRows.length,
+
+        postAccountCount:
+          postRows.length,
+      };
+    });
+
+  // ----------------------------------------------
+  // PARSED TOKEN INSTRUCTIONS
+  //
+  // Capture parsed instructions that explicitly
+  // identify one of our candidate mints.
+  // ----------------------------------------------
+
+  const parsedCandidateInstructions = [];
+
+  const inspectParsedInstruction = (
+    ix,
+    location,
+    outerIndex = null,
+    innerIndex = null
+  ) => {
+    const parsed =
+      ix?.parsed || null;
+
+    const info =
+      parsed?.info || null;
+
+    const mint =
+      info?.mint || null;
+
+    if (
+      typeof mint !== "string" ||
+      !candidates.includes(mint)
+    ) {
+      return;
+    }
+
+    parsedCandidateInstructions.push({
+      candidateMint:
+        mint,
+
+      location,
+
+      outerIndex,
+
+      innerIndex,
+
+      programId:
+        ix?.programId || null,
+
+      type:
+        parsed?.type || null,
+
+      source:
+        info?.source || null,
+
+      destination:
+        info?.destination || null,
+
+      authority:
+        info?.authority || null,
+
+      owner:
+        info?.owner || null,
+
+      amount:
+        info?.amount ??
+        info?.tokenAmount?.amount ??
+        null,
+    });
+  };
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectParsedInstruction(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectParsedInstruction(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // SAVE SAMPLE
+  // ----------------------------------------------
+
+  ambiguousMultipleMintSamples.push({
+    signature:
+      signature || null,
+
+    slot:
+      tx?.slot ?? null,
+
+    blockTime:
+      tx?.blockTime ?? null,
+
+    eventType:
+      eventType || "unknown",
+
+    candidateCount:
+      candidates.length,
+
+    candidates,
+
+    pumpConfirmedCandidateCount:
+      pumpConfirmedCandidates.length,
+
+    pumpConfirmedCandidates,
+
+    candidateResults,
+
+    candidateBalanceChanges,
+
+    parsedCandidateInstructions,
+
+    pumpInstructions,
+
+    logs:
+      getLogMessages(tx) || [],
+  });
+
+  // ----------------------------------------------
+  // OUTPUT SUMMARY WHEN SAMPLE IS COMPLETE
+  // ----------------------------------------------
+
+  if (
+    ambiguousMultipleMintSamples.length ===
+    AMBIGUOUS_MULTIPLE_SAMPLE_LIMIT
+  ) {
+    const eventTypeCounts = {};
+
+    const confirmedCountDistribution = {};
+
+    const candidateCountDistribution = {};
+
+    for (
+      const row
+      of ambiguousMultipleMintSamples
+    ) {
+      eventTypeCounts[row.eventType] =
+        (
+          eventTypeCounts[row.eventType] ||
+          0
+        ) + 1;
+
+      const confirmedKey =
+        String(
+          row.pumpConfirmedCandidateCount
+        );
+
+      confirmedCountDistribution[
+        confirmedKey
+      ] =
+        (
+          confirmedCountDistribution[
+            confirmedKey
+          ] ||
+          0
+        ) + 1;
+
+      const candidateKey =
+        String(row.candidateCount);
+
+      candidateCountDistribution[
+        candidateKey
+      ] =
+        (
+          candidateCountDistribution[
+            candidateKey
+          ] ||
+          0
+        ) + 1;
+    }
+
+    logInfo(
+      "Ambiguous multiple-candidate mint sample complete",
+      {
+        sampleCount:
+          ambiguousMultipleMintSamples.length,
+
+        eventTypeCounts,
+
+        candidateCountDistribution,
+
+        confirmedCountDistribution,
+
+        samples:
+          ambiguousMultipleMintSamples,
+      }
+    );
+  }
+}
+
+// ==================================================
 // ZERO-CANDIDATE EVENT DIAGNOSTIC
 //
 // Diagnostic only.
@@ -2539,16 +3079,23 @@ function recordUnresolvedMintDiagnostics(
   );
 }
 
-  else if (candidates.length === 1) {
-    stats.unresolvedOneCandidate += 1;
+else {
+  stats.unresolvedMultipleCandidates += 1;
 
-    recordOneCandidateMintSample(
-      tx,
-      signature,
-      eventType,
-      candidates[0]
-    );
-  }
+  recordMultipleCandidateMintSample(
+    tx,
+    signature,
+    eventType,
+    candidates
+  );
+
+  recordAmbiguousMultipleMintSample(
+    tx,
+    signature,
+    eventType,
+    candidates
+  );
+}
 
   else {
     stats.unresolvedMultipleCandidates += 1;

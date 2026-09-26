@@ -135,29 +135,9 @@ const MAX_TX_PER_SECOND = Number(
   process.env.MAX_TX_PER_SECOND || 30
 );
 
-let nextRpcStartAt = 0;
 
-async function waitForRpcStartSlot() {
-  const intervalMs =
-    1000 / MAX_TX_PER_SECOND;
 
-  const now = performanceNow();
 
-  const scheduledAt = Math.max(
-    now,
-    nextRpcStartAt
-  );
-
-  nextRpcStartAt =
-    scheduledAt + intervalMs;
-
-  const waitMs =
-    scheduledAt - now;
-
-  if (waitMs > 0) {
-    await sleep(waitMs);
-  }
-}
 
 // ==================================================
 // 2D. QUEUE AGE / MAINTENANCE
@@ -486,6 +466,9 @@ sqlGraduationUpdateMaxMs: 0,
   rpcFetchSamples: 0,
   rpcFetchTotalMs: 0,
   rpcFetchMaxMs: 0,
+  rpcAttemptSamples: 0,
+rpcAttemptTotalMs: 0,
+rpcAttemptMaxMs: 0,
 
   // ==========================================
   // DATABASE WRITE PERFORMANCE
@@ -596,6 +579,12 @@ function getPerformanceCounterMap() {
       total: "rpcFetchTotalMs",
       max: "rpcFetchMaxMs",
     },
+
+    rpcAttempt: {
+  samples: "rpcAttemptSamples",
+  total: "rpcAttemptTotalMs",
+  max: "rpcAttemptMaxMs",
+},
 
     dbWrite: {
       samples: "dbWriteSamples",
@@ -1188,32 +1177,38 @@ async function fetchFullTransaction(signature) {
     ) {
       try {
         // ------------------------------------------
-        // GLOBAL RPC START-RATE LIMIT
+        // PURE RPC ATTEMPT TIMING
         //
-        // Throttle request STARTS globally rather
-        // than sleeping each worker after processing.
+        // Measures only the individual Helius
+        // getTransaction request.
         //
-        // Every attempt, including retries, must
-        // acquire a start slot.
+        // Does NOT include retry sleep/backoff.
         // ------------------------------------------
 
-        await waitForRpcStartSlot();
+        const attemptStartedAt =
+          performanceNow();
 
-        // ------------------------------------------
-        // FETCH HYDRATED TRANSACTION
-        // ------------------------------------------
+        let transaction;
 
-        const transaction = await heliusRpc(
-          "getTransaction",
-          [
-            signature,
-            {
-              encoding: "jsonParsed",
-              maxSupportedTransactionVersion: 1,
-              commitment: "confirmed",
-            },
-          ]
-        );
+        try {
+          transaction = await heliusRpc(
+            "getTransaction",
+            [
+              signature,
+              {
+                encoding: "jsonParsed",
+                maxSupportedTransactionVersion: 1,
+                commitment: "confirmed",
+              },
+            ]
+          );
+        } finally {
+          recordPerformanceTiming(
+            "rpcAttempt",
+            performanceNow() -
+              attemptStartedAt
+          );
+        }
 
         // ------------------------------------------
         // SUCCESS
@@ -1224,9 +1219,7 @@ async function fetchFullTransaction(signature) {
         }
 
         // ------------------------------------------
-        // NULL RESPONSE
-        //
-        // Preserve the existing retry behavior.
+        // NULL RESPONSE RETRY
         // ------------------------------------------
 
         if (attempt < RPC_RETRY_COUNT) {
@@ -1280,11 +1273,13 @@ async function fetchFullTransaction(signature) {
     // COMPLETE FETCH TIMING
     //
     // Includes:
-    // • RPC start-slot waiting
     // • Helius request time
     // • Null-response retries
     // • RPC-error retries
-    // • Retry backoff delays
+    // • Retry/backoff delays
+    //
+    // Compare this against rpcAttemptPerformance
+    // to isolate retry/backoff overhead.
     // ----------------------------------------------
 
     recordPerformanceTiming(
@@ -8619,6 +8614,17 @@ if (!classified.ok) {
 // ==================================================
 
 async function queueWorkerLoop(workerId) {
+  const minimumDelayMs = Math.max(
+    Math.floor(
+      (
+        1000 /
+        MAX_TX_PER_SECOND
+      ) *
+      WORKER_CONCURRENCY
+    ),
+    15
+  );
+
   while (workerRunning) {
     drainStaleQueueItems();
 
@@ -8627,7 +8633,7 @@ async function queueWorkerLoop(workerId) {
 
     if (!item) {
       maybeResumeIntake();
-      await sleep(25);
+      await sleep(100);
       continue;
     }
 
@@ -8646,48 +8652,9 @@ async function queueWorkerLoop(workerId) {
     }
 
     maybeResumeIntake();
+
+    await sleep(minimumDelayMs);
   }
-}
-
-function startQueueWorkers() {
-  if (workerRunning) return;
-
-  workerRunning = true;
-
-  for (
-    let index = 0;
-    index < WORKER_CONCURRENCY;
-    index += 1
-  ) {
-    workerPromises.push(
-      queueWorkerLoop(index + 1)
-    );
-  }
-
-  logInfo("Transaction workers started", {
-    workerConcurrency:
-      WORKER_CONCURRENCY,
-
-    maxTransactionsPerSecond:
-      MAX_TX_PER_SECOND,
-
-    maxQueueSize:
-      MAX_QUEUE_SIZE,
-
-    resumeQueueSize:
-      RESUME_QUEUE_SIZE,
-
-    signatureMaxAgeMs:
-      SIGNATURE_MAX_AGE_MS,
-
-    pregradTokenSupply:
-      PREGRAD_TOKEN_SUPPLY,
-
-    solPriceUsd:
-      SOL_PRICE_USD > 0
-        ? SOL_PRICE_USD
-        : null,
-  });
 }
 
 // ==================================================
@@ -9203,11 +9170,14 @@ function startQueueLogger() {
         // Includes samples, average and maximum.
         // ------------------------------------------
 
-        const rpcFetchPerformance =
-          getPerformanceSummary("rpcFetch");
+       const rpcFetchPerformance =
+  getPerformanceSummary("rpcFetch");
 
-        const dbWritePerformance =
-          getPerformanceSummary("dbWrite");
+const rpcAttemptPerformance =
+  getPerformanceSummary("rpcAttempt");
+
+const dbWritePerformance =
+  getPerformanceSummary("dbWrite");
 
         const processingPerformance =
           getPerformanceSummary("processing");
@@ -9339,10 +9309,11 @@ function startQueueLogger() {
             processedPerSecond,
 
             // Cumulative latency summaries
-            rpcFetchPerformance,
-            dbWritePerformance,
-            processingPerformance,
-            intakePausePerformance,
+         rpcFetchPerformance,
+rpcAttemptPerformance,
+dbWritePerformance,
+processingPerformance,
+intakePausePerformance,
 
             // Ongoing pause duration
             currentPauseMs,

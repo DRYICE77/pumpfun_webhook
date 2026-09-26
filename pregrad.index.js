@@ -1519,6 +1519,23 @@ const rule5ShadowSamples = [];
 let rule5ShadowDiagnosticComplete = false;
 
 // ============================================================
+// RULE 5 FAILURE FORENSIC DIAGNOSTIC STATE
+// ============================================================
+//
+// Capture detailed transaction structure ONLY when the
+// existing Rule 5 shadow hypothesis cannot resolve a Create.
+//
+// Diagnostic only.
+// Does NOT modify production mint resolution.
+// ============================================================
+
+const RULE5_FAILURE_SAMPLE_LIMIT = 25;
+
+const rule5FailureSamples = [];
+
+let rule5FailureDiagnosticComplete = false;
+
+// ============================================================
 // UNRESOLVED CREATE MINT DIAGNOSTIC
 //
 // Capture detailed structure for unresolved Create events.
@@ -2400,6 +2417,18 @@ function recordRule5ShadowDiagnostic(
   rule5ShadowSamples.push(sample);
 
   // ----------------------------------------------
+// FAILURE-ONLY FORENSIC DIAGNOSTIC
+// ----------------------------------------------
+
+if (!resolvable) {
+  recordRule5FailureDiagnostic(
+    tx,
+    signature,
+    sample
+  );
+}
+
+  // ----------------------------------------------
   // LOG EACH SAMPLE
   // ----------------------------------------------
 
@@ -2655,6 +2684,605 @@ function recordRule5ShadowDiagnostic(
 
         samples:
           rule5ShadowSamples,
+      }
+    );
+  }
+}
+
+// ============================================================
+// RULE 5 FAILURE FORENSIC DIAGNOSTIC
+//
+// Purpose:
+//
+// Study Create transactions that remain unresolved by the
+// current Rule 5 shadow hypothesis.
+//
+// We specifically want to determine:
+//
+// • What outer instruction owns InitializeMint / MintTo?
+// • Is that parent instruction a Pump instruction?
+// • What is its account count?
+// • Which candidate mints does it reference?
+// • Is there another Pump Create schema that our current
+//   accountCount === 20 hypothesis does not recognize?
+//
+// IMPORTANT:
+//
+// • Diagnostic only.
+// • Does NOT modify production mint resolution.
+// • Runs only after the existing Rule 5 shadow test fails.
+// ============================================================
+
+function recordRule5FailureDiagnostic(
+  tx,
+  signature,
+  rule5Sample
+) {
+  // ----------------------------------------------
+  // STOP AFTER SAMPLE LIMIT
+  // ----------------------------------------------
+
+  if (
+    rule5FailureDiagnosticComplete ||
+    rule5FailureSamples.length >=
+      RULE5_FAILURE_SAMPLE_LIMIT
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // ONLY FAILED RULE 5 CREATE SAMPLES
+  // ----------------------------------------------
+
+  if (
+    !rule5Sample ||
+    rule5Sample.eventType !== "create" ||
+    rule5Sample.resolvable === true
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // TOKEN-BALANCE CANDIDATES
+  // ----------------------------------------------
+
+  const candidates =
+    getMintCandidatesFromTokenBalances(tx);
+
+  const candidateSet =
+    new Set(candidates);
+
+  // ----------------------------------------------
+  // TRANSACTION STRUCTURE
+  // ----------------------------------------------
+
+  const outerInstructions =
+    getInstructions(tx) || [];
+
+  const innerGroups =
+    getInnerInstructions(tx) || [];
+
+  // ----------------------------------------------
+  // NORMALIZE ONE INSTRUCTION
+  // ----------------------------------------------
+
+  function summarizeInstruction(
+    ix,
+    location,
+    outerIndex,
+    innerIndex
+  ) {
+    const accounts =
+      Array.isArray(ix?.accounts)
+        ? ix.accounts
+        : [];
+
+    const parsed =
+      ix?.parsed ?? null;
+
+    return {
+      location,
+
+      outerIndex,
+
+      innerIndex,
+
+      program:
+        ix?.program ?? null,
+
+      programId:
+        ix?.programId ?? null,
+
+      isPumpProgram:
+        ix?.programId ===
+        PUMP_LAUNCHPAD_PROGRAM_ID,
+
+      accountCount:
+        accounts.length,
+
+      accounts:
+        accounts.map(
+          (account, index) => ({
+            index,
+            account,
+
+            isCandidate:
+              candidateSet.has(account),
+          })
+        ),
+
+      candidateAccounts:
+        accounts
+          .map(
+            (account, index) => ({
+              index,
+              account,
+            })
+          )
+          .filter(row =>
+            candidateSet.has(row.account)
+          ),
+
+      data:
+        ix?.data ?? null,
+
+      parsedType:
+        parsed?.type ?? null,
+
+      parsedInfo:
+        parsed?.info ?? null,
+    };
+  }
+
+  // ----------------------------------------------
+  // ALL OUTER INSTRUCTIONS
+  // ----------------------------------------------
+
+  const outerInstructionSummaries = [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    outerInstructionSummaries.push(
+      summarizeInstruction(
+        outerInstructions[outerIndex],
+        "outer",
+        outerIndex,
+        null
+      )
+    );
+  }
+
+  // ----------------------------------------------
+  // ALL PUMP INSTRUCTIONS
+  //
+  // Unlike the existing Rule 5 diagnostic, DO NOT
+  // filter by accountCount === 20.
+  // ----------------------------------------------
+
+  const allPumpInstructions = [];
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    const ix =
+      outerInstructions[outerIndex];
+
+    if (
+      ix?.programId ===
+      PUMP_LAUNCHPAD_PROGRAM_ID
+    ) {
+      allPumpInstructions.push(
+        summarizeInstruction(
+          ix,
+          "outer",
+          outerIndex,
+          null
+        )
+      );
+    }
+  }
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      const ix =
+        instructions[innerIndex];
+
+      if (
+        ix?.programId ===
+        PUMP_LAUNCHPAD_PROGRAM_ID
+      ) {
+        allPumpInstructions.push(
+          summarizeInstruction(
+            ix,
+            "inner",
+            group?.index ?? null,
+            innerIndex
+          )
+        );
+      }
+    }
+  }
+
+  // ----------------------------------------------
+  // TOKEN CREATE SIGNALS
+  // ----------------------------------------------
+
+  const tokenCreateSignals = [];
+
+  function inspectTokenSignal(
+    ix,
+    location,
+    outerIndex,
+    innerIndex
+  ) {
+    const parsed =
+      ix?.parsed ?? null;
+
+    if (!parsed) {
+      return;
+    }
+
+    const type =
+      parsed?.type ?? null;
+
+    if (
+      type !== "initializeMint" &&
+      type !== "initializeMint2" &&
+      type !== "mintTo" &&
+      type !== "mintToChecked"
+    ) {
+      return;
+    }
+
+    const mint =
+      parsed?.info?.mint ?? null;
+
+    tokenCreateSignals.push({
+      location,
+      outerIndex,
+      innerIndex,
+
+      program:
+        ix?.program ?? null,
+
+      programId:
+        ix?.programId ?? null,
+
+      type,
+
+      mint,
+
+      mintIsCandidate:
+        typeof mint === "string" &&
+        candidateSet.has(mint),
+    });
+  }
+
+  // Outer token instructions.
+
+  for (
+    let outerIndex = 0;
+    outerIndex < outerInstructions.length;
+    outerIndex += 1
+  ) {
+    inspectTokenSignal(
+      outerInstructions[outerIndex],
+      "outer",
+      outerIndex,
+      null
+    );
+  }
+
+  // Inner token instructions.
+
+  for (const group of innerGroups) {
+    const instructions =
+      group?.instructions || [];
+
+    for (
+      let innerIndex = 0;
+      innerIndex < instructions.length;
+      innerIndex += 1
+    ) {
+      inspectTokenSignal(
+        instructions[innerIndex],
+        "inner",
+        group?.index ?? null,
+        innerIndex
+      );
+    }
+  }
+
+  // ----------------------------------------------
+  // PARENT OUTER INSTRUCTIONS
+  //
+  // For every InitializeMint / MintTo found inside
+  // an inner-instruction group, capture the outer
+  // instruction that invoked that group.
+  // ----------------------------------------------
+
+  const parentOuterIndexes =
+    new Set(
+      tokenCreateSignals
+        .filter(
+          signal =>
+            signal.location === "inner" &&
+            Number.isInteger(
+              signal.outerIndex
+            )
+        )
+        .map(
+          signal =>
+            signal.outerIndex
+        )
+    );
+
+  const parentOuterInstructions =
+    Array.from(parentOuterIndexes)
+      .sort((a, b) => a - b)
+      .map(outerIndex => {
+        const ix =
+          outerInstructions[outerIndex];
+
+        if (!ix) {
+          return {
+            outerIndex,
+            missing: true,
+          };
+        }
+
+        return summarizeInstruction(
+          ix,
+          "outer",
+          outerIndex,
+          null
+        );
+      });
+
+  // ----------------------------------------------
+  // RELEVANT LOGS
+  // ----------------------------------------------
+
+  const logs =
+    getLogMessages(tx);
+
+  const relevantLogs =
+    logs.filter(line => {
+      if (typeof line !== "string") {
+        return false;
+      }
+
+      const lower =
+        line.toLowerCase();
+
+      return (
+        lower.includes("instruction:") ||
+        lower.includes("initialize") ||
+        lower.includes("mint") ||
+        lower.includes("create") ||
+        lower.includes(
+          PUMP_LAUNCHPAD_PROGRAM_ID.toLowerCase()
+        )
+      );
+    });
+
+  // ----------------------------------------------
+  // RECORD FAILURE SAMPLE
+  // ----------------------------------------------
+
+  const failureSample = {
+    signature:
+      signature || null,
+
+    eventType:
+      rule5Sample.eventType,
+
+    failureReason: {
+      pumpCreateInstructionCount:
+        rule5Sample.pumpCreateInstructionCount,
+
+      initializeMintInstructionCount:
+        rule5Sample.initializeMintInstructionCount,
+
+      mintToInstructionCount:
+        rule5Sample.mintToInstructionCount,
+
+      createMint:
+        rule5Sample.createMint,
+
+      initializeMint:
+        rule5Sample.initializeMint,
+
+      mintToMint:
+        rule5Sample.mintToMint,
+
+      createMintIsCandidate:
+        rule5Sample.createMintIsCandidate,
+
+      initializeMintIsCandidate:
+        rule5Sample.initializeMintIsCandidate,
+
+      createVsInitializeMatch:
+        rule5Sample.createVsInitializeMatch,
+
+      initializeVsMintToMatch:
+        rule5Sample.initializeVsMintToMatch,
+    },
+
+    candidateCount:
+      candidates.length,
+
+    candidates,
+
+    outerInstructionCount:
+      outerInstructions.length,
+
+    outerInstructions:
+      outerInstructionSummaries,
+
+    allPumpInstructionCount:
+      allPumpInstructions.length,
+
+    allPumpInstructions,
+
+    tokenCreateSignalCount:
+      tokenCreateSignals.length,
+
+    tokenCreateSignals,
+
+    parentOuterInstructionCount:
+      parentOuterInstructions.length,
+
+    parentOuterInstructions,
+
+    relevantLogs,
+  };
+
+  rule5FailureSamples.push(
+    failureSample
+  );
+
+  // ----------------------------------------------
+  // LOG EACH FAILURE
+  // ----------------------------------------------
+
+  logInfo(
+    "Rule 5 failure forensic sample",
+    {
+      sampleNumber:
+        rule5FailureSamples.length,
+
+      signature:
+        signature || null,
+
+      candidateCount:
+        candidates.length,
+
+      allPumpInstructionCount:
+        allPumpInstructions.length,
+
+      tokenCreateSignalCount:
+        tokenCreateSignals.length,
+
+      parentOuterInstructionCount:
+        parentOuterInstructions.length,
+
+      failureSample,
+    }
+  );
+
+  // ----------------------------------------------
+  // FINAL SUMMARY
+  // ----------------------------------------------
+
+  if (
+    rule5FailureSamples.length >=
+    RULE5_FAILURE_SAMPLE_LIMIT
+  ) {
+    rule5FailureDiagnosticComplete =
+      true;
+
+    const parentProgramCounts = {};
+
+    const parentAccountCountDistribution = {};
+
+    const pumpAccountCountDistribution = {};
+
+    let parentIsPumpCount = 0;
+
+    let parentNotPumpCount = 0;
+
+    for (
+      const row
+      of rule5FailureSamples
+    ) {
+      for (
+        const parent
+        of row.parentOuterInstructions
+      ) {
+        const programKey =
+          parent.programId ||
+          parent.program ||
+          "unknown";
+
+        parentProgramCounts[
+          programKey
+        ] =
+          (
+            parentProgramCounts[
+              programKey
+            ] || 0
+          ) + 1;
+
+        const accountKey =
+          String(
+            parent.accountCount ?? "unknown"
+          );
+
+        parentAccountCountDistribution[
+          accountKey
+        ] =
+          (
+            parentAccountCountDistribution[
+              accountKey
+            ] || 0
+          ) + 1;
+
+        if (parent.isPumpProgram) {
+          parentIsPumpCount += 1;
+        } else {
+          parentNotPumpCount += 1;
+        }
+      }
+
+      for (
+        const pumpIx
+        of row.allPumpInstructions
+      ) {
+        const accountKey =
+          String(pumpIx.accountCount);
+
+        pumpAccountCountDistribution[
+          accountKey
+        ] =
+          (
+            pumpAccountCountDistribution[
+              accountKey
+            ] || 0
+          ) + 1;
+      }
+    }
+
+    logInfo(
+      "Rule 5 failure forensic diagnostic complete",
+      {
+        examined:
+          rule5FailureSamples.length,
+
+        parentIsPumpCount,
+
+        parentNotPumpCount,
+
+        parentProgramCounts,
+
+        parentAccountCountDistribution,
+
+        pumpAccountCountDistribution,
+
+        samples:
+          rule5FailureSamples,
       }
     );
   }

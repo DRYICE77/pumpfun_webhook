@@ -135,6 +135,29 @@ const MAX_TX_PER_SECOND = Number(
   process.env.MAX_TX_PER_SECOND || 30
 );
 
+let nextRpcStartAt = 0;
+
+async function waitForRpcStartSlot() {
+  const intervalMs =
+    1000 / MAX_TX_PER_SECOND;
+
+  const now = performanceNow();
+
+  const scheduledAt = Math.max(
+    now,
+    nextRpcStartAt
+  );
+
+  nextRpcStartAt =
+    scheduledAt + intervalMs;
+
+  const waitMs =
+    scheduledAt - now;
+
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+}
 
 // ==================================================
 // 2D. QUEUE AGE / MAINTENANCE
@@ -1138,6 +1161,8 @@ async function heliusRpc(method, params) {
   return json.result;
 }
 
+
+
 // ==================================================
 // 9A. FETCH FULL TRANSACTION
 //
@@ -1162,6 +1187,22 @@ async function fetchFullTransaction(signature) {
       attempt += 1
     ) {
       try {
+        // ------------------------------------------
+        // GLOBAL RPC START-RATE LIMIT
+        //
+        // Throttle request STARTS globally rather
+        // than sleeping each worker after processing.
+        //
+        // Every attempt, including retries, must
+        // acquire a start slot.
+        // ------------------------------------------
+
+        await waitForRpcStartSlot();
+
+        // ------------------------------------------
+        // FETCH HYDRATED TRANSACTION
+        // ------------------------------------------
+
         const transaction = await heliusRpc(
           "getTransaction",
           [
@@ -1174,35 +1215,60 @@ async function fetchFullTransaction(signature) {
           ]
         );
 
+        // ------------------------------------------
+        // SUCCESS
+        // ------------------------------------------
+
         if (transaction) {
           return transaction;
         }
+
+        // ------------------------------------------
+        // NULL RESPONSE
+        //
+        // Preserve the existing retry behavior.
+        // ------------------------------------------
 
         if (attempt < RPC_RETRY_COUNT) {
           stats.rpcRetries += 1;
 
           await sleep(
-            RPC_RETRY_DELAY_MS * (attempt + 1)
+            RPC_RETRY_DELAY_MS *
+              (attempt + 1)
           );
         }
       } catch (error) {
         lastError = error;
+
+        // ------------------------------------------
+        // RPC ERROR RETRY
+        // ------------------------------------------
 
         if (attempt < RPC_RETRY_COUNT) {
           stats.rpcRetries += 1;
 
           const wasRateLimited =
             error?.status === 429 ||
-            String(error?.message || "").includes("429");
+            String(
+              error?.message || ""
+            ).includes("429");
 
           await sleep(
             wasRateLimited
-              ? backoffDelay(attempt, true)
-              : RPC_RETRY_DELAY_MS * (attempt + 1)
+              ? backoffDelay(
+                  attempt,
+                  true
+                )
+              : RPC_RETRY_DELAY_MS *
+                  (attempt + 1)
           );
         }
       }
     }
+
+    // ----------------------------------------------
+    // ALL ATTEMPTS EXHAUSTED
+    // ----------------------------------------------
 
     if (lastError) {
       throw lastError;
@@ -1210,9 +1276,21 @@ async function fetchFullTransaction(signature) {
 
     return null;
   } finally {
+    // ----------------------------------------------
+    // COMPLETE FETCH TIMING
+    //
+    // Includes:
+    // • RPC start-slot waiting
+    // • Helius request time
+    // • Null-response retries
+    // • RPC-error retries
+    // • Retry backoff delays
+    // ----------------------------------------------
+
     recordPerformanceTiming(
       "rpcFetch",
-      performanceNow() - fetchStartedAt
+      performanceNow() -
+        fetchStartedAt
     );
   }
 }
@@ -8267,6 +8345,8 @@ async function processQueuedSignature(item) {
   let permanentlySeen = false;
 
   try {
+
+    
     // ----------------------------------------------
     // FETCH HYDRATED TRANSACTION
     //
@@ -8539,17 +8619,6 @@ if (!classified.ok) {
 // ==================================================
 
 async function queueWorkerLoop(workerId) {
-  const minimumDelayMs = Math.max(
-    Math.floor(
-      (
-        1000 /
-        MAX_TX_PER_SECOND
-      ) *
-      WORKER_CONCURRENCY
-    ),
-    15
-  );
-
   while (workerRunning) {
     drainStaleQueueItems();
 
@@ -8558,7 +8627,7 @@ async function queueWorkerLoop(workerId) {
 
     if (!item) {
       maybeResumeIntake();
-      await sleep(100);
+      await sleep(25);
       continue;
     }
 
@@ -8577,7 +8646,6 @@ async function queueWorkerLoop(workerId) {
     }
 
     maybeResumeIntake();
-    await sleep(minimumDelayMs);
   }
 }
 

@@ -8657,6 +8657,38 @@ async function queueWorkerLoop(workerId) {
   }
 }
 
+function startQueueWorkers() {
+  if (workerRunning) {
+    return;
+  }
+
+  workerRunning = true;
+
+  for (
+    let workerId = 0;
+    workerId < WORKER_CONCURRENCY;
+    workerId += 1
+  ) {
+    const workerPromise =
+      queueWorkerLoop(workerId);
+
+    workerPromises.push(
+      workerPromise
+    );
+  }
+
+  logInfo(
+    "Queue workers started",
+    {
+      workerConcurrency:
+        WORKER_CONCURRENCY,
+
+      maxTxPerSecond:
+        MAX_TX_PER_SECOND,
+    }
+  );
+}
+
 // ==================================================
 // 15. WEBSOCKET
 // ==================================================

@@ -4019,42 +4019,8 @@ function getMintCandidatesFromTokenBalances(tx) {
   return [...candidates];
 }
 
-
 // ==================================================
 // 10D-2. CURRENT PRODUCTION MINT RESOLVER
-//
-// IMPORTANT:
-//
-// Preserve current production behavior while diagnostics
-// are running.
-//
-// We are intentionally NOT using "one candidate" as a
-// resolution rule yet.
-// ==================================================
-
-// ==================================================
-// INFER PRIMARY PUMP.FUN MINT
-//
-// Resolution order:
-//
-// 1. Preserve the existing high-confidence rule:
-//    if a token-balance candidate ends in "pump",
-//    resolve it immediately.
-//
-// 2. If there is exactly one non-wSOL candidate,
-//    inspect both outer and inner instructions.
-//
-//    If the Pump.fun program explicitly references
-//    that candidate as one of its instruction accounts,
-//    resolve it.
-//
-// 3. Otherwise remain unresolved.
-//
-// IMPORTANT:
-// - We do NOT resolve a mint merely because it is the
-//   only token-balance candidate.
-// - We do NOT assume a fixed Pump account position.
-// - We do NOT require parsed SPL-token confirmation.
 // ==================================================
 
 function inferPrimaryMint(tx) {
@@ -4092,21 +4058,14 @@ function inferPrimaryMint(tx) {
     new Set(candidates);
 
   // ----------------------------------------------
-  // COLLECT ALL CANDIDATES REFERENCED BY
-  // OUTER OR INNER PUMP INSTRUCTIONS
-  //
-  // Also preserve the Pump instructions themselves
-  // for Rules 4 and 5.
+  // COLLECT PUMP-CONFIRMED CANDIDATES
+  // AND PUMP INSTRUCTIONS
   // ----------------------------------------------
 
   const pumpConfirmedCandidates =
     new Set();
 
   const pumpInstructions = [];
-
-  // ----------------------------------------------
-  // OUTER INSTRUCTIONS
-  // ----------------------------------------------
 
   const outerInstructions =
     getInstructions(tx) || [];
@@ -4151,10 +4110,6 @@ function inferPrimaryMint(tx) {
       }
     }
   }
-
-  // ----------------------------------------------
-  // INNER INSTRUCTIONS
-  // ----------------------------------------------
 
   const innerGroups =
     getInnerInstructions(tx) || [];
@@ -4213,7 +4168,7 @@ function inferPrimaryMint(tx) {
 
   // ----------------------------------------------
   // RULE 2:
-  // PUMP-CONFIRMED ONE-CANDIDATE FALLBACK
+  // ONE CANDIDATE + PUMP CONFIRMATION
   // ----------------------------------------------
 
   if (
@@ -4227,8 +4182,8 @@ function inferPrimaryMint(tx) {
 
   // ----------------------------------------------
   // RULE 3:
-  // MULTIPLE TOKEN-BALANCE CANDIDATES,
-  // BUT EXACTLY ONE PUMP-CONFIRMED CANDIDATE
+  // MULTIPLE CANDIDATES,
+  // EXACTLY ONE PUMP-CONFIRMED
   // ----------------------------------------------
 
   if (
@@ -4242,25 +4197,13 @@ function inferPrimaryMint(tx) {
 
   // ----------------------------------------------
   // RULE 4:
-  // VALIDATED MULTIPLE-PUMP-MINT TRADE SCHEMA
-  //
-  // Validated schemas:
+  // VALIDATED AMBIGUOUS BUY / SELL SCHEMAS
   //
   // BUY:
-  //   27 accounts -> mint at account[1]
-  //   28 accounts -> mint at account[1]
+  //   27 / 28 accounts -> mint at account[1]
   //
   // SELL:
-  //   26 accounts -> mint at account[1]
-  //   27 accounts -> mint at account[1]
-  //
-  // SAFETY:
-  //
-  // - Multiple candidates only.
-  // - Multiple Pump-confirmed candidates only.
-  // - Rules 1-3 must already have failed.
-  // - Expected mint must be a candidate.
-  // - Every qualifying instruction must agree.
+  //   26 / 27 accounts -> mint at account[1]
   // ----------------------------------------------
 
   if (
@@ -4288,10 +4231,6 @@ function inferPrimaryMint(tx) {
 
       let schemaMatches = false;
 
-      // ------------------------------------------
-      // VALIDATED BUY SCHEMAS
-      // ------------------------------------------
-
       if (
         eventType === "buy" &&
         (
@@ -4300,13 +4239,7 @@ function inferPrimaryMint(tx) {
         )
       ) {
         schemaMatches = true;
-      }
-
-      // ------------------------------------------
-      // VALIDATED SELL SCHEMAS
-      // ------------------------------------------
-
-      else if (
+      } else if (
         eventType === "sell" &&
         (
           accountCount === 26 ||
@@ -4322,7 +4255,6 @@ function inferPrimaryMint(tx) {
 
       qualifyingInstructionCount += 1;
 
-      // All validated Rule 4 schemas use account[1].
       const expectedMint =
         accounts[1] || null;
 
@@ -4330,10 +4262,6 @@ function inferPrimaryMint(tx) {
         typeof expectedMint !== "string" ||
         !candidateSet.has(expectedMint)
       ) {
-        // Qualifying schema produced something
-        // outside the token-balance candidate set.
-        //
-        // Fail closed.
         return null;
       }
 
@@ -4361,8 +4289,6 @@ function inferPrimaryMint(tx) {
       return resolvedMint;
     }
 
-    // Multiple qualifying instructions disagreed.
-    // Fail closed.
     return null;
   }
 
@@ -4370,44 +4296,21 @@ function inferPrimaryMint(tx) {
   // RULE 5:
   // VALIDATED AMBIGUOUS CREATE RESOLUTION
   //
-  // Shadow evidence:
+  // Required:
   //
-  // First run:
-  //   50 examined
-  //   49 resolvable
-  //   1 fail-closed
-  //   0 observed disagreements
+  // Pump Create:
+  //   20 accounts
+  //   account[0] = X
   //
-  // Second run:
-  //   50 examined
-  //   50 resolvable
-  //   0 fail-closed
-  //   0 observed disagreements
-  //
-  // Validated Create structure:
-  //
-  //   Pump Create instruction
-  //     20 accounts
-  //     account[0] = X
-  //
+  // SPL Token / Token-2022:
   //   InitializeMint / InitializeMint2
-  //     mint = X
+  //   mint = X
   //
-  //   MintTo / MintToChecked, if present
-  //     mint = X
+  // Optional corroboration:
+  //   MintTo / MintToChecked
+  //   if present, must also identify X.
   //
-  // SAFETY:
-  //
-  // - CREATE events only.
-  // - Multiple candidates only.
-  // - Rules 1-3 must already have failed.
-  // - Exactly one unique Pump Create expected mint.
-  // - Exactly one unique initialized mint.
-  // - Both must be token-balance candidates.
-  // - Pump Create mint MUST equal initialized mint.
-  // - If MintTo evidence exists, it must resolve
-  //   uniquely and agree with the same mint.
-  // - Any ambiguity or disagreement fails closed.
+  // Any ambiguity or disagreement fails closed.
   // ----------------------------------------------
 
   if (
@@ -4428,10 +4331,6 @@ function inferPrimaryMint(tx) {
 
     // --------------------------------------------
     // PUMP CREATE STRUCTURE
-    //
-    // Validated shadow schema:
-    //   20 accounts
-    //   account[0] = newly created mint
     // --------------------------------------------
 
     for (
@@ -4456,11 +4355,6 @@ function inferPrimaryMint(tx) {
         typeof expectedMint !== "string" ||
         !candidateSet.has(expectedMint)
       ) {
-        // A qualifying 20-account Pump Create
-        // structure points outside our candidate
-        // set.
-        //
-        // Fail closed.
         return null;
       }
 
@@ -4468,10 +4362,6 @@ function inferPrimaryMint(tx) {
         expectedMint
       );
     }
-
-    // --------------------------------------------
-    // REQUIRE A UNIQUE PUMP CREATE ANSWER
-    // --------------------------------------------
 
     if (
       qualifyingCreateInstructionCount === 0 ||
@@ -4483,92 +4373,174 @@ function inferPrimaryMint(tx) {
     // --------------------------------------------
     // TOKEN-PROGRAM CREATION SIGNALS
     //
-    // Scan parsed outer and inner instructions for:
+    // Whitelist:
     //
-    //   InitializeMint
-    //   InitializeMint2
-    //   MintTo
-    //   MintToChecked
-    //
-    // InitializeMint is required.
-    // MintTo is corroborating evidence when present.
+    // SPL Token
+    // Token-2022
     // --------------------------------------------
 
-function inspectRule5TokenInstruction(ix) {
-  // --------------------------------------------
-  // RULE 5 TOKEN-PROGRAM WHITELIST
-  //
-  // Only accept mint lifecycle evidence from:
-  //
-  //   1. Original SPL Token Program
-  //   2. Token-2022 Program
-  //
-  // Ignore similarly named parsed instructions
-  // from any other program.
-  // --------------------------------------------
+    function inspectRule5TokenInstruction(ix) {
+      const isSupportedTokenProgram =
+        ix?.programId ===
+          SPL_TOKEN_PROGRAM_ID ||
+        ix?.programId ===
+          TOKEN_2022_PROGRAM_ID;
 
-  const isSupportedTokenProgram =
-    ix?.programId === SPL_TOKEN_PROGRAM_ID ||
-    ix?.programId === TOKEN_2022_PROGRAM_ID;
+      if (!isSupportedTokenProgram) {
+        return;
+      }
 
-  if (!isSupportedTokenProgram) {
-    return;
-  }
+      const parsed =
+        ix?.parsed ?? null;
 
-  const parsed =
-    ix?.parsed ?? null;
+      if (!parsed) {
+        return;
+      }
 
-  if (!parsed) {
-    return;
-  }
+      const type =
+        parsed?.type ?? null;
 
-  const type =
-    parsed?.type ?? null;
+      const mint =
+        parsed?.info?.mint ?? null;
 
-  const mint =
-    parsed?.info?.mint ?? null;
+      // InitializeMint is required evidence.
 
-  // --------------------------------------------
-  // INITIALIZE MINT
-  //
-  // This is required evidence for Rule 5.
-  // --------------------------------------------
+      if (
+        type === "initializeMint" ||
+        type === "initializeMint2"
+      ) {
+        if (
+          typeof mint === "string"
+        ) {
+          rule5InitializeMints.add(
+            mint
+          );
+        }
 
-  if (
-    type === "initializeMint" ||
-    type === "initializeMint2"
-  ) {
-    if (
-      typeof mint === "string"
-    ) {
-      rule5InitializeMints.add(
-        mint
-      );
+        return;
+      }
+
+      // MintTo is optional corroborating evidence.
+
+      if (
+        type === "mintTo" ||
+        type === "mintToChecked"
+      ) {
+        if (
+          typeof mint === "string"
+        ) {
+          rule5MintToMints.add(
+            mint
+          );
+        }
+      }
     }
 
-    return;
-  }
+    // --------------------------------------------
+    // SCAN OUTER TOKEN INSTRUCTIONS
+    // --------------------------------------------
 
-  // --------------------------------------------
-  // MINT TO
-  //
-  // Supporting / consistency evidence.
-  // If present, it must ultimately agree with
-  // Pump Create + InitializeMint.
-  // --------------------------------------------
-
-  if (
-    type === "mintTo" ||
-    type === "mintToChecked"
-  ) {
-    if (
-      typeof mint === "string"
+    for (
+      const ix
+      of outerInstructions
     ) {
-      rule5MintToMints.add(
-        mint
-      );
+      inspectRule5TokenInstruction(ix);
     }
+
+    // --------------------------------------------
+    // SCAN INNER TOKEN INSTRUCTIONS
+    // --------------------------------------------
+
+    for (
+      const group
+      of innerGroups
+    ) {
+      const instructions =
+        group?.instructions || [];
+
+      for (
+        const ix
+        of instructions
+      ) {
+        inspectRule5TokenInstruction(ix);
+      }
+    }
+
+    // --------------------------------------------
+    // REQUIRE ONE UNIQUE INITIALIZED MINT
+    // --------------------------------------------
+
+    if (
+      rule5InitializeMints.size !== 1
+    ) {
+      return null;
+    }
+
+    const createMint =
+      Array.from(
+        rule5CreateExpectedMints
+      )[0];
+
+    const initializeMint =
+      Array.from(
+        rule5InitializeMints
+      )[0];
+
+    // --------------------------------------------
+    // CREATE + INITIALIZEMINT MUST AGREE
+    // --------------------------------------------
+
+    if (
+      !candidateSet.has(createMint) ||
+      !candidateSet.has(initializeMint) ||
+      createMint !== initializeMint
+    ) {
+      return null;
+    }
+
+    // --------------------------------------------
+    // MINTTO CONSISTENCY CHECK
+    //
+    // MintTo is optional.
+    // If present, it must uniquely agree.
+    // --------------------------------------------
+
+    if (
+      rule5MintToMints.size > 0
+    ) {
+      if (
+        rule5MintToMints.size !== 1
+      ) {
+        return null;
+      }
+
+      const mintToMint =
+        Array.from(
+          rule5MintToMints
+        )[0];
+
+      if (
+        !candidateSet.has(mintToMint) ||
+        mintToMint !== createMint
+      ) {
+        return null;
+      }
+    }
+
+    // --------------------------------------------
+    // RULE 5 RESOLVED
+    // --------------------------------------------
+
+    stats.resolvedMultipleCandidateRule5 += 1;
+
+    return createMint;
   }
+
+  // ----------------------------------------------
+  // NO SAFE RESOLUTION
+  // ----------------------------------------------
+
+  return null;
 }
 // ==================================================
 // 10D-3. ONE-CANDIDATE VALIDATION DIAGNOSTIC

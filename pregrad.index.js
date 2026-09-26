@@ -7178,57 +7178,272 @@ async function upsertLaunchpadToken(token) {
   return false;
 }
 
+function calculateEventMarketData(event) {
+  if (
+    !["buy", "sell"].includes(
+      event?.event_type
+    )
+  ) {
+    return null;
+  }
+
+  const priceSol = Number(
+    event?.price_per_token || 0
+  );
+
+  if (
+    !Number.isFinite(priceSol) ||
+    priceSol <= 0
+  ) {
+    return null;
+  }
+
+  const marketCapSol =
+    priceSol * PREGRAD_TOKEN_SUPPLY;
+
+  const hasUsd =
+    Number.isFinite(SOL_PRICE_USD) &&
+    SOL_PRICE_USD > 0;
+
+  const latestPriceUsd =
+    hasUsd
+      ? priceSol * SOL_PRICE_USD
+      : null;
+
+  const marketCapUsd =
+    hasUsd
+      ? marketCapSol * SOL_PRICE_USD
+      : null;
+
+  return {
+    priceSol,
+    marketCapSol,
+    latestPriceUsd,
+    marketCapUsd,
+
+    solPriceUsd:
+      hasUsd
+        ? SOL_PRICE_USD
+        : null,
+  };
+}
 
 // ==================================================
 // 11C. EVENT INSERT
 // ==================================================
 
 async function insertLaunchpadEvent(event) {
+  const market =
+    calculateEventMarketData(event);
+
   const result = await timedPoolQuery(
     "sqlEventInsert",
     `
-    INSERT INTO pump_launchpad_events (
-      token_address,
-      signature,
-      slot,
-      block_time,
-      event_type,
-      wallet_address,
-      sol_amount,
-      token_amount,
-      price_per_token,
-      raw_json
+    WITH inserted_event AS (
+      INSERT INTO pump_launchpad_events (
+        token_address,
+        signature,
+        slot,
+        block_time,
+        event_type,
+        wallet_address,
+        sol_amount,
+        token_amount,
+        price_per_token,
+        market_cap_sol,
+        market_cap_usd,
+        sol_price_usd,
+        raw_json
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,
+        $8,$9,$10,$11,$12,$13
+      )
+
+      ON CONFLICT (signature)
+      DO NOTHING
+
+      RETURNING id
+    ),
+
+    updated_token AS (
+      UPDATE pump_launchpad_tokens
+      SET
+        latest_price_sol = $9,
+        market_cap_sol = $10,
+
+        latest_price = COALESCE(
+          $14,
+          latest_price
+        ),
+
+        market_cap_usd = COALESCE(
+          $11,
+          market_cap_usd
+        ),
+
+        fdv_usd = COALESCE(
+          $11,
+          fdv_usd
+        ),
+
+        ath_market_cap_sol = GREATEST(
+          COALESCE(
+            ath_market_cap_sol,
+            0
+          ),
+          $10
+        ),
+
+        atl_market_cap_sol = CASE
+          WHEN
+            atl_market_cap_sol IS NULL
+            OR atl_market_cap_sol = 0
+          THEN $10
+
+          ELSE LEAST(
+            atl_market_cap_sol,
+            $10
+          )
+        END,
+
+        ath_market_cap_usd = CASE
+          WHEN $11 IS NULL
+          THEN ath_market_cap_usd
+
+          ELSE GREATEST(
+            COALESCE(
+              ath_market_cap_usd,
+              0
+            ),
+            $11
+          )
+        END,
+
+        atl_market_cap_usd = CASE
+          WHEN $11 IS NULL
+          THEN atl_market_cap_usd
+
+          WHEN
+            atl_market_cap_usd IS NULL
+            OR atl_market_cap_usd = 0
+          THEN $11
+
+          ELSE LEAST(
+            atl_market_cap_usd,
+            $11
+          )
+        END,
+
+        updated_market_data_at = NOW(),
+        updated_at = NOW()
+
+      WHERE
+        token_address = $1
+
+        AND $5 IN (
+          'buy',
+          'sell'
+        )
+
+        AND $9 IS NOT NULL
+
+        AND $9 > 0
+
+        AND EXISTS (
+          SELECT 1
+          FROM inserted_event
+        )
+
+      RETURNING token_address
     )
-    VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
-    )
-    ON CONFLICT (signature) DO NOTHING
-    RETURNING id
+
+    SELECT
+      EXISTS (
+        SELECT 1
+        FROM inserted_event
+      ) AS inserted,
+
+      EXISTS (
+        SELECT 1
+        FROM updated_token
+      ) AS market_updated
     `,
     [
+      // $1
       event.token_address,
+
+      // $2
       event.signature,
+
+      // $3
       event.slot,
+
+      // $4
       event.block_time,
+
+      // $5
       event.event_type,
+
+      // $6
       event.wallet_address,
+
+      // $7
       event.sol_amount,
+
+      // $8
       event.token_amount,
-      event.price_per_token,
+
+      // $9
+      market?.priceSol ??
+        event.price_per_token ??
+        null,
+
+      // $10
+      market?.marketCapSol ?? null,
+
+      // $11
+      market?.marketCapUsd ?? null,
+
+      // $12
+      market?.solPriceUsd ?? null,
+
+      // $13
       STORE_RAW_EVENTS
         ? event.raw_json
         : null,
+
+      // $14
+      market?.latestPriceUsd ?? null,
     ]
   );
 
-  if (result.rowCount > 0) {
+  const inserted =
+    result.rows?.[0]?.inserted === true;
+
+  const marketUpdated =
+    result.rows?.[0]?.market_updated === true;
+
+  if (inserted) {
     stats.insertedEvents += 1;
+
+    if (
+      ["buy", "sell"].includes(
+        event.event_type
+      )
+    ) {
+      if (marketUpdated) {
+        stats.updatedMarketData += 1;
+      } else if (!market) {
+        stats.skippedMarketDataUpdate += 1;
+      }
+    }
+
     return true;
   }
 
   return false;
 }
-
 
 // ==================================================
 // 11D. LIVE MARKET DATA
@@ -8208,21 +8423,8 @@ if (!classified.ok) {
         return;
       }
 
-      // --------------------------------------------
-      // LIVE MARKET DATA
-      // --------------------------------------------
-
-      if (
-        ["buy", "sell"].includes(
-          event.event_type
-        )
-      ) {
-        await updateLaunchpadMarketDataFromEvent(
-          event
-        );
-      }
-
-      // --------------------------------------------
+ 
+     // --------------------------------------------
       // GRADUATION
       // --------------------------------------------
 

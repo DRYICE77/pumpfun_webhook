@@ -484,6 +484,27 @@ rpcAttemptMaxMs: 0,
   dbWriteMaxMs: 0,
 
   // ==========================================
+// DATABASE CONNECTION / QUERY DIAGNOSTICS
+// ==========================================
+
+// Time spent waiting for pool.connect()
+dbPoolAcquireSamples: 0,
+dbPoolAcquireTotalMs: 0,
+dbPoolAcquireMaxMs: 0,
+
+// Time spent executing SQL after a client
+// has already been acquired.
+dbQueryExecutionSamples: 0,
+dbQueryExecutionTotalMs: 0,
+dbQueryExecutionMaxMs: 0,
+
+// Slow-query buckets.
+dbQueriesOver250ms: 0,
+dbQueriesOver500ms: 0,
+dbQueriesOver1000ms: 0,
+dbQueriesOver5000ms: 0,
+
+  // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
 
@@ -713,6 +734,65 @@ function getPerformanceSummary(
   };
 }
 
+function recordDbDiagnosticTiming(
+  category,
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  let samplesKey;
+  let totalKey;
+  let maxKey;
+
+  if (category === "poolAcquire") {
+    samplesKey = "dbPoolAcquireSamples";
+    totalKey = "dbPoolAcquireTotalMs";
+    maxKey = "dbPoolAcquireMaxMs";
+  } else if (category === "queryExecution") {
+    samplesKey = "dbQueryExecutionSamples";
+    totalKey = "dbQueryExecutionTotalMs";
+    maxKey = "dbQueryExecutionMaxMs";
+  } else {
+    return;
+  }
+
+  stats[samplesKey] += 1;
+  stats[totalKey] += durationMs;
+
+  stats[maxKey] = Math.max(
+    stats[maxKey],
+    durationMs
+  );
+}
+
+
+function recordSlowDbQuery(durationMs) {
+  if (!Number.isFinite(durationMs)) {
+    return;
+  }
+
+  if (durationMs >= 250) {
+    stats.dbQueriesOver250ms += 1;
+  }
+
+  if (durationMs >= 500) {
+    stats.dbQueriesOver500ms += 1;
+  }
+
+  if (durationMs >= 1000) {
+    stats.dbQueriesOver1000ms += 1;
+  }
+
+  if (durationMs >= 5000) {
+    stats.dbQueriesOver5000ms += 1;
+  }
+}
+
 
 // ==================================================
 // 6B. TIMED DATABASE QUERY
@@ -743,18 +823,57 @@ async function timedPoolQuery(
   sql,
   params = []
 ) {
-  const startedAt =
+  const totalStartedAt =
     performanceNow();
 
+  const acquireStartedAt =
+    performanceNow();
+
+  let client = null;
+
   try {
-    return await pool.query(
-      sql,
-      params
+    client = await pool.connect();
+
+    const acquireDurationMs =
+      performanceNow() -
+      acquireStartedAt;
+
+    recordDbDiagnosticTiming(
+      "poolAcquire",
+      acquireDurationMs
     );
+
+    const queryStartedAt =
+      performanceNow();
+
+    try {
+      return await client.query(
+        sql,
+        params
+      );
+    } finally {
+      const queryDurationMs =
+        performanceNow() -
+        queryStartedAt;
+
+      recordDbDiagnosticTiming(
+        "queryExecution",
+        queryDurationMs
+      );
+
+      recordSlowDbQuery(
+        queryDurationMs
+      );
+    }
   } finally {
+    if (client) {
+      client.release();
+    }
+
     recordPerformanceTiming(
       category,
-      performanceNow() - startedAt
+      performanceNow() -
+        totalStartedAt
     );
   }
 }
@@ -9077,9 +9196,13 @@ let previousLogAt =
 // • Incoming, drain, insert and processing rates
 // • Cumulative scanner counters
 //
-// Additional performance diagnostics:
-// • RPC fetch latency
-// • Database-write latency
+// Performance diagnostics:
+// • RPC fetch lifecycle latency
+// • Pure RPC attempt latency
+// • Total database-write latency
+// • PostgreSQL pool-acquisition latency
+// • PostgreSQL query-execution latency
+// • Slow database-query distribution
 // • Total signature-processing latency
 // • Completed and ongoing intake-pause duration
 // • PostgreSQL connection-pool pressure
@@ -9132,14 +9255,20 @@ function startQueueLogger() {
 
         const incomingPerSecond = Number(
           (
-            (stats.queued - previousStats.queued) /
+            (
+              stats.queued -
+              previousStats.queued
+            ) /
             seconds
           ).toFixed(2)
         );
 
         const drainedPerSecond = Number(
           (
-            (stats.dequeued - previousStats.dequeued) /
+            (
+              stats.dequeued -
+              previousStats.dequeued
+            ) /
             seconds
           ).toFixed(2)
         );
@@ -9149,7 +9278,8 @@ function startQueueLogger() {
             (
               stats.insertedEvents -
               previousStats.insertedEvents
-            ) / seconds
+            ) /
+            seconds
           ).toFixed(2)
         );
 
@@ -9158,7 +9288,8 @@ function startQueueLogger() {
             (
               stats.processed -
               previousStats.processed
-            ) / seconds
+            ) /
+            seconds
           ).toFixed(2)
         );
 
@@ -9169,20 +9300,111 @@ function startQueueLogger() {
         // Includes samples, average and maximum.
         // ------------------------------------------
 
-       const rpcFetchPerformance =
-  getPerformanceSummary("rpcFetch");
+        const rpcFetchPerformance =
+          getPerformanceSummary(
+            "rpcFetch"
+          );
 
-const rpcAttemptPerformance =
-  getPerformanceSummary("rpcAttempt");
+        const rpcAttemptPerformance =
+          getPerformanceSummary(
+            "rpcAttempt"
+          );
 
-const dbWritePerformance =
-  getPerformanceSummary("dbWrite");
+        const dbWritePerformance =
+          getPerformanceSummary(
+            "dbWrite"
+          );
+
+        // ------------------------------------------
+        // DATABASE DIAGNOSTIC SUMMARIES
+        //
+        // Pool acquisition:
+        // Time spent waiting for pool.connect().
+        //
+        // Query execution:
+        // Time spent executing SQL after a client
+        // has already been acquired.
+        // ------------------------------------------
+
+        const dbPoolAcquirePerformance = {
+          samples:
+            stats.dbPoolAcquireSamples,
+
+          avgMs:
+            stats.dbPoolAcquireSamples > 0
+              ? Number(
+                  (
+                    stats.dbPoolAcquireTotalMs /
+                    stats.dbPoolAcquireSamples
+                  ).toFixed(2)
+                )
+              : null,
+
+          maxMs:
+            stats.dbPoolAcquireSamples > 0
+              ? Number(
+                  stats.dbPoolAcquireMaxMs.toFixed(
+                    2
+                  )
+                )
+              : null,
+        };
+
+        const dbQueryExecutionPerformance = {
+          samples:
+            stats.dbQueryExecutionSamples,
+
+          avgMs:
+            stats.dbQueryExecutionSamples > 0
+              ? Number(
+                  (
+                    stats.dbQueryExecutionTotalMs /
+                    stats.dbQueryExecutionSamples
+                  ).toFixed(2)
+                )
+              : null,
+
+          maxMs:
+            stats.dbQueryExecutionSamples > 0
+              ? Number(
+                  stats.dbQueryExecutionMaxMs.toFixed(
+                    2
+                  )
+                )
+              : null,
+        };
+
+        // ------------------------------------------
+        // SLOW DATABASE QUERY DISTRIBUTION
+        //
+        // Thresholds are cumulative. Therefore a
+        // query taking 6 seconds contributes to all
+        // four threshold counters.
+        // ------------------------------------------
+
+        const slowDbQueries = {
+          over250ms:
+            stats.dbQueriesOver250ms,
+
+          over500ms:
+            stats.dbQueriesOver500ms,
+
+          over1000ms:
+            stats.dbQueriesOver1000ms,
+
+          over5000ms:
+            stats.dbQueriesOver5000ms,
+        };
 
         const processingPerformance =
-          getPerformanceSummary("processing");
+          getPerformanceSummary(
+            "processing"
+          );
 
         const intakePausePerformance =
-          getPerformanceSummary("intakePause");
+          getPerformanceSummary(
+            "intakePause"
+          );
 
         // ------------------------------------------
         // CURRENT INTAKE PAUSE
@@ -9196,7 +9418,8 @@ const dbWritePerformance =
           intakePausedAt !== null
             ? Math.max(
                 Math.round(
-                  performanceNow() - intakePausedAt
+                  performanceNow() -
+                    intakePausedAt
                 ),
                 0
               )
@@ -9296,7 +9519,8 @@ const dbWritePerformance =
             oldestSignatureAgeMs:
               oldest
                 ? Math.max(
-                    now - oldest.enqueuedAt,
+                    now -
+                      oldest.enqueuedAt,
                     0
                   )
                 : 0,
@@ -9307,12 +9531,21 @@ const dbWritePerformance =
             insertedPerSecond,
             processedPerSecond,
 
-            // Cumulative latency summaries
-         rpcFetchPerformance,
-rpcAttemptPerformance,
-dbWritePerformance,
-processingPerformance,
-intakePausePerformance,
+            // RPC latency
+            rpcFetchPerformance,
+            rpcAttemptPerformance,
+
+            // Database latency
+            dbWritePerformance,
+            dbPoolAcquirePerformance,
+            dbQueryExecutionPerformance,
+            slowDbQueries,
+
+            // Total processing latency
+            processingPerformance,
+
+            // Intake-pause latency
+            intakePausePerformance,
 
             // Ongoing pause duration
             currentPauseMs,
@@ -9323,7 +9556,8 @@ intakePausePerformance,
             // Actual active settings
             effectiveConfiguration,
 
-            // Preserve every existing counter
+            // Preserve every existing counter,
+            // including raw DB diagnostic counters.
             ...stats,
           }
         );
@@ -9354,7 +9588,8 @@ intakePausePerformance,
           "Scanner stats logging failed",
           {
             error: String(
-              error?.message || error
+              error?.message ||
+                error
             ),
           }
         );

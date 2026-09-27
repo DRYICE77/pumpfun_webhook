@@ -7327,6 +7327,8 @@ function calculateEventMarketData(event) {
 //
 // Strict ordering:
 //
+//   acquire PostgreSQL client
+//        ↓
 //   token UPSERT
 //        ↓
 //   event INSERT
@@ -7339,6 +7341,21 @@ function calculateEventMarketData(event) {
 // • Transaction still commits token metadata safely.
 //
 // One PostgreSQL client is held for the complete write.
+//
+// Performance diagnostics:
+//
+// • Pool-acquisition time is measured separately.
+// • Transaction execution time begins only after the
+//   PostgreSQL client has been acquired.
+// • Transaction execution includes:
+//     - BEGIN
+//     - token UPSERT
+//     - event INSERT
+//     - optional market UPDATE
+//     - COMMIT / ROLLBACK
+// • Slow transaction thresholds are recorded.
+//
+// No additional database queries are introduced.
 // ==================================================
 
 async function writeLaunchpadTokenAndEvent(
@@ -7356,7 +7373,35 @@ async function writeLaunchpadTokenAndEvent(
   const market =
     calculateEventMarketData(event);
 
-  const client = await pool.connect();
+  // ================================================
+  // DATABASE CONNECTION ACQUISITION
+  //
+  // Measure time spent waiting for an available
+  // PostgreSQL client separately from transaction
+  // execution.
+  // ================================================
+
+  const acquireStartedAt =
+    performanceNow();
+
+  const client =
+    await pool.connect();
+
+  const acquireDurationMs =
+    performanceNow() -
+    acquireStartedAt;
+
+  recordDbDiagnosticTiming(
+    "poolAcquire",
+    acquireDurationMs
+  );
+
+  // ================================================
+  // TRANSACTION EXECUTION TIMER
+  //
+  // Starts only after a PostgreSQL client has been
+  // successfully acquired.
+  // ================================================
 
   const writeStartedAt =
     performanceNow();
@@ -7496,7 +7541,6 @@ async function writeLaunchpadTokenAndEvent(
     tokenWritten =
       tokenResult.rowCount > 0;
 
-
     // ================================================
     // STEP 2 — EVENT INSERT
     //
@@ -7558,7 +7602,6 @@ async function writeLaunchpadTokenAndEvent(
 
     inserted =
       eventResult.rowCount > 0;
-
 
     // ================================================
     // STEP 3 — MARKET UPDATE
@@ -7674,13 +7717,11 @@ async function writeLaunchpadTokenAndEvent(
         marketResult.rowCount > 0;
     }
 
-
     // ================================================
     // COMMIT
     // ================================================
 
     await client.query("COMMIT");
-
 
     // ================================================
     // STATS
@@ -7732,28 +7773,46 @@ async function writeLaunchpadTokenAndEvent(
 
   } finally {
     // ================================================
-    // PERFORMANCE
+    // TRANSACTION PERFORMANCE
     //
-    // Record the entire transaction:
+    // Measures everything after client acquisition:
     //
-    // • connection already acquired
     // • BEGIN
     // • token UPSERT
     // • event INSERT
     // • optional market UPDATE
     // • COMMIT / ROLLBACK
+    //
+    // Pool-acquisition time is measured separately.
     // ================================================
 
+    const queryDurationMs =
+      performanceNow() -
+      writeStartedAt;
+
+    // Preserve the existing SQL timing counter.
     recordPerformanceTiming(
       "sqlEventInsert",
-      performanceNow() - writeStartedAt
+      queryDurationMs
     );
 
+    // New diagnostic: transaction execution after
+    // PostgreSQL client acquisition.
+    recordDbDiagnosticTiming(
+      "queryExecution",
+      queryDurationMs
+    );
+
+    // New diagnostic: cumulative slow-transaction
+    // threshold buckets.
+    recordSlowDbQuery(
+      queryDurationMs
+    );
+
+    // Always return the client to the pool.
     client.release();
   }
 }
-
-
 // ==================================================
 // 11D. GRADUATION UPDATE
 //

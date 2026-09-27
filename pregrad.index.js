@@ -432,14 +432,19 @@ sqlGraduationUpdateMaxMs: 0,
   unresolvedCandidatesNoPumpSuffix: 0,
   unresolvedCandidatesWithPumpSuffix: 0,
 
-  // ==========================================
-  // ERRORS
-  // ==========================================
+// ==========================================
+// ERRORS
+// ==========================================
 
-  txFetchErrors: 0,
-  workerErrors: 0,
-  rpcRetries: 0,
-  controlFetchErrors: 0,
+txFetchErrors: 0,
+workerErrors: 0,
+
+rpcRetries: 0,
+rpcNullRetries: 0,
+rpcRateLimitedRetries: 0,
+rpcOtherRetries: 0,
+
+controlFetchErrors: 0,
 
   // ==========================================
   // EVENT CLASSIFICATION
@@ -1220,10 +1225,14 @@ async function fetchFullTransaction(signature) {
 
         // ------------------------------------------
         // NULL RESPONSE RETRY
+        //
+        // Helius returned successfully, but the
+        // transaction was not available yet.
         // ------------------------------------------
 
         if (attempt < RPC_RETRY_COUNT) {
           stats.rpcRetries += 1;
+          stats.rpcNullRetries += 1;
 
           await sleep(
             RPC_RETRY_DELAY_MS *
@@ -1234,17 +1243,33 @@ async function fetchFullTransaction(signature) {
         lastError = error;
 
         // ------------------------------------------
+        // CLASSIFY RPC ERROR
+        // ------------------------------------------
+
+        const wasRateLimited =
+          error?.status === 429 ||
+          String(
+            error?.message || ""
+          ).includes("429");
+
+        // ------------------------------------------
         // RPC ERROR RETRY
+        //
+        // Preserve the existing retry behavior while
+        // separately counting:
+        //
+        // • Rate-limit retries
+        // • Other RPC-error retries
         // ------------------------------------------
 
         if (attempt < RPC_RETRY_COUNT) {
           stats.rpcRetries += 1;
 
-          const wasRateLimited =
-            error?.status === 429 ||
-            String(
-              error?.message || ""
-            ).includes("429");
+          if (wasRateLimited) {
+            stats.rpcRateLimitedRetries += 1;
+          } else {
+            stats.rpcOtherRetries += 1;
+          }
 
           await sleep(
             wasRateLimited
@@ -1280,6 +1305,15 @@ async function fetchFullTransaction(signature) {
     //
     // Compare this against rpcAttemptPerformance
     // to isolate retry/backoff overhead.
+    //
+    // Diagnostic invariant:
+    //
+    // rpcRetries should equal:
+    //
+    //   rpcNullRetries
+    // + rpcRateLimitedRetries
+    // + rpcOtherRetries
+    //
     // ----------------------------------------------
 
     recordPerformanceTiming(

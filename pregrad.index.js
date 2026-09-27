@@ -504,6 +504,26 @@ dbQueriesOver500ms: 0,
 dbQueriesOver1000ms: 0,
 dbQueriesOver5000ms: 0,
 
+  dbBeginSamples: 0,
+dbBeginTotalMs: 0,
+dbBeginMaxMs: 0,
+
+dbTokenUpsertSamples: 0,
+dbTokenUpsertTotalMs: 0,
+dbTokenUpsertMaxMs: 0,
+
+dbEventInsertSamples: 0,
+dbEventInsertTotalMs: 0,
+dbEventInsertMaxMs: 0,
+
+dbMarketUpdateSamples: 0,
+dbMarketUpdateTotalMs: 0,
+dbMarketUpdateMaxMs: 0,
+
+dbCommitSamples: 0,
+dbCommitTotalMs: 0,
+dbCommitMaxMs: 0,
+
   // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
@@ -564,7 +584,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-
 // ==================================================
 // 6A. PERFORMANCE DIAGNOSTICS
 //
@@ -575,18 +594,31 @@ function nowIso() {
 //
 // Measures:
 //
+// Core pipeline:
 // • Helius transaction fetch
+// • Individual Helius RPC attempts
 // • Complete database-write phase
 // • Complete signature processing
 // • Intake pauses
 //
-// Individual SQL operations:
-//
+// Existing SQL diagnostics:
 // • Token upsert
-// • Event insert
+// • Event insert / combined transaction
 // • Market token update
 // • Market event update
 // • Graduation update
+//
+// Database diagnostics:
+// • PostgreSQL pool acquisition
+// • Complete transaction execution
+// • Slow transaction thresholds
+//
+// Combined-write stage diagnostics:
+// • BEGIN
+// • Token UPSERT
+// • Event INSERT
+// • Market UPDATE
+// • COMMIT
 //
 // Uses counters defined in const stats.
 // ==================================================
@@ -598,6 +630,10 @@ function performanceNow() {
 }
 
 
+// ==================================================
+// CORE PERFORMANCE COUNTER MAP
+// ==================================================
+
 function getPerformanceCounterMap() {
   return {
     rpcFetch: {
@@ -607,10 +643,10 @@ function getPerformanceCounterMap() {
     },
 
     rpcAttempt: {
-  samples: "rpcAttemptSamples",
-  total: "rpcAttemptTotalMs",
-  max: "rpcAttemptMaxMs",
-},
+      samples: "rpcAttemptSamples",
+      total: "rpcAttemptTotalMs",
+      max: "rpcAttemptMaxMs",
+    },
 
     dbWrite: {
       samples: "dbWriteSamples",
@@ -663,6 +699,10 @@ function getPerformanceCounterMap() {
 }
 
 
+// ==================================================
+// CORE PERFORMANCE TIMING RECORDER
+// ==================================================
+
 function recordPerformanceTiming(
   category,
   durationMs
@@ -692,6 +732,10 @@ function recordPerformanceTiming(
   );
 }
 
+
+// ==================================================
+// CORE PERFORMANCE SUMMARY
+// ==================================================
 
 function getPerformanceSummary(
   category
@@ -734,6 +778,20 @@ function getPerformanceSummary(
   };
 }
 
+
+// ==================================================
+// DATABASE DIAGNOSTIC TIMING
+//
+// Measures:
+//
+// • poolAcquire
+//     Time waiting for pool.connect()
+//
+// • queryExecution
+//     Complete combined-write transaction after
+//     a PostgreSQL client has been acquired.
+// ==================================================
+
 function recordDbDiagnosticTiming(
   category,
   durationMs
@@ -750,19 +808,35 @@ function recordDbDiagnosticTiming(
   let maxKey;
 
   if (category === "poolAcquire") {
-    samplesKey = "dbPoolAcquireSamples";
-    totalKey = "dbPoolAcquireTotalMs";
-    maxKey = "dbPoolAcquireMaxMs";
-  } else if (category === "queryExecution") {
-    samplesKey = "dbQueryExecutionSamples";
-    totalKey = "dbQueryExecutionTotalMs";
-    maxKey = "dbQueryExecutionMaxMs";
+    samplesKey =
+      "dbPoolAcquireSamples";
+
+    totalKey =
+      "dbPoolAcquireTotalMs";
+
+    maxKey =
+      "dbPoolAcquireMaxMs";
+
+  } else if (
+    category === "queryExecution"
+  ) {
+    samplesKey =
+      "dbQueryExecutionSamples";
+
+    totalKey =
+      "dbQueryExecutionTotalMs";
+
+    maxKey =
+      "dbQueryExecutionMaxMs";
+
   } else {
     return;
   }
 
   stats[samplesKey] += 1;
-  stats[totalKey] += durationMs;
+
+  stats[totalKey] +=
+    durationMs;
 
   stats[maxKey] = Math.max(
     stats[maxKey],
@@ -771,8 +845,143 @@ function recordDbDiagnosticTiming(
 }
 
 
-function recordSlowDbQuery(durationMs) {
-  if (!Number.isFinite(durationMs)) {
+// ==================================================
+// COMBINED-WRITE STAGE DIAGNOSTICS
+//
+// Measures individual stages inside 11C:
+//
+// • begin
+// • tokenUpsert
+// • eventInsert
+// • marketUpdate
+// • commit
+//
+// These counters are observational only.
+// ==================================================
+
+function getDbStageCounterMap() {
+  return {
+    begin: {
+      samples: "dbBeginSamples",
+      total: "dbBeginTotalMs",
+      max: "dbBeginMaxMs",
+    },
+
+    tokenUpsert: {
+      samples: "dbTokenUpsertSamples",
+      total: "dbTokenUpsertTotalMs",
+      max: "dbTokenUpsertMaxMs",
+    },
+
+    eventInsert: {
+      samples: "dbEventInsertSamples",
+      total: "dbEventInsertTotalMs",
+      max: "dbEventInsertMaxMs",
+    },
+
+    marketUpdate: {
+      samples: "dbMarketUpdateSamples",
+      total: "dbMarketUpdateTotalMs",
+      max: "dbMarketUpdateMaxMs",
+    },
+
+    commit: {
+      samples: "dbCommitSamples",
+      total: "dbCommitTotalMs",
+      max: "dbCommitMaxMs",
+    },
+  };
+}
+
+
+function recordDbStageTiming(
+  category,
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  const counters =
+    getDbStageCounterMap()[category];
+
+  if (!counters) {
+    return;
+  }
+
+  stats[counters.samples] += 1;
+
+  stats[counters.total] +=
+    durationMs;
+
+  stats[counters.max] = Math.max(
+    stats[counters.max],
+    durationMs
+  );
+}
+
+
+function getDbStageSummary(
+  category
+) {
+  const counters =
+    getDbStageCounterMap()[category];
+
+  if (!counters) {
+    return null;
+  }
+
+  const samples =
+    stats[counters.samples];
+
+  const totalMs =
+    stats[counters.total];
+
+  const maxMs =
+    stats[counters.max];
+
+  return {
+    samples,
+
+    avgMs:
+      samples > 0
+        ? Number(
+            (
+              totalMs /
+              samples
+            ).toFixed(2)
+          )
+        : null,
+
+    maxMs:
+      samples > 0
+        ? Number(
+            maxMs.toFixed(2)
+          )
+        : null,
+  };
+}
+
+
+// ==================================================
+// SLOW DATABASE TRANSACTION DIAGNOSTICS
+//
+// Thresholds are cumulative:
+//
+// >500ms is also counted in >250ms.
+// >1000ms is also counted in >500ms and >250ms.
+// ==================================================
+
+function recordSlowDbQuery(
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
     return;
   }
 
@@ -792,7 +1001,6 @@ function recordSlowDbQuery(durationMs) {
     stats.dbQueriesOver5000ms += 1;
   }
 }
-
 
 // ==================================================
 // 6B. TIMED DATABASE QUERY
@@ -7329,11 +7537,15 @@ function calculateEventMarketData(event) {
 //
 //   acquire PostgreSQL client
 //        ↓
+//   BEGIN
+//        ↓
 //   token UPSERT
 //        ↓
 //   event INSERT
 //        ↓
-//   market UPDATE
+//   optional market UPDATE
+//        ↓
+//   COMMIT
 //
 // Duplicate signatures:
 // • Event insert returns no row.
@@ -7344,18 +7556,17 @@ function calculateEventMarketData(event) {
 //
 // Performance diagnostics:
 //
-// • Pool-acquisition time is measured separately.
-// • Transaction execution time begins only after the
-//   PostgreSQL client has been acquired.
-// • Transaction execution includes:
+// • Pool acquisition measured separately.
+// • Complete transaction measured separately.
+// • Individual transaction stages measured:
 //     - BEGIN
 //     - token UPSERT
 //     - event INSERT
-//     - optional market UPDATE
-//     - COMMIT / ROLLBACK
-// • Slow transaction thresholds are recorded.
+//     - market UPDATE
+//     - COMMIT
 //
-// No additional database queries are introduced.
+// No additional database queries.
+// No changes to ingestion behavior.
 // ==================================================
 
 async function writeLaunchpadTokenAndEvent(
@@ -7375,10 +7586,6 @@ async function writeLaunchpadTokenAndEvent(
 
   // ================================================
   // DATABASE CONNECTION ACQUISITION
-  //
-  // Measure time spent waiting for an available
-  // PostgreSQL client separately from transaction
-  // execution.
   // ================================================
 
   const acquireStartedAt =
@@ -7397,10 +7604,7 @@ async function writeLaunchpadTokenAndEvent(
   );
 
   // ================================================
-  // TRANSACTION EXECUTION TIMER
-  //
-  // Starts only after a PostgreSQL client has been
-  // successfully acquired.
+  // COMPLETE TRANSACTION TIMER
   // ================================================
 
   const writeStartedAt =
@@ -7411,11 +7615,29 @@ async function writeLaunchpadTokenAndEvent(
   let marketUpdated = false;
 
   try {
+
+    // ================================================
+    // BEGIN
+    // ================================================
+
+    const beginStartedAt =
+      performanceNow();
+
     await client.query("BEGIN");
+
+    recordDbStageTiming(
+      "begin",
+      performanceNow() -
+        beginStartedAt
+    );
+
 
     // ================================================
     // STEP 1 — TOKEN UPSERT
     // ================================================
+
+    const tokenUpsertStartedAt =
+      performanceNow();
 
     const tokenResult =
       await client.query(
@@ -7538,14 +7760,24 @@ async function writeLaunchpadTokenAndEvent(
         ]
       );
 
+    recordDbStageTiming(
+      "tokenUpsert",
+      performanceNow() -
+        tokenUpsertStartedAt
+    );
+
     tokenWritten =
       tokenResult.rowCount > 0;
+
 
     // ================================================
     // STEP 2 — EVENT INSERT
     //
     // Token is guaranteed to exist before this runs.
     // ================================================
+
+    const eventInsertStartedAt =
+      performanceNow();
 
     const eventResult =
       await client.query(
@@ -7600,8 +7832,15 @@ async function writeLaunchpadTokenAndEvent(
         ]
       );
 
+    recordDbStageTiming(
+      "eventInsert",
+      performanceNow() -
+        eventInsertStartedAt
+    );
+
     inserted =
       eventResult.rowCount > 0;
+
 
     // ================================================
     // STEP 3 — MARKET UPDATE
@@ -7621,6 +7860,9 @@ async function writeLaunchpadTokenAndEvent(
         event.event_type
       )
     ) {
+      const marketUpdateStartedAt =
+        performanceNow();
+
       const marketResult =
         await client.query(
           `
@@ -7713,15 +7955,32 @@ async function writeLaunchpadTokenAndEvent(
           ]
         );
 
+      recordDbStageTiming(
+        "marketUpdate",
+        performanceNow() -
+          marketUpdateStartedAt
+      );
+
       marketUpdated =
         marketResult.rowCount > 0;
     }
+
 
     // ================================================
     // COMMIT
     // ================================================
 
+    const commitStartedAt =
+      performanceNow();
+
     await client.query("COMMIT");
+
+    recordDbStageTiming(
+      "commit",
+      performanceNow() -
+        commitStartedAt
+    );
+
 
     // ================================================
     // STATS
@@ -7752,6 +8011,7 @@ async function writeLaunchpadTokenAndEvent(
     return inserted;
 
   } catch (error) {
+
     // ================================================
     // ROLLBACK
     // ================================================
@@ -7772,8 +8032,9 @@ async function writeLaunchpadTokenAndEvent(
     throw error;
 
   } finally {
+
     // ================================================
-    // TRANSACTION PERFORMANCE
+    // COMPLETE TRANSACTION PERFORMANCE
     //
     // Measures everything after client acquisition:
     //
@@ -7783,33 +8044,28 @@ async function writeLaunchpadTokenAndEvent(
     // • optional market UPDATE
     // • COMMIT / ROLLBACK
     //
-    // Pool-acquisition time is measured separately.
+    // Individual successful stages are measured
+    // independently above.
     // ================================================
 
     const queryDurationMs =
       performanceNow() -
       writeStartedAt;
 
-    // Preserve the existing SQL timing counter.
     recordPerformanceTiming(
       "sqlEventInsert",
       queryDurationMs
     );
 
-    // New diagnostic: transaction execution after
-    // PostgreSQL client acquisition.
     recordDbDiagnosticTiming(
       "queryExecution",
       queryDurationMs
     );
 
-    // New diagnostic: cumulative slow-transaction
-    // threshold buckets.
     recordSlowDbQuery(
       queryDurationMs
     );
 
-    // Always return the client to the pool.
     client.release();
   }
 }
@@ -9241,7 +9497,6 @@ let previousStats = {
 let previousLogAt =
   Date.now();
 
-
 // ==================================================
 // 16C. SCANNER STATS LOGGER
 //
@@ -9260,8 +9515,14 @@ let previousLogAt =
 // • Pure RPC attempt latency
 // • Total database-write latency
 // • PostgreSQL pool-acquisition latency
-// • PostgreSQL query-execution latency
-// • Slow database-query distribution
+// • Complete PostgreSQL transaction latency
+// • Individual combined-write transaction stages:
+//     - BEGIN
+//     - token UPSERT
+//     - event INSERT
+//     - market UPDATE
+//     - COMMIT
+// • Slow database-transaction distribution
 // • Total signature-processing latency
 // • Completed and ongoing intake-pause duration
 // • PostgreSQL connection-pool pressure
@@ -9381,8 +9642,8 @@ function startQueueLogger() {
         // Time spent waiting for pool.connect().
         //
         // Query execution:
-        // Time spent executing SQL after a client
-        // has already been acquired.
+        // Complete combined-write transaction after
+        // a PostgreSQL client has been acquired.
         // ------------------------------------------
 
         const dbPoolAcquirePerformance = {
@@ -9434,11 +9695,45 @@ function startQueueLogger() {
         };
 
         // ------------------------------------------
-        // SLOW DATABASE QUERY DISTRIBUTION
+        // COMBINED-WRITE STAGE SUMMARIES
+        //
+        // Individual stages inside the transaction.
+        //
+        // These allow us to identify exactly where
+        // transaction latency is being accumulated.
+        // ------------------------------------------
+
+        const dbBeginPerformance =
+          getDbStageSummary(
+            "begin"
+          );
+
+        const dbTokenUpsertPerformance =
+          getDbStageSummary(
+            "tokenUpsert"
+          );
+
+        const dbEventInsertPerformance =
+          getDbStageSummary(
+            "eventInsert"
+          );
+
+        const dbMarketUpdatePerformance =
+          getDbStageSummary(
+            "marketUpdate"
+          );
+
+        const dbCommitPerformance =
+          getDbStageSummary(
+            "commit"
+          );
+
+        // ------------------------------------------
+        // SLOW DATABASE TRANSACTION DISTRIBUTION
         //
         // Thresholds are cumulative. Therefore a
-        // query taking 6 seconds contributes to all
-        // four threshold counters.
+        // transaction taking 6 seconds contributes
+        // to all four threshold counters.
         // ------------------------------------------
 
         const slowDbQueries = {
@@ -9594,10 +9889,19 @@ function startQueueLogger() {
             rpcFetchPerformance,
             rpcAttemptPerformance,
 
-            // Database latency
+            // Overall database latency
             dbWritePerformance,
             dbPoolAcquirePerformance,
             dbQueryExecutionPerformance,
+
+            // Individual transaction stages
+            dbBeginPerformance,
+            dbTokenUpsertPerformance,
+            dbEventInsertPerformance,
+            dbMarketUpdatePerformance,
+            dbCommitPerformance,
+
+            // Slow transaction distribution
             slowDbQueries,
 
             // Total processing latency
@@ -9616,7 +9920,8 @@ function startQueueLogger() {
             effectiveConfiguration,
 
             // Preserve every existing counter,
-            // including raw DB diagnostic counters.
+            // including raw DB diagnostic and
+            // transaction-stage counters.
             ...stats,
           }
         );
@@ -9642,6 +9947,7 @@ function startQueueLogger() {
         };
 
         previousLogAt = now;
+
       } catch (error) {
         logError(
           "Scanner stats logging failed",
@@ -9652,6 +9958,7 @@ function startQueueLogger() {
             ),
           }
         );
+
       } finally {
         loggerRunning = false;
       }
@@ -9667,7 +9974,6 @@ function startQueueLogger() {
     }
   );
 }
-
 
 // ==================================================
 // 16D. TIMER SHUTDOWN

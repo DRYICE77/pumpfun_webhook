@@ -7052,34 +7052,27 @@ function maybeFinishRule4Diagnostic() {
 // PART 3 OF 4
 // Paste immediately after Part 2.
 // ==================================================
-
 // ==================================================
-// 11. PROVEN DATABASE WRITE PATH
+// 11. DATABASE WRITE PATH
 //
-// Performance diagnostics:
+// Purpose:
 //
-// Individual primary SQL operations are timed through
-// timedPoolQuery().
+// Preserve strict write ordering and data integrity:
 //
-// This does NOT change:
-// • SQL statements
-// • SQL parameters
-// • Query ordering
-// • Return values
-// • Error behavior
-// • Database transaction behavior
+//   1. Upsert token
+//   2. Insert event
+//   3. Update market state only if event was inserted
 //
-// Timed operations:
+// All primary writes use ONE checked-out PostgreSQL
+// client and ONE transaction.
 //
-// • Token upsert
-// • Event insert
-// • Market token update
-// • Market event update
-// • Graduation update
+// This avoids:
+// • Event-before-token foreign-key risk
+// • Updating the same row twice in writable CTEs
+// • Duplicate events advancing token market state
 //
-// Raw-event storage remains unchanged because it is
-// disabled by default and is outside the current
-// primary ingestion bottleneck investigation.
+// Graduation remains separate because migrate events
+// are rare and require explicit state promotion.
 // ==================================================
 
 
@@ -7120,136 +7113,8 @@ async function insertRawPregradEvent({
 
 
 // ==================================================
-// 11B. TOKEN UPSERT
+// 11B. MARKET DATA CALCULATION
 // ==================================================
-
-async function upsertLaunchpadToken(token) {
-  if (!token?.token_address) {
-    return false;
-  }
-
-  const result = await timedPoolQuery(
-    "sqlTokenUpsert",
-    `
-    INSERT INTO pump_launchpad_tokens (
-      token_address,
-      creator_wallet,
-      symbol,
-      name,
-      token_program,
-      created_at,
-      first_seen_signature,
-      first_seen_slot,
-      graduation_status,
-      graduated_at,
-      market_phase,
-      last_event_type,
-      last_seen_at,
-      updated_at
-    )
-    VALUES (
-      $1,$2,$3,$4,$5,$6,$7,
-      $8,$9,$10,$11,$12,$13,NOW()
-    )
-    ON CONFLICT (token_address)
-    DO UPDATE SET
-      creator_wallet = COALESCE(
-        pump_launchpad_tokens.creator_wallet,
-        EXCLUDED.creator_wallet
-      ),
-
-      symbol = COALESCE(
-        pump_launchpad_tokens.symbol,
-        EXCLUDED.symbol
-      ),
-
-      name = COALESCE(
-        pump_launchpad_tokens.name,
-        EXCLUDED.name
-      ),
-
-      token_program = COALESCE(
-        pump_launchpad_tokens.token_program,
-        EXCLUDED.token_program
-      ),
-
-      created_at = COALESCE(
-        pump_launchpad_tokens.created_at,
-        EXCLUDED.created_at
-      ),
-
-      first_seen_signature = COALESCE(
-        pump_launchpad_tokens.first_seen_signature,
-        EXCLUDED.first_seen_signature
-      ),
-
-      first_seen_slot = COALESCE(
-        pump_launchpad_tokens.first_seen_slot,
-        EXCLUDED.first_seen_slot
-      ),
-
-      graduation_status = CASE
-        WHEN
-          pump_launchpad_tokens.graduation_status =
-          'graduated'
-          THEN 'graduated'
-        ELSE EXCLUDED.graduation_status
-      END,
-
-      graduated_at = COALESCE(
-        pump_launchpad_tokens.graduated_at,
-        EXCLUDED.graduated_at
-      ),
-
-      market_phase = CASE
-        WHEN
-          pump_launchpad_tokens.market_phase IN (
-            'JUST_GRADUATED',
-            'POST_GRAD'
-          )
-          THEN
-            pump_launchpad_tokens.market_phase
-        ELSE EXCLUDED.market_phase
-      END,
-
-      last_event_type = COALESCE(
-        EXCLUDED.last_event_type,
-        pump_launchpad_tokens.last_event_type
-      ),
-
-      last_seen_at = COALESCE(
-        EXCLUDED.last_seen_at,
-        pump_launchpad_tokens.last_seen_at
-      ),
-
-      updated_at = NOW()
-
-    RETURNING token_address
-    `,
-    [
-      token.token_address,
-      token.creator_wallet,
-      token.symbol,
-      token.name,
-      token.token_program,
-      token.created_at,
-      token.first_seen_signature,
-      token.first_seen_slot,
-      token.graduation_status || "pre_grad",
-      token.graduated_at || null,
-      token.market_phase || "PRE_GRAD",
-      token.last_event_type || null,
-      token.last_seen_at || null,
-    ]
-  );
-
-  if (result.rowCount > 0) {
-    stats.insertedTokens += 1;
-    return true;
-  }
-
-  return false;
-}
 
 function calculateEventMarketData(event) {
   if (
@@ -7301,376 +7166,449 @@ function calculateEventMarketData(event) {
   };
 }
 
+
 // ==================================================
-// 11C. EVENT INSERT
+// 11C. COMBINED TOKEN + EVENT WRITE TRANSACTION
+//
+// IMPORTANT:
+//
+// Strict ordering:
+//
+//   token UPSERT
+//        ↓
+//   event INSERT
+//        ↓
+//   market UPDATE
+//
+// Duplicate signatures:
+// • Event insert returns no row.
+// • Market state does NOT advance.
+// • Transaction still commits token metadata safely.
+//
+// One PostgreSQL client is held for the complete write.
 // ==================================================
 
-async function insertLaunchpadEvent(event) {
+async function writeLaunchpadTokenAndEvent(
+  token,
+  event
+) {
+  if (
+    !token?.token_address ||
+    !event?.token_address ||
+    !event?.signature
+  ) {
+    return false;
+  }
+
   const market =
     calculateEventMarketData(event);
 
-  const result = await timedPoolQuery(
-    "sqlEventInsert",
-    `
-    WITH inserted_event AS (
-      INSERT INTO pump_launchpad_events (
-        token_address,
-        signature,
-        slot,
-        block_time,
-        event_type,
-        wallet_address,
-        sol_amount,
-        token_amount,
-        price_per_token,
-        market_cap_sol,
-        market_cap_usd,
-        sol_price_usd,
-        raw_json
-      )
-      VALUES (
-        $1,$2,$3,$4,$5,$6,$7,
-        $8,$9,$10,$11,$12,$13
-      )
+  const client = await pool.connect();
 
-      ON CONFLICT (signature)
-      DO NOTHING
+  const writeStartedAt =
+    performanceNow();
 
-      RETURNING id
-    ),
+  let tokenWritten = false;
+  let inserted = false;
+  let marketUpdated = false;
 
-    updated_token AS (
-      UPDATE pump_launchpad_tokens
-      SET
-        latest_price_sol = $9,
-        market_cap_sol = $10,
+  try {
+    await client.query("BEGIN");
 
-        latest_price = COALESCE(
-          $14,
-          latest_price
-        ),
+    // ================================================
+    // STEP 1 — TOKEN UPSERT
+    // ================================================
 
-        market_cap_usd = COALESCE(
-          $11,
-          market_cap_usd
-        ),
+    const tokenResult =
+      await client.query(
+        `
+        INSERT INTO pump_launchpad_tokens (
+          token_address,
+          creator_wallet,
+          symbol,
+          name,
+          token_program,
+          created_at,
+          first_seen_signature,
+          first_seen_slot,
+          graduation_status,
+          graduated_at,
+          market_phase,
+          last_event_type,
+          last_seen_at,
+          updated_at
+        )
 
-        fdv_usd = COALESCE(
-          $11,
-          fdv_usd
-        ),
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,
+          $8,$9,$10,$11,$12,$13,
+          NOW()
+        )
 
-        ath_market_cap_sol = GREATEST(
-          COALESCE(
-            ath_market_cap_sol,
-            0
+        ON CONFLICT (token_address)
+        DO UPDATE SET
+
+          creator_wallet = COALESCE(
+            pump_launchpad_tokens.creator_wallet,
+            EXCLUDED.creator_wallet
           ),
-          $10
-        ),
 
-        atl_market_cap_sol = CASE
-          WHEN
-            atl_market_cap_sol IS NULL
-            OR atl_market_cap_sol = 0
-          THEN $10
+          symbol = COALESCE(
+            pump_launchpad_tokens.symbol,
+            EXCLUDED.symbol
+          ),
 
-          ELSE LEAST(
-            atl_market_cap_sol,
-            $10
-          )
-        END,
+          name = COALESCE(
+            pump_launchpad_tokens.name,
+            EXCLUDED.name
+          ),
 
-        ath_market_cap_usd = CASE
-          WHEN $11 IS NULL
-          THEN ath_market_cap_usd
+          token_program = COALESCE(
+            pump_launchpad_tokens.token_program,
+            EXCLUDED.token_program
+          ),
 
-          ELSE GREATEST(
-            COALESCE(
-              ath_market_cap_usd,
-              0
-            ),
-            $11
-          )
-        END,
+          created_at = COALESCE(
+            pump_launchpad_tokens.created_at,
+            EXCLUDED.created_at
+          ),
 
-        atl_market_cap_usd = CASE
-          WHEN $11 IS NULL
-          THEN atl_market_cap_usd
+          first_seen_signature = COALESCE(
+            pump_launchpad_tokens.first_seen_signature,
+            EXCLUDED.first_seen_signature
+          ),
 
-          WHEN
-            atl_market_cap_usd IS NULL
-            OR atl_market_cap_usd = 0
-          THEN $11
+          first_seen_slot = COALESCE(
+            pump_launchpad_tokens.first_seen_slot,
+            EXCLUDED.first_seen_slot
+          ),
 
-          ELSE LEAST(
-            atl_market_cap_usd,
-            $11
-          )
-        END,
+          graduation_status = CASE
+            WHEN
+              pump_launchpad_tokens.graduation_status =
+              'graduated'
+            THEN 'graduated'
 
-        updated_market_data_at = NOW(),
-        updated_at = NOW()
+            ELSE EXCLUDED.graduation_status
+          END,
 
-      WHERE
-        token_address = $1
+          graduated_at = COALESCE(
+            pump_launchpad_tokens.graduated_at,
+            EXCLUDED.graduated_at
+          ),
 
-        AND $5 IN (
-          'buy',
-          'sell'
+          market_phase = CASE
+            WHEN
+              pump_launchpad_tokens.market_phase IN (
+                'JUST_GRADUATED',
+                'POST_GRAD'
+              )
+            THEN
+              pump_launchpad_tokens.market_phase
+
+            ELSE EXCLUDED.market_phase
+          END,
+
+          last_event_type = COALESCE(
+            EXCLUDED.last_event_type,
+            pump_launchpad_tokens.last_event_type
+          ),
+
+          last_seen_at = COALESCE(
+            EXCLUDED.last_seen_at,
+            pump_launchpad_tokens.last_seen_at
+          ),
+
+          updated_at = NOW()
+
+        RETURNING token_address
+        `,
+        [
+          token.token_address,
+          token.creator_wallet,
+          token.symbol,
+          token.name,
+          token.token_program,
+          token.created_at,
+          token.first_seen_signature,
+          token.first_seen_slot,
+          token.graduation_status || "pre_grad",
+          token.graduated_at || null,
+          token.market_phase || "PRE_GRAD",
+          token.last_event_type || null,
+          token.last_seen_at || null,
+        ]
+      );
+
+    tokenWritten =
+      tokenResult.rowCount > 0;
+
+
+    // ================================================
+    // STEP 2 — EVENT INSERT
+    //
+    // Token is guaranteed to exist before this runs.
+    // ================================================
+
+    const eventResult =
+      await client.query(
+        `
+        INSERT INTO pump_launchpad_events (
+          token_address,
+          signature,
+          slot,
+          block_time,
+          event_type,
+          wallet_address,
+          sol_amount,
+          token_amount,
+          price_per_token,
+          market_cap_sol,
+          market_cap_usd,
+          sol_price_usd,
+          raw_json
         )
 
-        AND $9 IS NOT NULL
-
-        AND $9 > 0
-
-        AND EXISTS (
-          SELECT 1
-          FROM inserted_event
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,
+          $8,$9,$10,$11,$12,$13
         )
 
-      RETURNING token_address
-    )
+        ON CONFLICT (signature)
+        DO NOTHING
 
-    SELECT
-      EXISTS (
-        SELECT 1
-        FROM inserted_event
-      ) AS inserted,
+        RETURNING id
+        `,
+        [
+          event.token_address,
+          event.signature,
+          event.slot,
+          event.block_time,
+          event.event_type,
+          event.wallet_address,
+          event.sol_amount,
+          event.token_amount,
 
-      EXISTS (
-        SELECT 1
-        FROM updated_token
-      ) AS market_updated
-    `,
-    [
-      // $1
-      event.token_address,
+          market?.priceSol ??
+            event.price_per_token ??
+            null,
 
-      // $2
-      event.signature,
+          market?.marketCapSol ?? null,
+          market?.marketCapUsd ?? null,
+          market?.solPriceUsd ?? null,
 
-      // $3
-      event.slot,
+          STORE_RAW_EVENTS
+            ? event.raw_json
+            : null,
+        ]
+      );
 
-      // $4
-      event.block_time,
+    inserted =
+      eventResult.rowCount > 0;
 
-      // $5
-      event.event_type,
 
-      // $6
-      event.wallet_address,
-
-      // $7
-      event.sol_amount,
-
-      // $8
-      event.token_amount,
-
-      // $9
-      market?.priceSol ??
-        event.price_per_token ??
-        null,
-
-      // $10
-      market?.marketCapSol ?? null,
-
-      // $11
-      market?.marketCapUsd ?? null,
-
-      // $12
-      market?.solPriceUsd ?? null,
-
-      // $13
-      STORE_RAW_EVENTS
-        ? event.raw_json
-        : null,
-
-      // $14
-      market?.latestPriceUsd ?? null,
-    ]
-  );
-
-  const inserted =
-    result.rows?.[0]?.inserted === true;
-
-  const marketUpdated =
-    result.rows?.[0]?.market_updated === true;
-
-  if (inserted) {
-    stats.insertedEvents += 1;
+    // ================================================
+    // STEP 3 — MARKET UPDATE
+    //
+    // ONLY:
+    // • newly inserted event
+    // • buy/sell
+    // • valid calculated market data
+    //
+    // Duplicate events can never advance market state.
+    // ================================================
 
     if (
+      inserted &&
+      market &&
       ["buy", "sell"].includes(
         event.event_type
       )
     ) {
-      if (marketUpdated) {
-        stats.updatedMarketData += 1;
-      } else if (!market) {
-        stats.skippedMarketDataUpdate += 1;
+      const marketResult =
+        await client.query(
+          `
+          UPDATE pump_launchpad_tokens
+
+          SET
+            latest_price_sol = $2,
+            market_cap_sol = $3,
+
+            latest_price = COALESCE(
+              $4,
+              latest_price
+            ),
+
+            market_cap_usd = COALESCE(
+              $5,
+              market_cap_usd
+            ),
+
+            fdv_usd = COALESCE(
+              $5,
+              fdv_usd
+            ),
+
+            ath_market_cap_sol =
+              GREATEST(
+                COALESCE(
+                  ath_market_cap_sol,
+                  0
+                ),
+                $3
+              ),
+
+            atl_market_cap_sol =
+              CASE
+                WHEN
+                  atl_market_cap_sol IS NULL
+                  OR atl_market_cap_sol = 0
+                THEN $3
+
+                ELSE LEAST(
+                  atl_market_cap_sol,
+                  $3
+                )
+              END,
+
+            ath_market_cap_usd =
+              CASE
+                WHEN $5 IS NULL
+                THEN ath_market_cap_usd
+
+                ELSE GREATEST(
+                  COALESCE(
+                    ath_market_cap_usd,
+                    0
+                  ),
+                  $5
+                )
+              END,
+
+            atl_market_cap_usd =
+              CASE
+                WHEN $5 IS NULL
+                THEN atl_market_cap_usd
+
+                WHEN
+                  atl_market_cap_usd IS NULL
+                  OR atl_market_cap_usd = 0
+                THEN $5
+
+                ELSE LEAST(
+                  atl_market_cap_usd,
+                  $5
+                )
+              END,
+
+            updated_market_data_at = NOW(),
+            updated_at = NOW()
+
+          WHERE token_address = $1
+
+          RETURNING token_address
+          `,
+          [
+            token.token_address,
+            market.priceSol,
+            market.marketCapSol,
+            market.latestPriceUsd,
+            market.marketCapUsd,
+          ]
+        );
+
+      marketUpdated =
+        marketResult.rowCount > 0;
+    }
+
+
+    // ================================================
+    // COMMIT
+    // ================================================
+
+    await client.query("COMMIT");
+
+
+    // ================================================
+    // STATS
+    //
+    // Only count committed work.
+    // ================================================
+
+    if (tokenWritten) {
+      stats.insertedTokens += 1;
+    }
+
+    if (inserted) {
+      stats.insertedEvents += 1;
+
+      if (
+        ["buy", "sell"].includes(
+          event.event_type
+        )
+      ) {
+        if (marketUpdated) {
+          stats.updatedMarketData += 1;
+        } else if (!market) {
+          stats.skippedMarketDataUpdate += 1;
+        }
       }
     }
 
-    return true;
+    return inserted;
+
+  } catch (error) {
+    // ================================================
+    // ROLLBACK
+    // ================================================
+
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      logError(
+        "Database rollback failed",
+        {
+          error:
+            rollbackError?.message ||
+            String(rollbackError),
+        }
+      );
+    }
+
+    throw error;
+
+  } finally {
+    // ================================================
+    // PERFORMANCE
+    //
+    // Record the entire transaction:
+    //
+    // • connection already acquired
+    // • BEGIN
+    // • token UPSERT
+    // • event INSERT
+    // • optional market UPDATE
+    // • COMMIT / ROLLBACK
+    // ================================================
+
+    recordPerformanceTiming(
+      "sqlEventInsert",
+      performanceNow() - writeStartedAt
+    );
+
+    client.release();
   }
-
-  return false;
-}
-
-// ==================================================
-// 11D. LIVE MARKET DATA
-// ==================================================
-
-async function updateLaunchpadMarketDataFromEvent(
-  event
-) {
-  if (!event?.token_address) {
-    return false;
-  }
-
-  const priceSol = Number(
-    event.price_per_token || 0
-  );
-
-  if (
-    !Number.isFinite(priceSol) ||
-    priceSol <= 0
-  ) {
-    stats.skippedMarketDataUpdate += 1;
-    return false;
-  }
-
-  const marketCapSol =
-    priceSol * PREGRAD_TOKEN_SUPPLY;
-
-  const hasUsd =
-    Number.isFinite(SOL_PRICE_USD) &&
-    SOL_PRICE_USD > 0;
-
-  const latestPriceUsd =
-    hasUsd
-      ? priceSol * SOL_PRICE_USD
-      : null;
-
-  const marketCapUsd =
-    hasUsd
-      ? marketCapSol * SOL_PRICE_USD
-      : null;
-
-
-  // ----------------------------------------------
-  // TOKEN MARKET-DATA UPDATE
-  // ----------------------------------------------
-
-  await timedPoolQuery(
-    "sqlMarketTokenUpdate",
-    `
-    UPDATE pump_launchpad_tokens
-    SET
-      latest_price_sol = $2,
-      market_cap_sol = $3,
-
-      latest_price = COALESCE(
-        $4,
-        latest_price
-      ),
-
-      market_cap_usd = COALESCE(
-        $5,
-        market_cap_usd
-      ),
-
-      fdv_usd = COALESCE(
-        $5,
-        fdv_usd
-      ),
-
-      ath_market_cap_sol = GREATEST(
-        COALESCE(ath_market_cap_sol, 0),
-        $3
-      ),
-
-      atl_market_cap_sol = CASE
-        WHEN
-          atl_market_cap_sol IS NULL
-          OR atl_market_cap_sol = 0
-          THEN $3
-        ELSE LEAST(
-          atl_market_cap_sol,
-          $3
-        )
-      END,
-
-      ath_market_cap_usd = CASE
-        WHEN $5 IS NULL
-          THEN ath_market_cap_usd
-        ELSE GREATEST(
-          COALESCE(ath_market_cap_usd, 0),
-          $5
-        )
-      END,
-
-      atl_market_cap_usd = CASE
-        WHEN $5 IS NULL
-          THEN atl_market_cap_usd
-        WHEN
-          atl_market_cap_usd IS NULL
-          OR atl_market_cap_usd = 0
-          THEN $5
-        ELSE LEAST(
-          atl_market_cap_usd,
-          $5
-        )
-      END,
-
-      updated_market_data_at = NOW(),
-      updated_at = NOW()
-
-    WHERE token_address = $1
-    `,
-    [
-      event.token_address,
-      priceSol,
-      marketCapSol,
-      latestPriceUsd,
-      marketCapUsd,
-    ]
-  );
-
-
-  // ----------------------------------------------
-  // EVENT MARKET-DATA UPDATE
-  // ----------------------------------------------
-
-  await timedPoolQuery(
-    "sqlMarketEventUpdate",
-    `
-    UPDATE pump_launchpad_events
-    SET
-      market_cap_sol = $2,
-      market_cap_usd = $3,
-      sol_price_usd = $4
-    WHERE signature = $1
-    `,
-    [
-      event.signature,
-      marketCapSol,
-      marketCapUsd,
-      hasUsd
-        ? SOL_PRICE_USD
-        : null,
-    ]
-  );
-
-  stats.updatedMarketData += 1;
-
-  return true;
 }
 
 
 // ==================================================
-// 11E. GRADUATION UPDATE
+// 11D. GRADUATION UPDATE
+//
+// Migrate events are rare, so graduation remains a
+// separate explicit update.
+//
+// The normal token upsert protects JUST_GRADUATED
+// and POST_GRAD from being overwritten afterward.
 // ==================================================
 
 async function markTokenGraduated(
@@ -7709,7 +7647,6 @@ async function markTokenGraduated(
     ]
   );
 }
-
 // ==================================================
 // 12. HOLDER ENRICHMENT
 //
@@ -8482,15 +8419,11 @@ if (!classified.ok) {
       // PRIMARY TOKEN WRITE
       // --------------------------------------------
 
-      await upsertLaunchpadToken(token);
-
-      // --------------------------------------------
-      // PRIMARY EVENT WRITE
-      // --------------------------------------------
-
-      inserted = await insertLaunchpadEvent(
-        event
-      );
+     inserted =
+  await writeLaunchpadTokenAndEvent(
+    token,
+    event
+  );
 
       permanentlySeen = true;
 

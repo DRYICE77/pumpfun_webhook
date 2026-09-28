@@ -525,6 +525,26 @@ dbCommitTotalMs: 0,
 dbCommitMaxMs: 0,
 
   // ==========================================
+// SLOW TRANSACTION FORENSICS
+//
+// For transactions >= 500ms, identify which
+// measured database stage consumed the most time.
+// ==========================================
+
+slowTxnForensicSamples: 0,
+
+slowTxnTokenUpsertDominant: 0,
+slowTxnCommitDominant: 0,
+slowTxnEventInsertDominant: 0,
+slowTxnMarketUpdateDominant: 0,
+slowTxnBeginDominant: 0,
+
+slowTxnUnclassified: 0,
+
+slowTxnDominantStageTotalMs: 0,
+slowTxnDominantStageMaxMs: 0,
+
+  // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
 
@@ -893,6 +913,97 @@ function getDbStageCounterMap() {
   };
 }
 
+// ==================================================
+// SLOW TRANSACTION FORENSICS
+//
+// Observation only.
+//
+// For transactions >= 500ms:
+// • Determine which measured DB stage was slowest.
+// • Increment one aggregate dominance counter.
+// • Do not log individual transactions.
+// • Do not add database work.
+// ==================================================
+
+function recordSlowTransactionForensic(
+  totalDurationMs,
+  stageDurations
+) {
+  if (
+    !Number.isFinite(totalDurationMs) ||
+    totalDurationMs < 500
+  ) {
+    return;
+  }
+
+  stats.slowTxnForensicSamples += 1;
+
+  const stages = [
+    ["begin", stageDurations?.begin],
+    ["tokenUpsert", stageDurations?.tokenUpsert],
+    ["eventInsert", stageDurations?.eventInsert],
+    ["marketUpdate", stageDurations?.marketUpdate],
+    ["commit", stageDurations?.commit],
+  ].filter(
+    ([, durationMs]) =>
+      Number.isFinite(durationMs) &&
+      durationMs >= 0
+  );
+
+  if (!stages.length) {
+    stats.slowTxnUnclassified += 1;
+    return;
+  }
+
+  let dominantStage = stages[0];
+
+  for (const stage of stages.slice(1)) {
+    if (stage[1] > dominantStage[1]) {
+      dominantStage = stage;
+    }
+  }
+
+  const [
+    dominantStageName,
+    dominantStageDurationMs,
+  ] = dominantStage;
+
+  switch (dominantStageName) {
+    case "begin":
+      stats.slowTxnBeginDominant += 1;
+      break;
+
+    case "tokenUpsert":
+      stats.slowTxnTokenUpsertDominant += 1;
+      break;
+
+    case "eventInsert":
+      stats.slowTxnEventInsertDominant += 1;
+      break;
+
+    case "marketUpdate":
+      stats.slowTxnMarketUpdateDominant += 1;
+      break;
+
+    case "commit":
+      stats.slowTxnCommitDominant += 1;
+      break;
+
+    default:
+      stats.slowTxnUnclassified += 1;
+      return;
+  }
+
+  stats.slowTxnDominantStageTotalMs +=
+    dominantStageDurationMs;
+
+  stats.slowTxnDominantStageMaxMs =
+    Math.max(
+      stats.slowTxnDominantStageMaxMs,
+      dominantStageDurationMs
+    );
+}
+
 
 function recordDbStageTiming(
   category,
@@ -1085,7 +1196,6 @@ async function timedPoolQuery(
     );
   }
 }
-
 
 // ==================================================
 // 6C. SIGNATURE HELPERS
@@ -7614,6 +7724,24 @@ async function writeLaunchpadTokenAndEvent(
   let inserted = false;
   let marketUpdated = false;
 
+  // ================================================
+  // PER-TRANSACTION STAGE DURATIONS
+  //
+  // Diagnostic only.
+  //
+  // These values let slow-transaction forensics
+  // identify which DB stage dominated transactions
+  // taking >= 500ms.
+  // ================================================
+
+  const stageDurations = {
+    begin: null,
+    tokenUpsert: null,
+    eventInsert: null,
+    marketUpdate: null,
+    commit: null,
+  };
+
   try {
 
     // ================================================
@@ -7625,10 +7753,13 @@ async function writeLaunchpadTokenAndEvent(
 
     await client.query("BEGIN");
 
+    stageDurations.begin =
+      performanceNow() -
+      beginStartedAt;
+
     recordDbStageTiming(
       "begin",
-      performanceNow() -
-        beginStartedAt
+      stageDurations.begin
     );
 
 
@@ -7760,10 +7891,13 @@ async function writeLaunchpadTokenAndEvent(
         ]
       );
 
+    stageDurations.tokenUpsert =
+      performanceNow() -
+      tokenUpsertStartedAt;
+
     recordDbStageTiming(
       "tokenUpsert",
-      performanceNow() -
-        tokenUpsertStartedAt
+      stageDurations.tokenUpsert
     );
 
     tokenWritten =
@@ -7832,10 +7966,13 @@ async function writeLaunchpadTokenAndEvent(
         ]
       );
 
+    stageDurations.eventInsert =
+      performanceNow() -
+      eventInsertStartedAt;
+
     recordDbStageTiming(
       "eventInsert",
-      performanceNow() -
-        eventInsertStartedAt
+      stageDurations.eventInsert
     );
 
     inserted =
@@ -7955,10 +8092,13 @@ async function writeLaunchpadTokenAndEvent(
           ]
         );
 
+      stageDurations.marketUpdate =
+        performanceNow() -
+        marketUpdateStartedAt;
+
       recordDbStageTiming(
         "marketUpdate",
-        performanceNow() -
-          marketUpdateStartedAt
+        stageDurations.marketUpdate
       );
 
       marketUpdated =
@@ -7975,10 +8115,13 @@ async function writeLaunchpadTokenAndEvent(
 
     await client.query("COMMIT");
 
+    stageDurations.commit =
+      performanceNow() -
+      commitStartedAt;
+
     recordDbStageTiming(
       "commit",
-      performanceNow() -
-        commitStartedAt
+      stageDurations.commit
     );
 
 
@@ -8064,6 +8207,19 @@ async function writeLaunchpadTokenAndEvent(
 
     recordSlowDbQuery(
       queryDurationMs
+    );
+
+    // ================================================
+    // SLOW TRANSACTION FORENSICS
+    //
+    // The helper ignores transactions below 500ms.
+    // For slow transactions, it determines which
+    // measured stage consumed the most time.
+    // ================================================
+
+    recordSlowTransactionForensic(
+      queryDurationMs,
+      stageDurations
     );
 
     client.release();

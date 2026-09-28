@@ -358,6 +358,29 @@ const tokenLastHolderEnrichedAt = new Map();
 const activeTokenDbWrites =
   new Map();
 
+// ==================================================
+// SHADOW PER-TOKEN SERIALIZER
+//
+// Diagnostic-only simulation.
+//
+// Models what would happen if combined database writes
+// for the SAME token were serialized.
+//
+// IMPORTANT:
+//
+// • Does NOT delay real writes.
+// • Does NOT change worker behavior.
+// • Does NOT acquire additional DB connections.
+// • Does NOT change SQL.
+// • Does NOT affect ingestion ordering.
+//
+// Each token stores the hypothetical time at which its
+// serialized write lane becomes available.
+// ==================================================
+
+const shadowTokenSerializer =
+  new Map();
+
 const SEEN_SIGNATURE_LIMIT = Number(
   process.env.SEEN_SIGNATURE_LIMIT || 100000
 );
@@ -584,6 +607,38 @@ slowCommitDominantWithoutSameTokenContention: 0,
 
 slowCommitDominantContentionDepthTotal: 0,
 slowCommitDominantContentionDepthMax: 0,
+
+  // ==========================================
+// SHADOW TOKEN SERIALIZATION
+//
+// Simulates per-token DB serialization without
+// changing production behavior.
+// ==========================================
+
+shadowSerializerSamples: 0,
+
+shadowSerializerImmediateSamples: 0,
+shadowSerializerWouldWaitSamples: 0,
+
+shadowSerializerWaitTotalMs: 0,
+shadowSerializerWaitMaxMs: 0,
+
+shadowSerializerDepth1: 0,
+shadowSerializerDepth2: 0,
+shadowSerializerDepth3Plus: 0,
+shadowSerializerQueueDepthMax: 0,
+  shadowSerializerResolvedSamples: 0,
+shadowSerializerCancelledSamples: 0,
+
+// Number of real writes that began while another
+// real write for the same token was active.
+allTokenWritesWithSameTokenContention: 0,
+allTokenWritesWithoutSameTokenContention: 0,
+
+// Total observed DB transaction execution time fed
+// into the shadow model.
+shadowSerializerObservedServiceTotalMs: 0,
+shadowSerializerObservedServiceMaxMs: 0,
 
   // ==========================================
 // SLOW TOKEN UPSERT CONTENTION FORENSICS
@@ -1279,6 +1334,357 @@ function beginTokenDbWrite(
   return existingDepth;
 }
 
+// ==================================================
+// BEGIN SHADOW TOKEN SERIALIZATION
+//
+// Creates a hypothetical reservation for this token.
+//
+// No waiting occurs.
+//
+// Returns the hypothetical queue state that existed
+// when this real write began.
+// ==================================================
+
+// ==================================================
+// BEGIN SHADOW TOKEN SERIALIZATION
+//
+// Diagnostic-only FIFO simulation.
+//
+// Creates an ordered shadow reservation for this
+// token without delaying the real database write.
+//
+// IMPORTANT:
+//
+// • Does NOT wait.
+// • Does NOT change worker behavior.
+// • Does NOT change database behavior.
+// • Does NOT change event ordering.
+// • Does NOT predict duration before it is known.
+//
+// The reservation is completed later by
+// finishShadowTokenSerialization(), which supplies
+// the observed DB transaction execution duration.
+// ==================================================
+
+function beginShadowTokenSerialization(
+  tokenAddress,
+  sameTokenContentionDepth = 0
+) {
+  if (!tokenAddress) {
+    return null;
+  }
+
+  const realStartedAt =
+    performanceNow();
+
+  // ----------------------------------------------
+  // GET / CREATE TOKEN SHADOW LANE
+  // ----------------------------------------------
+
+  let lane =
+    shadowTokenSerializer.get(
+      tokenAddress
+    );
+
+  if (!lane) {
+    lane = {
+      nextSequence: 1,
+
+      // Last hypothetical serialized finish time
+      // that has been fully resolved.
+      resolvedAvailableAt: null,
+
+      // Reservations waiting to be resolved in
+      // original arrival order.
+      writes: [],
+    };
+
+    shadowTokenSerializer.set(
+      tokenAddress,
+      lane
+    );
+  }
+
+  // ----------------------------------------------
+  // CREATE FIFO RESERVATION
+  // ----------------------------------------------
+
+  const sequence =
+    lane.nextSequence;
+
+  lane.nextSequence += 1;
+
+  const queueDepthAtArrival =
+    lane.writes.length;
+
+  const reservation = {
+    tokenAddress,
+    sequence,
+
+    realStartedAt,
+
+    sameTokenContentionDepth:
+      Number.isFinite(
+        sameTokenContentionDepth
+      )
+        ? Math.max(
+            0,
+            sameTokenContentionDepth
+          )
+        : 0,
+
+    queueDepthAtArrival,
+
+    // Filled by completion helper.
+    observedServiceMs: null,
+    completed: false,
+  };
+
+  lane.writes.push(
+    reservation
+  );
+
+  // ----------------------------------------------
+  // BASE POPULATION COUNTERS
+  // ----------------------------------------------
+
+  stats.shadowSerializerSamples += 1;
+
+  if (
+    reservation.sameTokenContentionDepth > 0
+  ) {
+    stats.allTokenWritesWithSameTokenContention +=
+      1;
+  } else {
+    stats.allTokenWritesWithoutSameTokenContention +=
+      1;
+  }
+
+  // ----------------------------------------------
+  // NOTE:
+  //
+  // Do NOT classify this reservation yet as:
+  //
+  // • immediate
+  // • would wait
+  // • depth 1 / 2 / 3+
+  // • hypothetical wait time
+  //
+  // Those values cannot be known correctly until
+  // predecessor service durations are available.
+  //
+  // finishShadowTokenSerialization() resolves them
+  // later in FIFO order.
+  // ----------------------------------------------
+
+  return reservation;
+}
+
+// ==================================================
+// FINISH SHADOW TOKEN SERIALIZATION
+//
+// Extends the hypothetical reservation using the
+// REAL observed transaction execution duration.
+//
+// This is intentionally a workload simulation:
+//
+// observed duration != predicted serialized duration.
+//
+// Contention may inflate the observed duration, so
+// shadow wait estimates should be interpreted as
+// conservative queue-pressure estimates.
+// ==================================================
+
+// ==================================================
+// FINISH SHADOW TOKEN SERIALIZATION
+//
+// Diagnostic-only FIFO simulation.
+//
+// Marks this reservation complete using the REAL
+// observed DB transaction execution duration.
+//
+// Then resolves as many completed reservations as
+// possible from the HEAD of this token's FIFO.
+//
+// IMPORTANT:
+//
+// • Does NOT delay real writes.
+// • Does NOT change database behavior.
+// • Does NOT change worker behavior.
+// • Resolves strictly in shadow arrival order.
+// • Uses observed transaction duration only after
+//   that duration is actually known.
+// ==================================================
+
+function finishShadowTokenSerialization(
+  reservation,
+  observedServiceMs
+) {
+  if (
+    !reservation?.tokenAddress ||
+    !Number.isFinite(observedServiceMs) ||
+    observedServiceMs < 0
+  ) {
+    return;
+  }
+
+  const tokenAddress =
+    reservation.tokenAddress;
+
+  const lane =
+    shadowTokenSerializer.get(
+      tokenAddress
+    );
+
+  if (!lane) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // MARK THIS RESERVATION COMPLETE
+  // ----------------------------------------------
+
+  reservation.observedServiceMs =
+    observedServiceMs;
+
+  reservation.completed = true;
+
+  stats.shadowSerializerObservedServiceTotalMs +=
+    observedServiceMs;
+
+  stats.shadowSerializerObservedServiceMaxMs =
+    Math.max(
+      stats.shadowSerializerObservedServiceMaxMs,
+      observedServiceMs
+    );
+
+  // ----------------------------------------------
+  // RESOLVE COMPLETED FIFO HEADS
+  //
+  // A later transaction may finish before an
+  // earlier transaction.
+  //
+  // We therefore resolve only while the HEAD of
+  // the queue has completed.
+  // ----------------------------------------------
+
+  while (
+    lane.writes.length > 0 &&
+    lane.writes[0].completed === true
+  ) {
+    const current =
+      lane.writes.shift();
+
+    stats.shadowSerializerResolvedSamples += 1;
+
+    // --------------------------------------------
+    // HYPOTHETICAL SERIALIZED START
+    //
+    // First write:
+    //   starts when it really arrived.
+    //
+    // Later write:
+    //   starts at the later of:
+    //
+    //   • its real arrival time
+    //   • previous serialized finish time
+    // --------------------------------------------
+
+    const previousAvailableAt =
+      Number.isFinite(
+        lane.resolvedAvailableAt
+      )
+        ? lane.resolvedAvailableAt
+        : current.realStartedAt;
+
+    const hypotheticalStartAt =
+      Math.max(
+        current.realStartedAt,
+        previousAvailableAt
+      );
+
+    const hypotheticalWaitMs =
+      Math.max(
+        0,
+        hypotheticalStartAt -
+          current.realStartedAt
+      );
+
+    const hypotheticalFinishAt =
+      hypotheticalStartAt +
+      current.observedServiceMs;
+
+    // --------------------------------------------
+    // CLASSIFY SHADOW RESULT
+    // --------------------------------------------
+
+    if (hypotheticalWaitMs > 0) {
+      stats.shadowSerializerWouldWaitSamples +=
+        1;
+
+      stats.shadowSerializerWaitTotalMs +=
+        hypotheticalWaitMs;
+
+      stats.shadowSerializerWaitMaxMs =
+        Math.max(
+          stats.shadowSerializerWaitMaxMs,
+          hypotheticalWaitMs
+        );
+
+      // queueDepthAtArrival represents how many
+      // unresolved shadow writes were already ahead
+      // of this write when it entered the lane.
+      const shadowDepth =
+        Math.max(
+          1,
+          current.queueDepthAtArrival || 0
+        );
+
+      stats.shadowSerializerQueueDepthMax =
+        Math.max(
+          stats.shadowSerializerQueueDepthMax,
+          shadowDepth
+        );
+
+      if (shadowDepth === 1) {
+        stats.shadowSerializerDepth1 += 1;
+
+      } else if (shadowDepth === 2) {
+        stats.shadowSerializerDepth2 += 1;
+
+      } else {
+        stats.shadowSerializerDepth3Plus += 1;
+      }
+
+    } else {
+      stats.shadowSerializerImmediateSamples +=
+        1;
+    }
+
+    // --------------------------------------------
+    // ADVANCE HYPOTHETICAL SERIALIZED LANE
+    // --------------------------------------------
+
+    lane.resolvedAvailableAt =
+      hypotheticalFinishAt;
+  }
+
+  // ----------------------------------------------
+  // CLEAN UP IDLE TOKEN LANES
+  //
+  // Once every reservation for this token has been
+  // resolved, no queue state needs to remain.
+  //
+  // Deleting it prevents this diagnostic Map from
+  // growing indefinitely.
+  // ----------------------------------------------
+
+  if (lane.writes.length === 0) {
+    shadowTokenSerializer.delete(
+      tokenAddress
+    );
+  }
+}
 
 function endTokenDbWrite(
   tokenAddress
@@ -1304,6 +1710,189 @@ function endTokenDbWrite(
     tokenAddress,
     currentDepth - 1
   );
+}
+
+// ==================================================
+// CANCEL SHADOW TOKEN SERIALIZATION
+//
+// Diagnostic-only FIFO cleanup.
+//
+// Used when a shadow reservation was created but the
+// real database transaction never actually began.
+//
+// Primary example:
+//
+// • pool.connect() fails before writeStartedAt exists.
+//
+// The cancelled reservation contributes NO observed
+// service time and NO hypothetical wait classification.
+//
+// Once cancelled, it no longer blocks later completed
+// reservations in the same shadow FIFO.
+// ==================================================
+
+function cancelShadowTokenSerialization(
+  reservation
+) {
+  if (
+    !reservation?.tokenAddress
+  ) {
+    return;
+  }
+
+  const tokenAddress =
+    reservation.tokenAddress;
+
+  const lane =
+    shadowTokenSerializer.get(
+      tokenAddress
+    );
+
+  if (!lane) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // MARK RESERVATION CANCELLED
+  //
+  // A cancelled reservation represents work that
+  // never entered the measured DB transaction.
+  //
+  // It therefore has zero shadow service time and
+  // should not be classified as immediate/waiting.
+  // ----------------------------------------------
+
+  reservation.cancelled = true;
+  reservation.completed = true;
+  reservation.observedServiceMs = null;
+  stats.shadowSerializerCancelledSamples += 1;
+
+  // ----------------------------------------------
+  // DRAIN RESOLVABLE FIFO HEADS
+  //
+  // Cancellation may unblock later reservations
+  // that already completed in the real system.
+  // ----------------------------------------------
+
+  while (
+    lane.writes.length > 0 &&
+    lane.writes[0].completed === true
+  ) {
+    const current =
+      lane.writes.shift();
+
+    // --------------------------------------------
+    // CANCELLED RESERVATION
+    //
+    // Remove it from the FIFO without advancing
+    // the hypothetical serialized clock.
+    // --------------------------------------------
+
+    if (current.cancelled === true) {
+      continue;
+    }
+
+    // --------------------------------------------
+    // COMPLETED REAL TRANSACTION
+    //
+    // This is the same FIFO-resolution logic used
+    // by finishShadowTokenSerialization().
+    // --------------------------------------------
+
+    if (
+      !Number.isFinite(
+        current.observedServiceMs
+      ) ||
+      current.observedServiceMs < 0
+    ) {
+      continue;
+    }
+
+    const previousAvailableAt =
+      Number.isFinite(
+        lane.resolvedAvailableAt
+      )
+        ? lane.resolvedAvailableAt
+        : current.realStartedAt;
+
+    const hypotheticalStartAt =
+      Math.max(
+        current.realStartedAt,
+        previousAvailableAt
+      );
+
+    const hypotheticalWaitMs =
+      Math.max(
+        0,
+        hypotheticalStartAt -
+          current.realStartedAt
+      );
+
+    const hypotheticalFinishAt =
+      hypotheticalStartAt +
+      current.observedServiceMs;
+
+    // --------------------------------------------
+    // CLASSIFY SHADOW RESULT
+    // --------------------------------------------
+
+    if (hypotheticalWaitMs > 0) {
+      stats.shadowSerializerWouldWaitSamples +=
+        1;
+
+      stats.shadowSerializerWaitTotalMs +=
+        hypotheticalWaitMs;
+
+      stats.shadowSerializerWaitMaxMs =
+        Math.max(
+          stats.shadowSerializerWaitMaxMs,
+          hypotheticalWaitMs
+        );
+
+      const shadowDepth =
+        Math.max(
+          1,
+          current.queueDepthAtArrival || 0
+        );
+
+      stats.shadowSerializerQueueDepthMax =
+        Math.max(
+          stats.shadowSerializerQueueDepthMax,
+          shadowDepth
+        );
+
+      if (shadowDepth === 1) {
+        stats.shadowSerializerDepth1 += 1;
+
+      } else if (shadowDepth === 2) {
+        stats.shadowSerializerDepth2 += 1;
+
+      } else {
+        stats.shadowSerializerDepth3Plus += 1;
+      }
+
+    } else {
+      stats.shadowSerializerImmediateSamples +=
+        1;
+    }
+
+    // --------------------------------------------
+    // ADVANCE HYPOTHETICAL SERIALIZED LANE
+    // --------------------------------------------
+
+    lane.resolvedAvailableAt =
+      hypotheticalFinishAt;
+  }
+
+  // ----------------------------------------------
+  // CLEAN UP EMPTY TOKEN LANE
+  // ----------------------------------------------
+
+  if (lane.writes.length === 0) {
+    shadowTokenSerializer.delete(
+      tokenAddress
+    );
+  }
 }
 
 
@@ -8008,12 +8597,6 @@ async function writeLaunchpadTokenAndEvent(
 
   // ================================================
   // SAME-TOKEN CONTENTION DIAGNOSTIC
-  //
-  // Records how many OTHER combined DB writes for
-  // this token were already active when this write
-  // began.
-  //
-  // Diagnostic only.
   // ================================================
 
   const tokenAddress =
@@ -8023,6 +8606,25 @@ async function writeLaunchpadTokenAndEvent(
     beginTokenDbWrite(
       tokenAddress
     );
+
+  // ================================================
+  // SHADOW PER-TOKEN SERIALIZER
+  //
+  // Diagnostic only.
+  //
+  // Creates the FIFO reservation before pool
+  // acquisition so the shadow model observes the
+  // same point at which a real per-token serializer
+  // would intercept the write.
+  // ================================================
+
+  const shadowReservation =
+    beginShadowTokenSerialization(
+      tokenAddress,
+      sameTokenContentionDepth
+    );
+
+  let shadowReservationFinished = false;
 
   // ================================================
   // DATABASE CONNECTION ACQUISITION
@@ -8057,12 +8659,6 @@ async function writeLaunchpadTokenAndEvent(
     let inserted = false;
     let marketUpdated = false;
 
-    // ================================================
-    // PER-TRANSACTION STAGE DURATIONS
-    //
-    // Diagnostic only.
-    // ================================================
-
     const stageDurations = {
       begin: null,
       tokenUpsert: null,
@@ -8072,6 +8668,8 @@ async function writeLaunchpadTokenAndEvent(
     };
 
     try {
+
+
 
       // ================================================
       // BEGIN
@@ -8231,12 +8829,6 @@ async function writeLaunchpadTokenAndEvent(
 
       // ================================================
       // SLOW TOKEN UPSERT CONTENTION FORENSICS
-      //
-      // The helper ignores UPSERTs below 500ms.
-      //
-      // For slow UPSERTs, record whether another
-      // combined DB write for this same token was
-      // already active when this transaction began.
       // ================================================
 
       recordSlowTokenUpsertForensic(
@@ -8250,8 +8842,6 @@ async function writeLaunchpadTokenAndEvent(
 
       // ================================================
       // STEP 2 — EVENT INSERT
-      //
-      // Token is guaranteed to exist before this runs.
       // ================================================
 
       const eventInsertStartedAt =
@@ -8495,13 +9085,10 @@ async function writeLaunchpadTokenAndEvent(
         }
       }
 
+
       return inserted;
 
     } catch (error) {
-
-      // ================================================
-      // ROLLBACK
-      // ================================================
 
       try {
         await client.query("ROLLBACK");
@@ -8522,17 +9109,6 @@ async function writeLaunchpadTokenAndEvent(
 
       // ================================================
       // COMPLETE TRANSACTION PERFORMANCE
-      //
-      // Measures everything after client acquisition:
-      //
-      // • BEGIN
-      // • token UPSERT
-      // • event INSERT
-      // • optional market UPDATE
-      // • COMMIT / ROLLBACK
-      //
-      // Individual successful stages are measured
-      // independently above.
       // ================================================
 
       const queryDurationMs =
@@ -8553,19 +9129,26 @@ async function writeLaunchpadTokenAndEvent(
         queryDurationMs
       );
 
+      recordSlowTransactionForensic(
+        queryDurationMs,
+        stageDurations,
+        sameTokenContentionDepth
+      );
+
       // ================================================
-      // SLOW TRANSACTION FORENSICS
+      // SHADOW SERIALIZER COMPLETION
       //
-      // The helper ignores transactions below 500ms.
-      // For slow transactions, it determines which
-      // measured stage consumed the most time.
+      // The reservation receives its observed service
+      // duration only after the real transaction has
+      // completed or rolled back.
       // ================================================
 
-      recordSlowTransactionForensic(
-  queryDurationMs,
-  stageDurations,
-  sameTokenContentionDepth
-);
+      finishShadowTokenSerialization(
+        shadowReservation,
+        queryDurationMs
+      );
+
+      shadowReservationFinished = true;
 
       client.release();
     }
@@ -8573,17 +9156,28 @@ async function writeLaunchpadTokenAndEvent(
   } finally {
 
     // ================================================
+    // SHADOW RESERVATION FAIL-SAFE
+    //
+    // If we created a FIFO reservation but never
+    // reached transaction completion — most notably
+    // because pool.connect() failed — remove it from
+    // the shadow lane.
+    //
+    // Otherwise an unfinished FIFO head could block
+    // later shadow reservations forever.
+    // ================================================
+
+    if (
+      shadowReservation &&
+      !shadowReservationFinished
+    ) {
+      cancelShadowTokenSerialization(
+        shadowReservation
+      );
+    }
+
+    // ================================================
     // SAME-TOKEN CONTENTION CLEANUP
-    //
-    // Always remove this write from the active-token
-    // tracker, including:
-    //
-    // • successful commits
-    // • SQL failures
-    // • rollbacks
-    // • pool acquisition failures
-    //
-    // This prevents stale diagnostic state.
     // ================================================
 
     endTokenDbWrite(

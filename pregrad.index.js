@@ -555,6 +555,37 @@ slowTxnDominantStageTotalMs: 0,
 slowTxnDominantStageMaxMs: 0,
 
   // ==========================================
+// SLOW TRANSACTION CONTENTION FORENSICS
+//
+// For ALL transactions >= 500ms:
+//
+// • Did another write for the same token
+//   already exist when this transaction began?
+//
+// • Was the transaction COMMIT dominant?
+//
+// Observation only.
+// ==========================================
+
+slowTxnWithSameTokenContention: 0,
+slowTxnWithoutSameTokenContention: 0,
+
+slowTxnContentionDepthTotal: 0,
+slowTxnContentionDepthMax: 0,
+
+slowTxnWithDepth1: 0,
+slowTxnWithDepth2: 0,
+slowTxnWithDepth3Plus: 0,
+
+// COMMIT-dominant subset
+
+slowCommitDominantWithSameTokenContention: 0,
+slowCommitDominantWithoutSameTokenContention: 0,
+
+slowCommitDominantContentionDepthTotal: 0,
+slowCommitDominantContentionDepthMax: 0,
+
+  // ==========================================
 // SLOW TOKEN UPSERT CONTENTION FORENSICS
 //
 // For token UPSERTs >= 500ms, determine whether
@@ -965,7 +996,8 @@ function getDbStageCounterMap() {
 
 function recordSlowTransactionForensic(
   totalDurationMs,
-  stageDurations
+  stageDurations,
+  sameTokenContentionDepth = 0
 ) {
   if (
     !Number.isFinite(totalDurationMs) ||
@@ -976,12 +1008,74 @@ function recordSlowTransactionForensic(
 
   stats.slowTxnForensicSamples += 1;
 
+  // ================================================
+  // SAME-TOKEN CONTENTION CLASSIFICATION
+  // ================================================
+
+  const contentionDepth =
+    Number.isFinite(
+      sameTokenContentionDepth
+    )
+      ? Math.max(
+          0,
+          sameTokenContentionDepth
+        )
+      : 0;
+
+  if (contentionDepth > 0) {
+    stats.slowTxnWithSameTokenContention +=
+      1;
+
+    stats.slowTxnContentionDepthTotal +=
+      contentionDepth;
+
+    stats.slowTxnContentionDepthMax =
+      Math.max(
+        stats.slowTxnContentionDepthMax,
+        contentionDepth
+      );
+
+    if (contentionDepth === 1) {
+      stats.slowTxnWithDepth1 += 1;
+
+    } else if (contentionDepth === 2) {
+      stats.slowTxnWithDepth2 += 1;
+
+    } else {
+      stats.slowTxnWithDepth3Plus += 1;
+    }
+
+  } else {
+    stats.slowTxnWithoutSameTokenContention +=
+      1;
+  }
+
+
+  // ================================================
+  // DOMINANT-STAGE CLASSIFICATION
+  // ================================================
+
   const stages = [
-    ["begin", stageDurations?.begin],
-    ["tokenUpsert", stageDurations?.tokenUpsert],
-    ["eventInsert", stageDurations?.eventInsert],
-    ["marketUpdate", stageDurations?.marketUpdate],
-    ["commit", stageDurations?.commit],
+    [
+      "begin",
+      stageDurations?.begin,
+    ],
+    [
+      "tokenUpsert",
+      stageDurations?.tokenUpsert,
+    ],
+    [
+      "eventInsert",
+      stageDurations?.eventInsert,
+    ],
+    [
+      "marketUpdate",
+      stageDurations?.marketUpdate,
+    ],
+    [
+      "commit",
+      stageDurations?.commit,
+    ],
   ].filter(
     ([, durationMs]) =>
       Number.isFinite(durationMs) &&
@@ -993,10 +1087,16 @@ function recordSlowTransactionForensic(
     return;
   }
 
-  let dominantStage = stages[0];
+  let dominantStage =
+    stages[0];
 
-  for (const stage of stages.slice(1)) {
-    if (stage[1] > dominantStage[1]) {
+  for (
+    const stage of stages.slice(1)
+  ) {
+    if (
+      stage[1] >
+      dominantStage[1]
+    ) {
       dominantStage = stage;
     }
   }
@@ -1006,21 +1106,29 @@ function recordSlowTransactionForensic(
     dominantStageDurationMs,
   ] = dominantStage;
 
+
+  // ================================================
+  // EXISTING DOMINANT-STAGE COUNTERS
+  // ================================================
+
   switch (dominantStageName) {
     case "begin":
       stats.slowTxnBeginDominant += 1;
       break;
 
     case "tokenUpsert":
-      stats.slowTxnTokenUpsertDominant += 1;
+      stats.slowTxnTokenUpsertDominant +=
+        1;
       break;
 
     case "eventInsert":
-      stats.slowTxnEventInsertDominant += 1;
+      stats.slowTxnEventInsertDominant +=
+        1;
       break;
 
     case "marketUpdate":
-      stats.slowTxnMarketUpdateDominant += 1;
+      stats.slowTxnMarketUpdateDominant +=
+        1;
       break;
 
     case "commit":
@@ -1032,6 +1140,38 @@ function recordSlowTransactionForensic(
       return;
   }
 
+
+  // ================================================
+  // COMMIT-DOMINANT CONTENTION FORENSICS
+  // ================================================
+
+  if (
+    dominantStageName === "commit"
+  ) {
+    if (contentionDepth > 0) {
+      stats.slowCommitDominantWithSameTokenContention +=
+        1;
+
+      stats.slowCommitDominantContentionDepthTotal +=
+        contentionDepth;
+
+      stats.slowCommitDominantContentionDepthMax =
+        Math.max(
+          stats.slowCommitDominantContentionDepthMax,
+          contentionDepth
+        );
+
+    } else {
+      stats.slowCommitDominantWithoutSameTokenContention +=
+        1;
+    }
+  }
+
+
+  // ================================================
+  // EXISTING DOMINANT-STAGE DURATION STATS
+  // ================================================
+
   stats.slowTxnDominantStageTotalMs +=
     dominantStageDurationMs;
 
@@ -1041,7 +1181,6 @@ function recordSlowTransactionForensic(
       dominantStageDurationMs
     );
 }
-
 
 function recordDbStageTiming(
   category,
@@ -8423,9 +8562,10 @@ async function writeLaunchpadTokenAndEvent(
       // ================================================
 
       recordSlowTransactionForensic(
-        queryDurationMs,
-        stageDurations
-      );
+  queryDurationMs,
+  stageDurations,
+  sameTokenContentionDepth
+);
 
       client.release();
     }

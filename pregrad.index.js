@@ -348,6 +348,16 @@ const workerPromises = [];
 const tokenSafetyEnrichmentInFlight = new Map();
 const tokenLastHolderEnrichedAt = new Map();
 
+// ==================================================
+// ACTIVE TOKEN DATABASE WRITES
+//
+// Diagnostic-only tracker for concurrent writes
+// targeting the same token.
+// ==================================================
+
+const activeTokenDbWrites =
+  new Map();
+
 const SEEN_SIGNATURE_LIMIT = Number(
   process.env.SEEN_SIGNATURE_LIMIT || 100000
 );
@@ -543,6 +553,34 @@ slowTxnUnclassified: 0,
 
 slowTxnDominantStageTotalMs: 0,
 slowTxnDominantStageMaxMs: 0,
+
+  // ==========================================
+// SLOW TOKEN UPSERT CONTENTION FORENSICS
+//
+// For token UPSERTs >= 500ms, determine whether
+// another database write for the same token was
+// already in flight when this transaction began.
+//
+// Observation only:
+// • No additional database queries
+// • No per-transaction logging
+// • No ingestion behavior changes
+// ==========================================
+
+slowTokenUpsertSamples: 0,
+
+slowTokenUpsertWithSameTokenContention: 0,
+slowTokenUpsertWithoutSameTokenContention: 0,
+
+slowTokenUpsertContentionDepthTotal: 0,
+slowTokenUpsertContentionDepthMax: 0,
+
+slowTokenUpsertWithDepth1: 0,
+slowTokenUpsertWithDepth2: 0,
+slowTokenUpsertWithDepth3Plus: 0,
+
+slowTokenUpsertDurationTotalMs: 0,
+slowTokenUpsertDurationMaxMs: 0,
 
   // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
@@ -1074,6 +1112,141 @@ function getDbStageSummary(
           )
         : null,
   };
+}
+
+// ==================================================
+// TOKEN DATABASE WRITE CONTENTION TRACKING
+// ==================================================
+
+function beginTokenDbWrite(
+  tokenAddress
+) {
+  if (!tokenAddress) {
+    return 0;
+  }
+
+  const existingDepth =
+    activeTokenDbWrites.get(
+      tokenAddress
+    ) || 0;
+
+  activeTokenDbWrites.set(
+    tokenAddress,
+    existingDepth + 1
+  );
+
+  // Return the number of OTHER writes that were
+  // already active for this token.
+  return existingDepth;
+}
+
+
+function endTokenDbWrite(
+  tokenAddress
+) {
+  if (!tokenAddress) {
+    return;
+  }
+
+  const currentDepth =
+    activeTokenDbWrites.get(
+      tokenAddress
+    ) || 0;
+
+  if (currentDepth <= 1) {
+    activeTokenDbWrites.delete(
+      tokenAddress
+    );
+
+    return;
+  }
+
+  activeTokenDbWrites.set(
+    tokenAddress,
+    currentDepth - 1
+  );
+}
+
+
+// ==================================================
+// SLOW TOKEN UPSERT CONTENTION FORENSICS
+//
+// Records only token UPSERTs >= 500ms.
+//
+// sameTokenContentionDepth means:
+//
+//   0 = no other write for this token was active
+//       when this transaction began
+//
+//   1 = one other write was already active
+//
+//   2 = two other writes were already active
+//
+//   3+ = three or more other writes were active
+//
+// No database work is added.
+// ==================================================
+
+function recordSlowTokenUpsertForensic(
+  tokenUpsertDurationMs,
+  sameTokenContentionDepth
+) {
+  if (
+    !Number.isFinite(
+      tokenUpsertDurationMs
+    ) ||
+    tokenUpsertDurationMs < 500
+  ) {
+    return;
+  }
+
+  const contentionDepth =
+    Number.isFinite(
+      sameTokenContentionDepth
+    )
+      ? Math.max(
+          0,
+          sameTokenContentionDepth
+        )
+      : 0;
+
+  stats.slowTokenUpsertSamples += 1;
+
+  stats.slowTokenUpsertDurationTotalMs +=
+    tokenUpsertDurationMs;
+
+  stats.slowTokenUpsertDurationMaxMs =
+    Math.max(
+      stats.slowTokenUpsertDurationMaxMs,
+      tokenUpsertDurationMs
+    );
+
+  if (contentionDepth > 0) {
+    stats.slowTokenUpsertWithSameTokenContention +=
+      1;
+
+    stats.slowTokenUpsertContentionDepthTotal +=
+      contentionDepth;
+
+    stats.slowTokenUpsertContentionDepthMax =
+      Math.max(
+        stats.slowTokenUpsertContentionDepthMax,
+        contentionDepth
+      );
+
+    if (contentionDepth === 1) {
+      stats.slowTokenUpsertWithDepth1 += 1;
+    } else if (contentionDepth === 2) {
+      stats.slowTokenUpsertWithDepth2 += 1;
+    } else {
+      stats.slowTokenUpsertWithDepth3Plus += 1;
+    }
+
+    return;
+  }
+
+  stats.slowTokenUpsertWithoutSameTokenContention +=
+    1;
 }
 
 
@@ -7695,534 +7868,587 @@ async function writeLaunchpadTokenAndEvent(
     calculateEventMarketData(event);
 
   // ================================================
+  // SAME-TOKEN CONTENTION DIAGNOSTIC
+  //
+  // Records how many OTHER combined DB writes for
+  // this token were already active when this write
+  // began.
+  //
+  // Diagnostic only.
+  // ================================================
+
+  const tokenAddress =
+    token.token_address;
+
+  const sameTokenContentionDepth =
+    beginTokenDbWrite(
+      tokenAddress
+    );
+
+  // ================================================
   // DATABASE CONNECTION ACQUISITION
   // ================================================
 
   const acquireStartedAt =
     performanceNow();
 
-  const client =
-    await pool.connect();
-
-  const acquireDurationMs =
-    performanceNow() -
-    acquireStartedAt;
-
-  recordDbDiagnosticTiming(
-    "poolAcquire",
-    acquireDurationMs
-  );
-
-  // ================================================
-  // COMPLETE TRANSACTION TIMER
-  // ================================================
-
-  const writeStartedAt =
-    performanceNow();
-
-  let tokenWritten = false;
-  let inserted = false;
-  let marketUpdated = false;
-
-  // ================================================
-  // PER-TRANSACTION STAGE DURATIONS
-  //
-  // Diagnostic only.
-  //
-  // These values let slow-transaction forensics
-  // identify which DB stage dominated transactions
-  // taking >= 500ms.
-  // ================================================
-
-  const stageDurations = {
-    begin: null,
-    tokenUpsert: null,
-    eventInsert: null,
-    marketUpdate: null,
-    commit: null,
-  };
+  let client = null;
 
   try {
+    client =
+      await pool.connect();
 
-    // ================================================
-    // BEGIN
-    // ================================================
-
-    const beginStartedAt =
-      performanceNow();
-
-    await client.query("BEGIN");
-
-    stageDurations.begin =
+    const acquireDurationMs =
       performanceNow() -
-      beginStartedAt;
+      acquireStartedAt;
 
-    recordDbStageTiming(
-      "begin",
-      stageDurations.begin
+    recordDbDiagnosticTiming(
+      "poolAcquire",
+      acquireDurationMs
     );
 
-
     // ================================================
-    // STEP 1 — TOKEN UPSERT
+    // COMPLETE TRANSACTION TIMER
     // ================================================
 
-    const tokenUpsertStartedAt =
+    const writeStartedAt =
       performanceNow();
 
-    const tokenResult =
-      await client.query(
-        `
-        INSERT INTO pump_launchpad_tokens (
-          token_address,
-          creator_wallet,
-          symbol,
-          name,
-          token_program,
-          created_at,
-          first_seen_signature,
-          first_seen_slot,
-          graduation_status,
-          graduated_at,
-          market_phase,
-          last_event_type,
-          last_seen_at,
-          updated_at
-        )
-
-        VALUES (
-          $1,$2,$3,$4,$5,$6,$7,
-          $8,$9,$10,$11,$12,$13,
-          NOW()
-        )
-
-        ON CONFLICT (token_address)
-        DO UPDATE SET
-
-          creator_wallet = COALESCE(
-            pump_launchpad_tokens.creator_wallet,
-            EXCLUDED.creator_wallet
-          ),
-
-          symbol = COALESCE(
-            pump_launchpad_tokens.symbol,
-            EXCLUDED.symbol
-          ),
-
-          name = COALESCE(
-            pump_launchpad_tokens.name,
-            EXCLUDED.name
-          ),
-
-          token_program = COALESCE(
-            pump_launchpad_tokens.token_program,
-            EXCLUDED.token_program
-          ),
-
-          created_at = COALESCE(
-            pump_launchpad_tokens.created_at,
-            EXCLUDED.created_at
-          ),
-
-          first_seen_signature = COALESCE(
-            pump_launchpad_tokens.first_seen_signature,
-            EXCLUDED.first_seen_signature
-          ),
-
-          first_seen_slot = COALESCE(
-            pump_launchpad_tokens.first_seen_slot,
-            EXCLUDED.first_seen_slot
-          ),
-
-          graduation_status = CASE
-            WHEN
-              pump_launchpad_tokens.graduation_status =
-              'graduated'
-            THEN 'graduated'
-
-            ELSE EXCLUDED.graduation_status
-          END,
-
-          graduated_at = COALESCE(
-            pump_launchpad_tokens.graduated_at,
-            EXCLUDED.graduated_at
-          ),
-
-          market_phase = CASE
-            WHEN
-              pump_launchpad_tokens.market_phase IN (
-                'JUST_GRADUATED',
-                'POST_GRAD'
-              )
-            THEN
-              pump_launchpad_tokens.market_phase
-
-            ELSE EXCLUDED.market_phase
-          END,
-
-          last_event_type = COALESCE(
-            EXCLUDED.last_event_type,
-            pump_launchpad_tokens.last_event_type
-          ),
-
-          last_seen_at = COALESCE(
-            EXCLUDED.last_seen_at,
-            pump_launchpad_tokens.last_seen_at
-          ),
-
-          updated_at = NOW()
-
-        RETURNING token_address
-        `,
-        [
-          token.token_address,
-          token.creator_wallet,
-          token.symbol,
-          token.name,
-          token.token_program,
-          token.created_at,
-          token.first_seen_signature,
-          token.first_seen_slot,
-          token.graduation_status || "pre_grad",
-          token.graduated_at || null,
-          token.market_phase || "PRE_GRAD",
-          token.last_event_type || null,
-          token.last_seen_at || null,
-        ]
-      );
-
-    stageDurations.tokenUpsert =
-      performanceNow() -
-      tokenUpsertStartedAt;
-
-    recordDbStageTiming(
-      "tokenUpsert",
-      stageDurations.tokenUpsert
-    );
-
-    tokenWritten =
-      tokenResult.rowCount > 0;
-
+    let tokenWritten = false;
+    let inserted = false;
+    let marketUpdated = false;
 
     // ================================================
-    // STEP 2 — EVENT INSERT
+    // PER-TRANSACTION STAGE DURATIONS
     //
-    // Token is guaranteed to exist before this runs.
+    // Diagnostic only.
     // ================================================
 
-    const eventInsertStartedAt =
-      performanceNow();
+    const stageDurations = {
+      begin: null,
+      tokenUpsert: null,
+      eventInsert: null,
+      marketUpdate: null,
+      commit: null,
+    };
 
-    const eventResult =
-      await client.query(
-        `
-        INSERT INTO pump_launchpad_events (
-          token_address,
-          signature,
-          slot,
-          block_time,
-          event_type,
-          wallet_address,
-          sol_amount,
-          token_amount,
-          price_per_token,
-          market_cap_sol,
-          market_cap_usd,
-          sol_price_usd,
-          raw_json
-        )
+    try {
 
-        VALUES (
-          $1,$2,$3,$4,$5,$6,$7,
-          $8,$9,$10,$11,$12,$13
-        )
+      // ================================================
+      // BEGIN
+      // ================================================
 
-        ON CONFLICT (signature)
-        DO NOTHING
-
-        RETURNING id
-        `,
-        [
-          event.token_address,
-          event.signature,
-          event.slot,
-          event.block_time,
-          event.event_type,
-          event.wallet_address,
-          event.sol_amount,
-          event.token_amount,
-
-          market?.priceSol ??
-            event.price_per_token ??
-            null,
-
-          market?.marketCapSol ?? null,
-          market?.marketCapUsd ?? null,
-          market?.solPriceUsd ?? null,
-
-          STORE_RAW_EVENTS
-            ? event.raw_json
-            : null,
-        ]
-      );
-
-    stageDurations.eventInsert =
-      performanceNow() -
-      eventInsertStartedAt;
-
-    recordDbStageTiming(
-      "eventInsert",
-      stageDurations.eventInsert
-    );
-
-    inserted =
-      eventResult.rowCount > 0;
-
-
-    // ================================================
-    // STEP 3 — MARKET UPDATE
-    //
-    // ONLY:
-    // • newly inserted event
-    // • buy/sell
-    // • valid calculated market data
-    //
-    // Duplicate events can never advance market state.
-    // ================================================
-
-    if (
-      inserted &&
-      market &&
-      ["buy", "sell"].includes(
-        event.event_type
-      )
-    ) {
-      const marketUpdateStartedAt =
+      const beginStartedAt =
         performanceNow();
 
-      const marketResult =
+      await client.query("BEGIN");
+
+      stageDurations.begin =
+        performanceNow() -
+        beginStartedAt;
+
+      recordDbStageTiming(
+        "begin",
+        stageDurations.begin
+      );
+
+
+      // ================================================
+      // STEP 1 — TOKEN UPSERT
+      // ================================================
+
+      const tokenUpsertStartedAt =
+        performanceNow();
+
+      const tokenResult =
         await client.query(
           `
-          UPDATE pump_launchpad_tokens
+          INSERT INTO pump_launchpad_tokens (
+            token_address,
+            creator_wallet,
+            symbol,
+            name,
+            token_program,
+            created_at,
+            first_seen_signature,
+            first_seen_slot,
+            graduation_status,
+            graduated_at,
+            market_phase,
+            last_event_type,
+            last_seen_at,
+            updated_at
+          )
 
-          SET
-            latest_price_sol = $2,
-            market_cap_sol = $3,
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,
+            $8,$9,$10,$11,$12,$13,
+            NOW()
+          )
 
-            latest_price = COALESCE(
-              $4,
-              latest_price
+          ON CONFLICT (token_address)
+          DO UPDATE SET
+
+            creator_wallet = COALESCE(
+              pump_launchpad_tokens.creator_wallet,
+              EXCLUDED.creator_wallet
             ),
 
-            market_cap_usd = COALESCE(
-              $5,
-              market_cap_usd
+            symbol = COALESCE(
+              pump_launchpad_tokens.symbol,
+              EXCLUDED.symbol
             ),
 
-            fdv_usd = COALESCE(
-              $5,
-              fdv_usd
+            name = COALESCE(
+              pump_launchpad_tokens.name,
+              EXCLUDED.name
             ),
 
-            ath_market_cap_sol =
-              GREATEST(
-                COALESCE(
-                  ath_market_cap_sol,
-                  0
-                ),
-                $3
-              ),
+            token_program = COALESCE(
+              pump_launchpad_tokens.token_program,
+              EXCLUDED.token_program
+            ),
 
-            atl_market_cap_sol =
-              CASE
-                WHEN
-                  atl_market_cap_sol IS NULL
-                  OR atl_market_cap_sol = 0
-                THEN $3
+            created_at = COALESCE(
+              pump_launchpad_tokens.created_at,
+              EXCLUDED.created_at
+            ),
 
-                ELSE LEAST(
-                  atl_market_cap_sol,
-                  $3
+            first_seen_signature = COALESCE(
+              pump_launchpad_tokens.first_seen_signature,
+              EXCLUDED.first_seen_signature
+            ),
+
+            first_seen_slot = COALESCE(
+              pump_launchpad_tokens.first_seen_slot,
+              EXCLUDED.first_seen_slot
+            ),
+
+            graduation_status = CASE
+              WHEN
+                pump_launchpad_tokens.graduation_status =
+                'graduated'
+              THEN 'graduated'
+
+              ELSE EXCLUDED.graduation_status
+            END,
+
+            graduated_at = COALESCE(
+              pump_launchpad_tokens.graduated_at,
+              EXCLUDED.graduated_at
+            ),
+
+            market_phase = CASE
+              WHEN
+                pump_launchpad_tokens.market_phase IN (
+                  'JUST_GRADUATED',
+                  'POST_GRAD'
                 )
-              END,
+              THEN
+                pump_launchpad_tokens.market_phase
 
-            ath_market_cap_usd =
-              CASE
-                WHEN $5 IS NULL
-                THEN ath_market_cap_usd
+              ELSE EXCLUDED.market_phase
+            END,
 
-                ELSE GREATEST(
-                  COALESCE(
-                    ath_market_cap_usd,
-                    0
-                  ),
-                  $5
-                )
-              END,
+            last_event_type = COALESCE(
+              EXCLUDED.last_event_type,
+              pump_launchpad_tokens.last_event_type
+            ),
 
-            atl_market_cap_usd =
-              CASE
-                WHEN $5 IS NULL
-                THEN atl_market_cap_usd
+            last_seen_at = COALESCE(
+              EXCLUDED.last_seen_at,
+              pump_launchpad_tokens.last_seen_at
+            ),
 
-                WHEN
-                  atl_market_cap_usd IS NULL
-                  OR atl_market_cap_usd = 0
-                THEN $5
-
-                ELSE LEAST(
-                  atl_market_cap_usd,
-                  $5
-                )
-              END,
-
-            updated_market_data_at = NOW(),
             updated_at = NOW()
-
-          WHERE token_address = $1
 
           RETURNING token_address
           `,
           [
             token.token_address,
-            market.priceSol,
-            market.marketCapSol,
-            market.latestPriceUsd,
-            market.marketCapUsd,
+            token.creator_wallet,
+            token.symbol,
+            token.name,
+            token.token_program,
+            token.created_at,
+            token.first_seen_signature,
+            token.first_seen_slot,
+            token.graduation_status || "pre_grad",
+            token.graduated_at || null,
+            token.market_phase || "PRE_GRAD",
+            token.last_event_type || null,
+            token.last_seen_at || null,
           ]
         );
 
-      stageDurations.marketUpdate =
+      stageDurations.tokenUpsert =
         performanceNow() -
-        marketUpdateStartedAt;
+        tokenUpsertStartedAt;
 
       recordDbStageTiming(
-        "marketUpdate",
-        stageDurations.marketUpdate
+        "tokenUpsert",
+        stageDurations.tokenUpsert
       );
 
-      marketUpdated =
-        marketResult.rowCount > 0;
-    }
+      // ================================================
+      // SLOW TOKEN UPSERT CONTENTION FORENSICS
+      //
+      // The helper ignores UPSERTs below 500ms.
+      //
+      // For slow UPSERTs, record whether another
+      // combined DB write for this same token was
+      // already active when this transaction began.
+      // ================================================
+
+      recordSlowTokenUpsertForensic(
+        stageDurations.tokenUpsert,
+        sameTokenContentionDepth
+      );
+
+      tokenWritten =
+        tokenResult.rowCount > 0;
 
 
-    // ================================================
-    // COMMIT
-    // ================================================
+      // ================================================
+      // STEP 2 — EVENT INSERT
+      //
+      // Token is guaranteed to exist before this runs.
+      // ================================================
 
-    const commitStartedAt =
-      performanceNow();
+      const eventInsertStartedAt =
+        performanceNow();
 
-    await client.query("COMMIT");
+      const eventResult =
+        await client.query(
+          `
+          INSERT INTO pump_launchpad_events (
+            token_address,
+            signature,
+            slot,
+            block_time,
+            event_type,
+            wallet_address,
+            sol_amount,
+            token_amount,
+            price_per_token,
+            market_cap_sol,
+            market_cap_usd,
+            sol_price_usd,
+            raw_json
+          )
 
-    stageDurations.commit =
-      performanceNow() -
-      commitStartedAt;
+          VALUES (
+            $1,$2,$3,$4,$5,$6,$7,
+            $8,$9,$10,$11,$12,$13
+          )
 
-    recordDbStageTiming(
-      "commit",
-      stageDurations.commit
-    );
+          ON CONFLICT (signature)
+          DO NOTHING
+
+          RETURNING id
+          `,
+          [
+            event.token_address,
+            event.signature,
+            event.slot,
+            event.block_time,
+            event.event_type,
+            event.wallet_address,
+            event.sol_amount,
+            event.token_amount,
+
+            market?.priceSol ??
+              event.price_per_token ??
+              null,
+
+            market?.marketCapSol ?? null,
+            market?.marketCapUsd ?? null,
+            market?.solPriceUsd ?? null,
+
+            STORE_RAW_EVENTS
+              ? event.raw_json
+              : null,
+          ]
+        );
+
+      stageDurations.eventInsert =
+        performanceNow() -
+        eventInsertStartedAt;
+
+      recordDbStageTiming(
+        "eventInsert",
+        stageDurations.eventInsert
+      );
+
+      inserted =
+        eventResult.rowCount > 0;
 
 
-    // ================================================
-    // STATS
-    //
-    // Only count committed work.
-    // ================================================
-
-    if (tokenWritten) {
-      stats.insertedTokens += 1;
-    }
-
-    if (inserted) {
-      stats.insertedEvents += 1;
+      // ================================================
+      // STEP 3 — MARKET UPDATE
+      //
+      // ONLY:
+      // • newly inserted event
+      // • buy/sell
+      // • valid calculated market data
+      //
+      // Duplicate events can never advance market state.
+      // ================================================
 
       if (
+        inserted &&
+        market &&
         ["buy", "sell"].includes(
           event.event_type
         )
       ) {
-        if (marketUpdated) {
-          stats.updatedMarketData += 1;
-        } else if (!market) {
-          stats.skippedMarketDataUpdate += 1;
+        const marketUpdateStartedAt =
+          performanceNow();
+
+        const marketResult =
+          await client.query(
+            `
+            UPDATE pump_launchpad_tokens
+
+            SET
+              latest_price_sol = $2,
+              market_cap_sol = $3,
+
+              latest_price = COALESCE(
+                $4,
+                latest_price
+              ),
+
+              market_cap_usd = COALESCE(
+                $5,
+                market_cap_usd
+              ),
+
+              fdv_usd = COALESCE(
+                $5,
+                fdv_usd
+              ),
+
+              ath_market_cap_sol =
+                GREATEST(
+                  COALESCE(
+                    ath_market_cap_sol,
+                    0
+                  ),
+                  $3
+                ),
+
+              atl_market_cap_sol =
+                CASE
+                  WHEN
+                    atl_market_cap_sol IS NULL
+                    OR atl_market_cap_sol = 0
+                  THEN $3
+
+                  ELSE LEAST(
+                    atl_market_cap_sol,
+                    $3
+                  )
+                END,
+
+              ath_market_cap_usd =
+                CASE
+                  WHEN $5 IS NULL
+                  THEN ath_market_cap_usd
+
+                  ELSE GREATEST(
+                    COALESCE(
+                      ath_market_cap_usd,
+                      0
+                    ),
+                    $5
+                  )
+                END,
+
+              atl_market_cap_usd =
+                CASE
+                  WHEN $5 IS NULL
+                  THEN atl_market_cap_usd
+
+                  WHEN
+                    atl_market_cap_usd IS NULL
+                    OR atl_market_cap_usd = 0
+                  THEN $5
+
+                  ELSE LEAST(
+                    atl_market_cap_usd,
+                    $5
+                  )
+                END,
+
+              updated_market_data_at = NOW(),
+              updated_at = NOW()
+
+            WHERE token_address = $1
+
+            RETURNING token_address
+            `,
+            [
+              token.token_address,
+              market.priceSol,
+              market.marketCapSol,
+              market.latestPriceUsd,
+              market.marketCapUsd,
+            ]
+          );
+
+        stageDurations.marketUpdate =
+          performanceNow() -
+          marketUpdateStartedAt;
+
+        recordDbStageTiming(
+          "marketUpdate",
+          stageDurations.marketUpdate
+        );
+
+        marketUpdated =
+          marketResult.rowCount > 0;
+      }
+
+
+      // ================================================
+      // COMMIT
+      // ================================================
+
+      const commitStartedAt =
+        performanceNow();
+
+      await client.query("COMMIT");
+
+      stageDurations.commit =
+        performanceNow() -
+        commitStartedAt;
+
+      recordDbStageTiming(
+        "commit",
+        stageDurations.commit
+      );
+
+
+      // ================================================
+      // STATS
+      //
+      // Only count committed work.
+      // ================================================
+
+      if (tokenWritten) {
+        stats.insertedTokens += 1;
+      }
+
+      if (inserted) {
+        stats.insertedEvents += 1;
+
+        if (
+          ["buy", "sell"].includes(
+            event.event_type
+          )
+        ) {
+          if (marketUpdated) {
+            stats.updatedMarketData += 1;
+          } else if (!market) {
+            stats.skippedMarketDataUpdate += 1;
+          }
         }
       }
-    }
 
-    return inserted;
+      return inserted;
 
-  } catch (error) {
+    } catch (error) {
 
-    // ================================================
-    // ROLLBACK
-    // ================================================
+      // ================================================
+      // ROLLBACK
+      // ================================================
 
-    try {
-      await client.query("ROLLBACK");
-    } catch (rollbackError) {
-      logError(
-        "Database rollback failed",
-        {
-          error:
-            rollbackError?.message ||
-            String(rollbackError),
-        }
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        logError(
+          "Database rollback failed",
+          {
+            error:
+              rollbackError?.message ||
+              String(rollbackError),
+          }
+        );
+      }
+
+      throw error;
+
+    } finally {
+
+      // ================================================
+      // COMPLETE TRANSACTION PERFORMANCE
+      //
+      // Measures everything after client acquisition:
+      //
+      // • BEGIN
+      // • token UPSERT
+      // • event INSERT
+      // • optional market UPDATE
+      // • COMMIT / ROLLBACK
+      //
+      // Individual successful stages are measured
+      // independently above.
+      // ================================================
+
+      const queryDurationMs =
+        performanceNow() -
+        writeStartedAt;
+
+      recordPerformanceTiming(
+        "sqlEventInsert",
+        queryDurationMs
       );
-    }
 
-    throw error;
+      recordDbDiagnosticTiming(
+        "queryExecution",
+        queryDurationMs
+      );
+
+      recordSlowDbQuery(
+        queryDurationMs
+      );
+
+      // ================================================
+      // SLOW TRANSACTION FORENSICS
+      //
+      // The helper ignores transactions below 500ms.
+      // For slow transactions, it determines which
+      // measured stage consumed the most time.
+      // ================================================
+
+      recordSlowTransactionForensic(
+        queryDurationMs,
+        stageDurations
+      );
+
+      client.release();
+    }
 
   } finally {
 
     // ================================================
-    // COMPLETE TRANSACTION PERFORMANCE
+    // SAME-TOKEN CONTENTION CLEANUP
     //
-    // Measures everything after client acquisition:
+    // Always remove this write from the active-token
+    // tracker, including:
     //
-    // • BEGIN
-    // • token UPSERT
-    // • event INSERT
-    // • optional market UPDATE
-    // • COMMIT / ROLLBACK
+    // • successful commits
+    // • SQL failures
+    // • rollbacks
+    // • pool acquisition failures
     //
-    // Individual successful stages are measured
-    // independently above.
+    // This prevents stale diagnostic state.
     // ================================================
 
-    const queryDurationMs =
-      performanceNow() -
-      writeStartedAt;
-
-    recordPerformanceTiming(
-      "sqlEventInsert",
-      queryDurationMs
+    endTokenDbWrite(
+      tokenAddress
     );
-
-    recordDbDiagnosticTiming(
-      "queryExecution",
-      queryDurationMs
-    );
-
-    recordSlowDbQuery(
-      queryDurationMs
-    );
-
-    // ================================================
-    // SLOW TRANSACTION FORENSICS
-    //
-    // The helper ignores transactions below 500ms.
-    // For slow transactions, it determines which
-    // measured stage consumed the most time.
-    // ================================================
-
-    recordSlowTransactionForensic(
-      queryDurationMs,
-      stageDurations
-    );
-
-    client.release();
   }
 }
 // ==================================================

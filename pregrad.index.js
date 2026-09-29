@@ -9067,7 +9067,7 @@ async function writeLaunchpadTokenAndEvent(
     return false;
   }
 
-   const market =
+  const market =
     calculateEventMarketData(event);
 
   const tokenAddress =
@@ -9076,16 +9076,13 @@ async function writeLaunchpadTokenAndEvent(
   // ================================================
   // REAL PER-TOKEN SERIALIZATION
   //
-  // IMPORTANT:
-  //
-  // Acquire this BEFORE:
+  // Acquire BEFORE:
   // • beginTokenDbWrite()
   // • shadow diagnostics
   // • pool.connect()
   //
-  // Therefore queued same-token writes do not consume
-  // PostgreSQL connections and are not counted as
-  // simultaneously active DB writes.
+  // Same-token writes therefore never compete for
+  // PostgreSQL connections or row locks.
   // ================================================
 
   let tokenSerializationReservation =
@@ -9155,20 +9152,22 @@ async function writeLaunchpadTokenAndEvent(
     const stageDurations = {
       begin: null,
       tokenUpsert: null,
+
+      // eventInsert now represents the combined
+      // event INSERT + conditional market UPDATE
+      // statement.
       eventInsert: null,
+
+      // Market UPDATE no longer has its own network
+      // round trip. Keep this field for compatibility
+      // with existing diagnostics.
       marketUpdate: null,
+
       commit: null,
     };
 
     // ================================================
     // UPSERT EXECUTION CONTENTION DEPTH
-    //
-    // Declared outside the inner transaction try so
-    // transaction-finalization diagnostics can safely
-    // access it.
-    //
-    // Remains null if execution fails before reaching
-    // the token UPSERT.
     // ================================================
 
     let upsertExecutionDepth = null;
@@ -9342,10 +9341,6 @@ async function writeLaunchpadTokenAndEvent(
 
       // ================================================
       // CONTENTION DEPTH PERFORMANCE
-      //
-      // Compare:
-      // • contention when the write entered the DB path
-      // • contention immediately before this UPSERT
       // ================================================
 
       recordContentionDepthTiming(
@@ -9360,10 +9355,6 @@ async function writeLaunchpadTokenAndEvent(
         stageDurations.tokenUpsert
       );
 
-      // ================================================
-      // SLOW TOKEN UPSERT CONTENTION FORENSICS
-      // ================================================
-
       recordSlowTokenUpsertForensic(
         stageDurations.tokenUpsert,
         sameTokenContentionDepth
@@ -9373,42 +9364,166 @@ async function writeLaunchpadTokenAndEvent(
         tokenResult.rowCount > 0;
 
       // ================================================
-      // STEP 2 — EVENT INSERT
+      // STEP 2 — EVENT INSERT + CONDITIONAL MARKET UPDATE
+      //
+      // This replaces TWO PostgreSQL round trips:
+      //
+      //   event INSERT
+      //   market UPDATE
+      //
+      // with ONE statement.
+      //
+      // Critical invariant:
+      //
+      // market_update can only see rows returned by
+      // inserted_event.
+      //
+      // Therefore a duplicate signature produces zero
+      // inserted_event rows and CANNOT advance market
+      // state.
       // ================================================
 
-      const eventInsertStartedAt =
+      const eventWriteStartedAt =
         performanceNow();
 
-      const eventResult =
+      const eventWriteResult =
         await client.query(
           `
-          INSERT INTO pump_launchpad_events (
-            token_address,
-            signature,
-            slot,
-            block_time,
-            event_type,
-            wallet_address,
-            sol_amount,
-            token_amount,
-            price_per_token,
-            market_cap_sol,
-            market_cap_usd,
-            sol_price_usd,
-            raw_json
+          WITH inserted_event AS (
+            INSERT INTO pump_launchpad_events (
+              token_address,
+              signature,
+              slot,
+              block_time,
+              event_type,
+              wallet_address,
+              sol_amount,
+              token_amount,
+              price_per_token,
+              market_cap_sol,
+              market_cap_usd,
+              sol_price_usd,
+              raw_json
+            )
+
+            VALUES (
+              $1,$2,$3,$4,$5,$6,$7,
+              $8,$9,$10,$11,$12,$13
+            )
+
+            ON CONFLICT (signature)
+            DO NOTHING
+
+            RETURNING id
+          ),
+
+          market_update AS (
+            UPDATE pump_launchpad_tokens
+
+            SET
+              latest_price_sol = $14,
+              market_cap_sol = $15,
+
+              latest_price = COALESCE(
+                $16,
+                latest_price
+              ),
+
+              market_cap_usd = COALESCE(
+                $17,
+                market_cap_usd
+              ),
+
+              fdv_usd = COALESCE(
+                $17,
+                fdv_usd
+              ),
+
+              ath_market_cap_sol =
+                GREATEST(
+                  COALESCE(
+                    ath_market_cap_sol,
+                    0
+                  ),
+                  $15
+                ),
+
+              atl_market_cap_sol =
+                CASE
+                  WHEN
+                    atl_market_cap_sol IS NULL
+                    OR atl_market_cap_sol = 0
+                  THEN $15
+
+                  ELSE LEAST(
+                    atl_market_cap_sol,
+                    $15
+                  )
+                END,
+
+              ath_market_cap_usd =
+                CASE
+                  WHEN $17 IS NULL
+                  THEN ath_market_cap_usd
+
+                  ELSE GREATEST(
+                    COALESCE(
+                      ath_market_cap_usd,
+                      0
+                    ),
+                    $17
+                  )
+                END,
+
+              atl_market_cap_usd =
+                CASE
+                  WHEN $17 IS NULL
+                  THEN atl_market_cap_usd
+
+                  WHEN
+                    atl_market_cap_usd IS NULL
+                    OR atl_market_cap_usd = 0
+                  THEN $17
+
+                  ELSE LEAST(
+                    atl_market_cap_usd,
+                    $17
+                  )
+                END,
+
+              updated_market_data_at = NOW(),
+              updated_at = NOW()
+
+            WHERE
+              token_address = $1
+
+              AND EXISTS (
+                SELECT 1
+                FROM inserted_event
+              )
+
+              AND $18::boolean = TRUE
+
+            RETURNING token_address
           )
 
-          VALUES (
-            $1,$2,$3,$4,$5,$6,$7,
-            $8,$9,$10,$11,$12,$13
-          )
+          SELECT
+            EXISTS (
+              SELECT 1
+              FROM inserted_event
+            ) AS inserted,
 
-          ON CONFLICT (signature)
-          DO NOTHING
-
-          RETURNING id
+            EXISTS (
+              SELECT 1
+              FROM market_update
+            ) AS market_updated
           `,
           [
+            // ------------------------------------------
+            // EVENT INSERT
+            // $1 - $13
+            // ------------------------------------------
+
             event.token_address,
             event.signature,
             event.slot,
@@ -9429,146 +9544,43 @@ async function writeLaunchpadTokenAndEvent(
             STORE_RAW_EVENTS
               ? event.raw_json
               : null,
+
+            // ------------------------------------------
+            // MARKET UPDATE
+            // $14 - $18
+            // ------------------------------------------
+
+            market?.priceSol ?? null,
+            market?.marketCapSol ?? null,
+            market?.latestPriceUsd ?? null,
+            market?.marketCapUsd ?? null,
+
+            Boolean(
+              market &&
+              ["buy", "sell"].includes(
+                event.event_type
+              )
+            ),
           ]
         );
 
       stageDurations.eventInsert =
         performanceNow() -
-        eventInsertStartedAt;
+        eventWriteStartedAt;
 
       recordDbStageTiming(
         "eventInsert",
         stageDurations.eventInsert
       );
 
+      const resultRow =
+        eventWriteResult.rows?.[0] || {};
+
       inserted =
-        eventResult.rowCount > 0;
+        resultRow.inserted === true;
 
-      // ================================================
-      // STEP 3 — MARKET UPDATE
-      //
-      // ONLY:
-      // • newly inserted event
-      // • buy/sell
-      // • valid calculated market data
-      //
-      // Duplicate events can never advance market state.
-      // ================================================
-
-      if (
-        inserted &&
-        market &&
-        ["buy", "sell"].includes(
-          event.event_type
-        )
-      ) {
-        const marketUpdateStartedAt =
-          performanceNow();
-
-        const marketResult =
-          await client.query(
-            `
-            UPDATE pump_launchpad_tokens
-
-            SET
-              latest_price_sol = $2,
-              market_cap_sol = $3,
-
-              latest_price = COALESCE(
-                $4,
-                latest_price
-              ),
-
-              market_cap_usd = COALESCE(
-                $5,
-                market_cap_usd
-              ),
-
-              fdv_usd = COALESCE(
-                $5,
-                fdv_usd
-              ),
-
-              ath_market_cap_sol =
-                GREATEST(
-                  COALESCE(
-                    ath_market_cap_sol,
-                    0
-                  ),
-                  $3
-                ),
-
-              atl_market_cap_sol =
-                CASE
-                  WHEN
-                    atl_market_cap_sol IS NULL
-                    OR atl_market_cap_sol = 0
-                  THEN $3
-
-                  ELSE LEAST(
-                    atl_market_cap_sol,
-                    $3
-                  )
-                END,
-
-              ath_market_cap_usd =
-                CASE
-                  WHEN $5 IS NULL
-                  THEN ath_market_cap_usd
-
-                  ELSE GREATEST(
-                    COALESCE(
-                      ath_market_cap_usd,
-                      0
-                    ),
-                    $5
-                  )
-                END,
-
-              atl_market_cap_usd =
-                CASE
-                  WHEN $5 IS NULL
-                  THEN atl_market_cap_usd
-
-                  WHEN
-                    atl_market_cap_usd IS NULL
-                    OR atl_market_cap_usd = 0
-                  THEN $5
-
-                  ELSE LEAST(
-                    atl_market_cap_usd,
-                    $5
-                  )
-                END,
-
-              updated_market_data_at = NOW(),
-              updated_at = NOW()
-
-            WHERE token_address = $1
-
-            RETURNING token_address
-            `,
-            [
-              token.token_address,
-              market.priceSol,
-              market.marketCapSol,
-              market.latestPriceUsd,
-              market.marketCapUsd,
-            ]
-          );
-
-        stageDurations.marketUpdate =
-          performanceNow() -
-          marketUpdateStartedAt;
-
-        recordDbStageTiming(
-          "marketUpdate",
-          stageDurations.marketUpdate
-        );
-
-        marketUpdated =
-          marketResult.rowCount > 0;
-      }
+      marketUpdated =
+        resultRow.market_updated === true;
 
       // ================================================
       // COMMIT
@@ -9591,7 +9603,7 @@ async function writeLaunchpadTokenAndEvent(
       // ================================================
       // STATS
       //
-      // Only count committed work.
+      // Count only committed work.
       // ================================================
 
       if (tokenWritten) {
@@ -9632,31 +9644,24 @@ async function writeLaunchpadTokenAndEvent(
       }
 
       throw error;
+
     } finally {
 
       // ================================================
       // CONNECTION-SAFE TRANSACTION FINALIZATION
       //
-      // Diagnostics must NEVER be able to prevent the
-      // PostgreSQL client from returning to the pool.
+      // Diagnostics must NEVER prevent the PostgreSQL
+      // client from returning to the pool.
       // ================================================
 
       try {
-
-        // ================================================
-        // COMPLETE TRANSACTION PERFORMANCE
-        // ================================================
 
         const queryDurationMs =
           performanceNow() -
           writeStartedAt;
 
         // ================================================
-        // CONTENTION DEPTH PERFORMANCE
-        //
-        // Measure complete transaction duration against:
-        // • contention when the write entered the DB path
-        // • contention immediately before the token UPSERT
+        // COMPLETE TRANSACTION PERFORMANCE
         // ================================================
 
         recordContentionDepthTiming(
@@ -9693,10 +9698,6 @@ async function writeLaunchpadTokenAndEvent(
 
         // ================================================
         // SHADOW SERIALIZER COMPLETION
-        //
-        // The reservation receives its observed service
-        // duration only after the real transaction has
-        // completed or rolled back.
         // ================================================
 
         finishShadowTokenSerialization(
@@ -9711,8 +9712,7 @@ async function writeLaunchpadTokenAndEvent(
         // ================================================
         // DATABASE CONNECTION RELEASE
         //
-        // This MUST execute even if any observational
-        // diagnostic above throws.
+        // MUST execute even if diagnostics throw.
         // ================================================
 
         client.release();
@@ -9723,11 +9723,6 @@ async function writeLaunchpadTokenAndEvent(
 
     // ================================================
     // SHADOW RESERVATION FAIL-SAFE
-    //
-    // If the reservation never reached normal shadow
-    // completion — including pool acquisition failure
-    // or an unexpected diagnostic failure — remove it
-    // from the shadow lane.
     // ================================================
 
     if (
@@ -9741,10 +9736,6 @@ async function writeLaunchpadTokenAndEvent(
 
     // ================================================
     // SAME-TOKEN CONTENTION CLEANUP
-    //
-    // Remove this write from the real active-write
-    // diagnostic before allowing the next serialized
-    // write for this token to enter the DB path.
     // ================================================
 
     endTokenDbWrite(
@@ -9755,15 +9746,6 @@ async function writeLaunchpadTokenAndEvent(
     // REAL PER-TOKEN SERIALIZER RELEASE
     //
     // MUST remain last.
-    //
-    // At this point:
-    // • the transaction has completed or failed
-    // • the PostgreSQL client has been released
-    // • shadow diagnostics have been cleaned up
-    // • active-token tracking has been cleaned up
-    //
-    // Only now may the next queued write for this
-    // SAME token enter the database path.
     // ================================================
 
     releaseTokenDbSerializationLane(

@@ -135,7 +135,26 @@ const MAX_TX_PER_SECOND = Number(
   process.env.MAX_TX_PER_SECOND || 30
 );
 
+// ==================================================
+// 2C-2. DATABASE WRITE DISPATCHER
+//
+// Signature workers fetch/classify transactions and
+// hand accepted writes to this independent dispatcher.
+//
+// Different tokens may write concurrently.
+// The same token is dispatched strictly FIFO.
+//
+// The existing per-token serializer remains enabled
+// inside the DB write function as a safety net.
+// ==================================================
 
+const DB_WRITE_CONCURRENCY = Number(
+  process.env.DB_WRITE_CONCURRENCY || 12
+);
+
+const MAX_DB_WRITE_QUEUE_SIZE = Number(
+  process.env.MAX_DB_WRITE_QUEUE_SIZE || 10000
+);
 
 
 
@@ -344,6 +363,17 @@ const inFlightSignatures = new Set();
 
 const signatureQueue = [];
 const workerPromises = [];
+// ==================================================
+// DATABASE WRITE DISPATCHER STATE
+// ==================================================
+
+const dbWriteQueue = [];
+
+// Tokens that currently have a DB job executing.
+const activeDbWriteTokens = new Set();
+
+let dbWritesInFlight = 0;
+let dbWriteDispatcherScheduled = false;
 
 const tokenSafetyEnrichmentInFlight = new Map();
 const tokenLastHolderEnrichedAt = new Map();
@@ -609,6 +639,27 @@ dbMarketUpdateMaxMs: 0,
 dbCommitSamples: 0,
 dbCommitTotalMs: 0,
 dbCommitMaxMs: 0,
+
+  // ==========================================
+// DATABASE WRITE DISPATCHER
+// ==========================================
+
+dbWriteJobsQueued: 0,
+dbWriteJobsStarted: 0,
+dbWriteJobsCompleted: 0,
+dbWriteJobsFailed: 0,
+
+dbWriteQueueDepthMax: 0,
+
+dbWriteInFlightCurrent: 0,
+dbWriteInFlightMax: 0,
+
+dbWriteDispatchBlockedSameToken: 0,
+dbWriteDispatchBackpressure: 0,
+
+dbWriteQueueWaitSamples: 0,
+dbWriteQueueWaitTotalMs: 0,
+dbWriteQueueWaitMaxMs: 0,
 
   // ==========================================
 // REAL TOKEN SERIALIZATION
@@ -10335,7 +10386,590 @@ function dispatchTokenSafetyEnrichment(
     );
   });
 }
+// ==================================================
+// DATABASE WRITE DISPATCHER
+//
+//
+// ==================================================
 
+
+// ==================================================
+// ENQUEUE DATABASE WRITE JOB
+// ==================================================
+
+function enqueueDbWriteJob(job) {
+  if (
+    !job?.signature ||
+    !job?.token?.token_address ||
+    !job?.event?.token_address
+  ) {
+    return false;
+  }
+
+  // ----------------------------------------------
+  // SAFETY BACKPRESSURE
+  //
+  // Never allow the independent DB queue to grow
+  // without bound.
+  //
+  // If the dispatcher queue reaches its configured
+  // maximum, refuse the handoff.
+  //
+  // processQueuedSignature() will then fall back to
+  // the existing synchronous DB-write path rather
+  // than silently dropping an accepted event.
+  // ----------------------------------------------
+
+  if (
+    dbWriteQueue.length >=
+    MAX_DB_WRITE_QUEUE_SIZE
+  ) {
+    stats.dbWriteDispatchBackpressure += 1;
+
+    return false;
+  }
+
+  job.enqueuedAt =
+    performanceNow();
+
+  dbWriteQueue.push(job);
+
+  stats.dbWriteJobsQueued += 1;
+
+  stats.dbWriteQueueDepthMax =
+    Math.max(
+      stats.dbWriteQueueDepthMax,
+      dbWriteQueue.length
+    );
+
+  scheduleDbWriteDispatcher();
+
+  return true;
+}
+
+
+// ==================================================
+// SCHEDULE DATABASE DISPATCHER
+//
+// Multiple enqueue/completion events may request a
+// dispatch pass during the same event-loop turn.
+//
+// Collapse those requests into one setImmediate()
+// callback.
+// ==================================================
+
+function scheduleDbWriteDispatcher() {
+  if (dbWriteDispatcherScheduled) {
+    return;
+  }
+
+  dbWriteDispatcherScheduled = true;
+
+  setImmediate(() => {
+    dbWriteDispatcherScheduled = false;
+
+    dispatchDbWriteJobs();
+  });
+}
+
+
+// ==================================================
+// FIND NEXT DISPATCHABLE DATABASE JOB
+//
+// The DB queue contains jobs from many tokens.
+//
+// If the first queued job belongs to a token that is
+// already executing, continue scanning for work from
+// another token.
+//
+// This prevents a hot token from causing global
+// head-of-line blocking.
+//
+// FIFO ordering is still preserved WITHIN each token
+// because a later job for the same token cannot start
+// while that token is active.
+// ==================================================
+
+function findNextDispatchableDbJobIndex() {
+  for (
+    let index = 0;
+    index < dbWriteQueue.length;
+    index += 1
+  ) {
+    const job =
+      dbWriteQueue[index];
+
+    const tokenAddress =
+      job?.token?.token_address;
+
+    // Invalid jobs should normally never reach this
+    // queue because enqueueDbWriteJob() validates them.
+    //
+    // Returning the index allows the dispatcher to
+    // remove the malformed job rather than allowing it
+    // to block the queue indefinitely.
+    if (!tokenAddress) {
+      return index;
+    }
+
+    if (
+      !activeDbWriteTokens.has(
+        tokenAddress
+      )
+    ) {
+      return index;
+    }
+
+    stats.dbWriteDispatchBlockedSameToken += 1;
+  }
+
+  return -1;
+}
+
+
+// ==================================================
+// EXECUTE ONE DATABASE WRITE JOB
+//
+// This function owns the accepted signature AFTER
+// processQueuedSignature() successfully hands it to
+// the DB dispatcher.
+//
+// It is responsible for:
+//
+// • Primary token/event DB write
+// • Graduation update
+// • Async enrichment dispatch
+// • Success counters
+// • Seen-signature finalization
+// • inFlightSignatures cleanup
+// • Final end-to-end processing timing
+//
+// IMPORTANT:
+//
+// This function does NOT release the dispatcher's
+// token lane or global DB slot.
+//
+// dispatchDbWriteJobs() owns those resources and
+// releases them in its Promise.finally() handler.
+// ==================================================
+
+async function executeDbWriteJob(job) {
+  const {
+    signature,
+    token,
+    event,
+    processingStartedAt,
+  } = job;
+
+  let permanentlySeen = false;
+
+  const dbWriteStartedAt =
+    performanceNow();
+
+  try {
+    // --------------------------------------------
+    // PRIMARY TOKEN / EVENT WRITE
+    //
+    // The existing per-token DB serializer remains
+    // inside this function's downstream write path
+    // as a safety invariant.
+    // --------------------------------------------
+
+    const inserted =
+      await writeLaunchpadTokenAndEvent(
+        token,
+        event
+      );
+
+    // Once the primary database path has completed
+    // normally, preserve the existing signature
+    // lifecycle.
+    //
+    // Duplicate / already-present events are also
+    // considered permanently handled.
+    permanentlySeen = true;
+
+    // --------------------------------------------
+    // DUPLICATE / ALREADY-PRESENT EVENT
+    //
+    // No additional downstream work is required.
+    //
+    // The dispatcher job completed successfully even
+    // though no new event row was inserted.
+    // --------------------------------------------
+
+    if (!inserted) {
+      stats.dbWriteJobsCompleted += 1;
+
+      return;
+    }
+
+    // --------------------------------------------
+    // GRADUATION
+    //
+    // This remains part of the dispatcher-owned job.
+    //
+    // Do not mark the dispatcher job completed until
+    // this awaited work succeeds.
+    // --------------------------------------------
+
+    if (
+      event.event_type ===
+      "migrate"
+    ) {
+      await markTokenGraduated(
+        event.token_address,
+        event.block_time
+      );
+    }
+
+    // --------------------------------------------
+    // ASYNC HOLDER / SAFETY ENRICHMENT
+    //
+    // Intentionally NOT awaited.
+    //
+    // Enrichment remains outside the primary
+    // ingestion / DB-write critical path and does
+    // not determine dispatcher completion.
+    // --------------------------------------------
+
+    if (
+      event.event_type === "create" ||
+      event.event_type === "buy"
+    ) {
+      dispatchTokenSafetyEnrichment(
+        event.token_address
+      );
+    }
+
+    // --------------------------------------------
+    // INSERTED-EVENT SUCCESS STATS
+    //
+    // These counters intentionally represent only
+    // newly inserted / accepted events.
+    // --------------------------------------------
+
+    stats.processed += 1;
+
+    switch (event.event_type) {
+      case "create":
+        stats.classifiedCreate += 1;
+        break;
+
+      case "buy":
+        stats.classifiedBuy += 1;
+        break;
+
+      case "sell":
+        stats.classifiedSell += 1;
+        break;
+
+      case "migrate":
+        stats.classifiedMigrate += 1;
+        break;
+
+      default:
+        stats.classifiedUnknown += 1;
+        break;
+    }
+
+    // --------------------------------------------
+    // SUCCESSFUL DISPATCHER COMPLETION
+    //
+    // Reaching this point means all awaited work
+    // owned by this dispatcher job completed
+    // successfully.
+    //
+    // Duplicate jobs are counted in the early-return
+    // path above. Newly inserted jobs are counted
+    // here only after any required graduation work
+    // has also succeeded.
+    //
+    // This keeps dispatcher accounting mutually
+    // exclusive:
+    //
+    // started
+    //   ≈ completed + failed + currently in flight
+    // --------------------------------------------
+
+    stats.dbWriteJobsCompleted += 1;
+
+  } finally {
+    // --------------------------------------------
+    // DB WRITE PERFORMANCE
+    //
+    // For dispatched jobs this measures execution
+    // time after the dispatcher actually starts the
+    // job.
+    //
+    // Dispatcher queue wait is measured separately.
+    // --------------------------------------------
+
+    recordPerformanceTiming(
+      "dbWrite",
+      performanceNow() -
+        dbWriteStartedAt
+    );
+
+    // --------------------------------------------
+    // SIGNATURE LIFECYCLE COMPLETES HERE
+    //
+    // processQueuedSignature() deliberately leaves
+    // the signature in inFlightSignatures after a
+    // successful dispatcher handoff.
+    //
+    // Ownership therefore ends here regardless of
+    // success or failure.
+    // --------------------------------------------
+
+    inFlightSignatures.delete(
+      signature
+    );
+
+    if (permanentlySeen) {
+      addSeenSignature(
+        signature
+      );
+    }
+
+    // --------------------------------------------
+    // END-TO-END PROCESSING PERFORMANCE
+    //
+    // For dispatched accepted events this measures:
+    //
+    // accepted by worker
+    //        ↓
+    // RPC / classification
+    //        ↓
+    // DB dispatcher queue
+    //        ↓
+    // database work
+    //        ↓
+    // dispatcher completion
+    //
+    // Signature-queue waiting remains excluded.
+    // --------------------------------------------
+
+    if (
+      Number.isFinite(
+        processingStartedAt
+      )
+    ) {
+      recordPerformanceTiming(
+        "processing",
+        performanceNow() -
+          processingStartedAt
+      );
+    }
+  }
+}
+
+// ==================================================
+// DISPATCH DATABASE WRITE JOBS
+//
+// Starts as many jobs as possible while respecting:
+//
+// 1. Global DB_WRITE_CONCURRENCY
+// 2. Maximum one active write per token
+//
+// Different tokens remain fully concurrent.
+//
+// Same-token jobs remain queued until the currently
+// active write for that token completes.
+// ==================================================
+
+function dispatchDbWriteJobs() {
+  while (
+    dbWritesInFlight <
+      DB_WRITE_CONCURRENCY &&
+    dbWriteQueue.length > 0
+  ) {
+    const jobIndex =
+      findNextDispatchableDbJobIndex();
+
+    // Every queued job currently belongs to a token
+    // that already has a DB write executing.
+    //
+    // A completion callback will schedule another
+    // dispatcher pass when one of those lanes opens.
+    if (jobIndex < 0) {
+      return;
+    }
+
+    const [job] =
+      dbWriteQueue.splice(
+        jobIndex,
+        1
+      );
+
+    const tokenAddress =
+      job?.token?.token_address;
+
+    // --------------------------------------------
+    // DEFENSIVE INVALID-JOB HANDLING
+    //
+    // enqueueDbWriteJob() already validates jobs, so
+    // this should never normally fire.
+    //
+    // Do not allow malformed work to consume a
+    // dispatcher slot or poison the queue.
+    // --------------------------------------------
+
+    if (
+      !job?.signature ||
+      !tokenAddress ||
+      !job?.event?.token_address
+    ) {
+      stats.dbWriteJobsFailed += 1;
+
+      logError(
+        "Invalid database write job",
+        {
+          signature:
+            job?.signature ||
+            null,
+
+          tokenAddress:
+            tokenAddress ||
+            null,
+        }
+      );
+
+      if (job?.signature) {
+        inFlightSignatures.delete(
+          job.signature
+        );
+      }
+
+      continue;
+    }
+
+    // --------------------------------------------
+    // RESERVE TOKEN LANE
+    // --------------------------------------------
+
+    activeDbWriteTokens.add(
+      tokenAddress
+    );
+
+    // --------------------------------------------
+    // RESERVE GLOBAL DB SLOT
+    // --------------------------------------------
+
+    dbWritesInFlight += 1;
+
+    stats.dbWriteJobsStarted += 1;
+
+    stats.dbWriteInFlightCurrent =
+      dbWritesInFlight;
+
+    stats.dbWriteInFlightMax =
+      Math.max(
+        stats.dbWriteInFlightMax,
+        dbWritesInFlight
+      );
+
+    // --------------------------------------------
+    // DISPATCH QUEUE WAIT
+    //
+    // Measures time between:
+    //
+    // enqueueDbWriteJob()
+    //        ↓
+    // actual DB execution start
+    // --------------------------------------------
+
+    const queueWaitMs =
+      Number.isFinite(
+        job.enqueuedAt
+      )
+        ? Math.max(
+            0,
+            performanceNow() -
+              job.enqueuedAt
+          )
+        : 0;
+
+    stats.dbWriteQueueWaitSamples += 1;
+
+    stats.dbWriteQueueWaitTotalMs +=
+      queueWaitMs;
+
+    stats.dbWriteQueueWaitMaxMs =
+      Math.max(
+        stats.dbWriteQueueWaitMaxMs,
+        queueWaitMs
+      );
+
+    // --------------------------------------------
+    // EXECUTE ASYNCHRONOUSLY
+    //
+    // IMPORTANT:
+    //
+    // We deliberately do NOT await this Promise.
+    //
+    // The dispatcher may immediately start another
+    // job for a DIFFERENT token while capacity
+    // remains available.
+    // --------------------------------------------
+
+    executeDbWriteJob(job)
+      .catch((error) => {
+        stats.dbWriteJobsFailed += 1;
+
+        logError(
+          "Database write job failed",
+          {
+            signature:
+              job.signature,
+
+            tokenAddress,
+
+            error:
+              String(
+                error?.message ||
+                error
+              ),
+          }
+        );
+      })
+      .finally(() => {
+        // ----------------------------------------
+        // RELEASE TOKEN LANE
+        // ----------------------------------------
+
+        activeDbWriteTokens.delete(
+          tokenAddress
+        );
+
+        // ----------------------------------------
+        // RELEASE GLOBAL DB SLOT
+        // ----------------------------------------
+
+        dbWritesInFlight =
+          Math.max(
+            0,
+            dbWritesInFlight - 1
+          );
+
+        stats.dbWriteInFlightCurrent =
+          dbWritesInFlight;
+
+        // ----------------------------------------
+        // RESUME DISPATCH
+        //
+        // Completion may have:
+        //
+        // • opened a global concurrency slot
+        // • made another same-token job eligible
+        //
+        // Schedule another dispatcher pass.
+        // ----------------------------------------
+
+        scheduleDbWriteDispatcher();
+      });
+  }
+}
 // ==================================================
 // 13. SIGNATURE PROCESSING
 //
@@ -10361,9 +10995,12 @@ async function processQueuedSignature(item) {
     return;
   }
 
-  const signature = item.signature;
+  const signature =
+    item.signature;
 
-  queuedSignatures.delete(signature);
+  queuedSignatures.delete(
+    signature
+  );
 
   if (
     seenSignatures.has(signature) ||
@@ -10386,18 +11023,30 @@ async function processQueuedSignature(item) {
     return;
   }
 
-  inFlightSignatures.add(signature);
+  inFlightSignatures.add(
+    signature
+  );
+
   stats.dequeued += 1;
 
   // Begin timing only after the signature is accepted
-  // for processing. Queue waiting time is excluded.
-  const processingStartedAt = performanceNow();
+  // for processing. Signature-queue waiting is excluded.
+  const processingStartedAt =
+    performanceNow();
 
   let permanentlySeen = false;
 
-  try {
+  // When true, ownership of:
+  //
+  // • inFlightSignatures cleanup
+  // • seen-signature finalization
+  // • final processing timing
+  //
+  // has moved to executeDbWriteJob().
+  let handedOffToDbDispatcher =
+    false;
 
-    
+  try {
     // ----------------------------------------------
     // FETCH HYDRATED TRANSACTION
     //
@@ -10405,21 +11054,24 @@ async function processQueuedSignature(item) {
     // own RPC timing in Section 9.
     // ----------------------------------------------
 
-    const tx = await fetchFullTransaction(
-      signature
-    );
+    const tx =
+      await fetchFullTransaction(
+        signature
+      );
 
     if (!tx) {
       stats.skippedEmptyTx += 1;
 
       // Preserve existing behavior:
-      // Do not mark a temporary null RPC response
-      // as permanently seen.
+      //
+      // A temporary null RPC response is NOT marked
+      // permanently seen so it remains retryable.
       return;
     }
 
     if (tx.meta?.err) {
       stats.skippedFailedTx += 1;
+
       permanentlySeen = true;
       return;
     }
@@ -10444,9 +11096,11 @@ async function processQueuedSignature(item) {
           item.blockTime ||
           null,
 
-        type: "helius_ws_pregrad_tx",
+        type:
+          "helius_ws_pregrad_tx",
 
-        payload: tx,
+        payload:
+          tx,
       });
     }
 
@@ -10454,43 +11108,49 @@ async function processQueuedSignature(item) {
     // CLASSIFY PUMP.FUN EVENT
     // ----------------------------------------------
 
- const classified =
-  classifyPregradEvent(
-    tx,
-    signature
-  );
+    const classified =
+      classifyPregradEvent(
+        tx,
+        signature
+      );
 
-if (!classified.ok) {
-  if (
-    classified.reason ===
-    "unsupported_pump_instruction"
-  ) {
-    stats.skippedUnsupportedPumpInstruction += 1;
-  }
+    if (!classified.ok) {
+      if (
+        classified.reason ===
+        "unsupported_pump_instruction"
+      ) {
+        stats.skippedUnsupportedPumpInstruction +=
+          1;
+      }
 
-  else if (
-    classified.reason ===
-    "unresolved_token_mint"
-  ) {
-    stats.skippedUnresolvedMint += 1;
+      else if (
+        classified.reason ===
+        "unresolved_token_mint"
+      ) {
+        stats.skippedUnresolvedMint +=
+          1;
 
-    recordUnresolvedMintDiagnostics(
-      tx,
-      signature
-    );
-  }
+        recordUnresolvedMintDiagnostics(
+          tx,
+          signature
+        );
+      }
 
-  permanentlySeen = true;
-  return;
-}
+      permanentlySeen = true;
+      return;
+    }
 
-    const event = classified.event;
-    const token = classified.tokenUpsert;
+    const event =
+      classified.event;
+
+    const token =
+      classified.tokenUpsert;
 
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
     // Create and migrate events are always allowed.
+    //
     // Only buy and sell events use the SOL threshold.
     // ----------------------------------------------
 
@@ -10502,120 +11162,116 @@ if (!classified.ok) {
       const minSolAmount =
         effectiveMinSolAmount();
 
-      const solAmount = Number(
-        event.sol_amount
-      );
+      const solAmount =
+        Number(
+          event.sol_amount
+        );
 
       if (
         !Number.isFinite(solAmount) ||
         solAmount < minSolAmount
       ) {
-        stats.skippedSmallSolAmount += 1;
+        stats.skippedSmallSolAmount +=
+          1;
+
         permanentlySeen = true;
         return;
       }
     }
 
-    // ----------------------------------------------
-    // DATABASE WRITE PERFORMANCE
+    // ==============================================
+    // DATABASE WRITE HANDOFF
     //
-    // Measures the complete primary write phase:
-    // • Token upsert
-    // • Event insert
-    // • Market-data update, when applicable
-    // • Graduation update, when applicable
+    // The signature worker has now completed:
     //
-    // The inner finally records timing even if
-    // a database operation throws or returns early.
+    // • RPC fetch
+    // • validation
+    // • classification
+    // • mint resolution
+    // • trade-size filtering
+    //
+    // From this point forward, ALL accepted database
+    // work must pass through the DB dispatcher.
+    //
+    // IMPORTANT:
+    //
+    // There is NO synchronous database fallback.
+    //
+    // Allowing a worker to bypass the dispatcher
+    // during backpressure could violate same-token
+    // FIFO ordering.
+    // ==============================================
+
+    const dbJob = {
+      signature,
+      token,
+      event,
+      processingStartedAt,
+    };
+
+    // ----------------------------------------------
+    // ORDER-PRESERVING DISPATCHER BACKPRESSURE
+    //
+    // Normally this loop executes exactly once.
+    //
+    // If the DB queue reaches its configured maximum,
+    // wait briefly for dispatcher capacity and retry.
+    //
+    // This may temporarily occupy a signature worker
+    // during genuine DB saturation, but it preserves:
+    //
+    // • accepted events
+    // • dispatcher ownership
+    // • same-token FIFO ordering
+    //
+    // and prevents direct DB writes from jumping ahead
+    // of already-queued work for the same token.
     // ----------------------------------------------
 
-    const dbWriteStartedAt = performanceNow();
+    while (true) {
+      const handedOff =
+        enqueueDbWriteJob(
+          dbJob
+        );
 
-    let inserted = false;
+      if (handedOff) {
+        handedOffToDbDispatcher = true;
 
-    try {
-      // --------------------------------------------
-      // PRIMARY TOKEN WRITE
-      // --------------------------------------------
-
-     inserted =
-  await writeLaunchpadTokenAndEvent(
-    token,
-    event
-  );
-
-      permanentlySeen = true;
-
-      if (!inserted) {
+        // IMPORTANT:
+        //
+        // Do NOT:
+        //
+        // • remove signature from inFlightSignatures
+        // • add signature to seenSignatures
+        // • record final processing timing
+        //
+        // executeDbWriteJob() now owns the remainder
+        // of this signature's lifecycle.
         return;
       }
 
- 
-     // --------------------------------------------
-      // GRADUATION
+      // --------------------------------------------
+      // WAIT FOR DISPATCHER CAPACITY
+      //
+      // enqueueDbWriteJob() returning false means the
+      // bounded dispatcher queue could not accept the
+      // job immediately.
+      //
+      // Do not bypass the dispatcher.
+      // Do not drop the accepted event.
       // --------------------------------------------
 
-      if (
-        event.event_type === "migrate"
-      ) {
-        await markTokenGraduated(
-          event.token_address,
-          event.block_time
-        );
-      }
-    } finally {
-      recordPerformanceTiming(
-        "dbWrite",
-        performanceNow() - dbWriteStartedAt
-      );
+      await sleep(25);
     }
 
-    // ----------------------------------------------
-    // ASYNC HOLDER ENRICHMENT
-    //
-    // Only creates and buys initiate holder scans.
-    // This call is intentionally never awaited.
-    // ----------------------------------------------
-
-    if (
-      event.event_type === "create" ||
-      event.event_type === "buy"
-    ) {
-      dispatchTokenSafetyEnrichment(
-        event.token_address
-      );
-    }
-
-    // ----------------------------------------------
-    // SUCCESS STATS
-    // ----------------------------------------------
-
-    stats.processed += 1;
-
-    switch (event.event_type) {
-      case "create":
-        stats.classifiedCreate += 1;
-        break;
-
-      case "buy":
-        stats.classifiedBuy += 1;
-        break;
-
-      case "sell":
-        stats.classifiedSell += 1;
-        break;
-
-      case "migrate":
-        stats.classifiedMigrate += 1;
-        break;
-
-      default:
-        stats.classifiedUnknown += 1;
-        break;
-    }
   } catch (error) {
     // Preserve the existing error counter and
-    // error-handling behavior.
+    // error-handling behavior for work still owned
+    // by the signature-processing worker.
+    //
+    // Once dispatcher handoff succeeds, failures are
+    // handled by the dispatcher instead.
+
     stats.txFetchErrors += 1;
 
     logError(
@@ -10623,35 +11279,48 @@ if (!classified.ok) {
       {
         signature,
 
-        error: String(
-          error?.message || error
-        ),
+        error:
+          String(
+            error?.message ||
+            error
+          ),
       }
     );
+
   } finally {
-    // ----------------------------------------------
-    // TOTAL PROCESSING PERFORMANCE
+    // ==============================================
+    // SIGNATURE LIFECYCLE OWNERSHIP
     //
-    // Includes:
-    // • RPC fetch and retries
-    // • Optional raw storage
-    // • Classification
-    // • Database writes
+    // If the DB dispatcher accepted the job,
+    // executeDbWriteJob() owns final cleanup.
     //
-    // Excludes:
-    // • Time spent waiting in the queue
-    // • Async holder-enrichment execution
-    // ----------------------------------------------
+    // Otherwise this function retains the original
+    // lifecycle responsibilities.
+    // ==============================================
 
-    recordPerformanceTiming(
-      "processing",
-      performanceNow() - processingStartedAt
-    );
+    if (!handedOffToDbDispatcher) {
+      // --------------------------------------------
+      // TOTAL PROCESSING PERFORMANCE
+      //
+      // For signatures that do NOT enter the
+      // dispatcher, preserve the original meaning.
+      // --------------------------------------------
 
-    inFlightSignatures.delete(signature);
+      recordPerformanceTiming(
+        "processing",
+        performanceNow() -
+          processingStartedAt
+      );
 
-    if (permanentlySeen) {
-      addSeenSignature(signature);
+      inFlightSignatures.delete(
+        signature
+      );
+
+      if (permanentlySeen) {
+        addSeenSignature(
+          signature
+        );
+      }
     }
   }
 }
@@ -11154,35 +11823,96 @@ let previousLogAt =
 // Produces one compact scanner-health record per
 // logging interval.
 //
-// Existing diagnostics:
+// INGESTION:
 // • WebSocket health
-// • Queue depth and oldest signature age
-// • In-flight transaction count
-// • Incoming, drain, insert and processing rates
-// • Cumulative scanner counters
+// • Signature queue depth / age
+// • In-flight signature count
+// • Incoming / drain / insert / processing rates
 //
-// Performance diagnostics:
-// • RPC fetch lifecycle latency
+// DB WRITE DISPATCHER:
+// • DB-write queue depth / age
+// • Active DB-write concurrency
+// • Active token lanes
+// • DB dispatcher queue-wait latency
+// • Dispatcher throughput
+// • Dispatcher backpressure
+//
+// TOKEN SERIALIZER:
+// • Worker waits
+// • Maximum simultaneous waiters
+// • Token-lane queue depth
+// • Same-token contention diagnostics
+//
+// DATABASE:
+// • Complete DB-write latency
+// • Pool-acquisition latency
+// • PostgreSQL transaction latency
+// • BEGIN
+// • token UPSERT
+// • event INSERT
+// • market UPDATE
+// • COMMIT
+// • Slow transaction diagnostics
+//
+// RPC:
+// • Full RPC fetch lifecycle
 // • Pure RPC attempt latency
-// • Total database-write latency
-// • PostgreSQL pool-acquisition latency
-// • Complete PostgreSQL transaction latency
-// • Individual combined-write transaction stages:
-//     - BEGIN
-//     - token UPSERT
-//     - event INSERT
-//     - market UPDATE
-//     - COMMIT
-// • Slow database-transaction distribution
-// • Total signature-processing latency
-// • Completed and ongoing intake-pause duration
-// • PostgreSQL connection-pool pressure
-// • Effective runtime configuration
+//
+// COVERAGE:
+// • Intake pauses
+// • Pause duration
+// • Queue / stale / pause drops
 //
 // Timing summaries are cumulative since startup.
 // Rate measurements cover the current log interval.
 //
 // Observation only: does not modify ingestion.
+// ==================================================
+
+// ==================================================
+// 16C. SCANNER STATS LOGGER
+//
+// Produces one scanner-health record per interval.
+//
+// Tracks:
+//
+// INGESTION
+// • Signature queue depth / age
+// • In-flight signatures
+// • Incoming / drain / insert / processing rates
+//
+// DB WRITE DISPATCHER
+// • Queue depth / oldest job
+// • Jobs queued / started / completed
+// • Queue wait
+// • Active DB writes / token lanes
+// • Backpressure
+//
+// TOKEN SERIALIZER
+// • Real serializer waits
+// • Worker wait pressure
+//
+// DATABASE
+// • DB-write latency
+// • Pool acquisition
+// • Transaction execution
+// • Individual transaction stages
+// • Slow transaction distribution
+// • Contention-depth diagnostics
+//
+// RPC
+// • Full fetch lifecycle
+// • Individual RPC attempts
+//
+// COVERAGE / HEALTH
+// • Intake pauses
+// • PostgreSQL pool pressure
+// • Effective runtime configuration
+//
+// Timing summaries are cumulative since startup.
+// Rates cover only the current logging interval.
+//
+// Observation only.
 // ==================================================
 
 function startQueueLogger() {
@@ -11202,9 +11932,9 @@ function startQueueLogger() {
       loggerRunning = true;
 
       try {
-        // ------------------------------------------
+        // ==========================================
         // SHARED CONTROL REFRESH
-        // ------------------------------------------
+        // ==========================================
 
         await getPregradControl();
 
@@ -11215,61 +11945,112 @@ function startQueueLogger() {
           1
         );
 
-        const oldest = signatureQueue[0];
+        const oldestSignature =
+          signatureQueue[0];
 
-        // ------------------------------------------
-        // INGESTION RATES
-        //
-        // These measure the interval since the
-        // previous successful stats log.
-        // ------------------------------------------
+        const oldestDbWriteJob =
+          dbWriteQueue[0];
 
-        const incomingPerSecond = Number(
-          (
+        // ==========================================
+        // INTERVAL INGESTION RATES
+        // ==========================================
+
+        const incomingPerSecond =
+          Number(
             (
-              stats.queued -
-              previousStats.queued
-            ) /
-            seconds
-          ).toFixed(2)
-        );
+              (
+                stats.queued -
+                previousStats.queued
+              ) /
+              seconds
+            ).toFixed(2)
+          );
 
-        const drainedPerSecond = Number(
-          (
+        const drainedPerSecond =
+          Number(
             (
-              stats.dequeued -
-              previousStats.dequeued
-            ) /
-            seconds
-          ).toFixed(2)
-        );
+              (
+                stats.dequeued -
+                previousStats.dequeued
+              ) /
+              seconds
+            ).toFixed(2)
+          );
 
-        const insertedPerSecond = Number(
-          (
+        const insertedPerSecond =
+          Number(
             (
-              stats.insertedEvents -
-              previousStats.insertedEvents
-            ) /
-            seconds
-          ).toFixed(2)
-        );
+              (
+                stats.insertedEvents -
+                previousStats.insertedEvents
+              ) /
+              seconds
+            ).toFixed(2)
+          );
 
-        const processedPerSecond = Number(
-          (
+        const processedPerSecond =
+          Number(
             (
-              stats.processed -
-              previousStats.processed
-            ) /
-            seconds
-          ).toFixed(2)
-        );
+              (
+                stats.processed -
+                previousStats.processed
+              ) /
+              seconds
+            ).toFixed(2)
+          );
 
-        // ------------------------------------------
-        // PERFORMANCE SUMMARIES
-        //
-        // Cumulative since scanner startup.
-        // Includes samples, average and maximum.
-        // ------------------------------------------
+        // ==========================================
+        // DB DISPATCHER INTERVAL RATES
+        // ==========================================
+
+        const dbJobsQueuedPerSecond =
+          Number(
+            (
+              (
+                stats.dbWriteJobsQueued -
+                (
+                  previousStats
+                    .dbWriteJobsQueued ||
+                  0
+                )
+              ) /
+              seconds
+            ).toFixed(2)
+          );
+
+        const dbJobsStartedPerSecond =
+          Number(
+            (
+              (
+                stats.dbWriteJobsStarted -
+                (
+                  previousStats
+                    .dbWriteJobsStarted ||
+                  0
+                )
+              ) /
+              seconds
+            ).toFixed(2)
+          );
+
+        const dbJobsCompletedPerSecond =
+          Number(
+            (
+              (
+                stats.dbWriteJobsCompleted -
+                (
+                  previousStats
+                    .dbWriteJobsCompleted ||
+                  0
+                )
+              ) /
+              seconds
+            ).toFixed(2)
+          );
+
+        // ==========================================
+        // CORE PERFORMANCE SUMMARIES
+        // ==========================================
 
         const rpcFetchPerformance =
           getPerformanceSummary(
@@ -11286,16 +12067,22 @@ function startQueueLogger() {
             "dbWrite"
           );
 
-        // ------------------------------------------
+        const processingPerformance =
+          getPerformanceSummary(
+            "processing"
+          );
+
+        const intakePausePerformance =
+          getPerformanceSummary(
+            "intakePause"
+          );
+
+        // ==========================================
         // DATABASE DIAGNOSTIC SUMMARIES
         //
-        // Pool acquisition:
-        // Time spent waiting for pool.connect().
-        //
-        // Query execution:
-        // Complete combined-write transaction after
-        // a PostgreSQL client has been acquired.
-        // ------------------------------------------
+        // These diagnostics use their dedicated
+        // counters rather than getPerformanceSummary().
+        // ==========================================
 
         const dbPoolAcquirePerformance = {
           samples:
@@ -11345,14 +12132,9 @@ function startQueueLogger() {
               : null,
         };
 
-        // ------------------------------------------
+        // ==========================================
         // COMBINED-WRITE STAGE SUMMARIES
-        //
-        // Individual stages inside the transaction.
-        //
-        // These allow us to identify exactly where
-        // transaction latency is being accumulated.
-        // ------------------------------------------
+        // ==========================================
 
         const dbBeginPerformance =
           getDbStageSummary(
@@ -11379,13 +12161,18 @@ function startQueueLogger() {
             "commit"
           );
 
-        // ------------------------------------------
+        // ==========================================
+        // CONTENTION DEPTH PERFORMANCE
+        // ==========================================
+
+        const contentionDepthPerformance =
+          summarizeContentionDepth();
+
+        // ==========================================
         // SLOW DATABASE TRANSACTION DISTRIBUTION
         //
-        // Thresholds are cumulative. Therefore a
-        // transaction taking 6 seconds contributes
-        // to all four threshold counters.
-        // ------------------------------------------
+        // Threshold counters are cumulative.
+        // ==========================================
 
         const slowDbQueries = {
           over250ms:
@@ -11401,22 +12188,218 @@ function startQueueLogger() {
             stats.dbQueriesOver5000ms,
         };
 
-        const processingPerformance =
-          getPerformanceSummary(
-            "processing"
-          );
+        // ==========================================
+        // SIGNATURE QUEUE HEALTH
+        // ==========================================
 
-        const intakePausePerformance =
-          getPerformanceSummary(
-            "intakePause"
-          );
+        const oldestSignatureAgeMs =
+          oldestSignature
+            ? Math.max(
+                now -
+                  oldestSignature.enqueuedAt,
+                0
+              )
+            : 0;
 
-        // ------------------------------------------
+        // ==========================================
+        // DATABASE WRITE DISPATCHER HEALTH
+        // ==========================================
+
+        const oldestDbWriteJobAgeMs =
+          oldestDbWriteJob &&
+          Number.isFinite(
+            oldestDbWriteJob.enqueuedAt
+          )
+            ? Math.max(
+                performanceNow() -
+                  oldestDbWriteJob.enqueuedAt,
+                0
+              )
+            : 0;
+
+        const avgDbWriteQueueWaitMs =
+          stats.dbWriteQueueWaitSamples > 0
+            ? Number(
+                (
+                  stats.dbWriteQueueWaitTotalMs /
+                  stats.dbWriteQueueWaitSamples
+                ).toFixed(2)
+              )
+            : null;
+
+        const dbWriteDispatcher = {
+          queueSize:
+            dbWriteQueue.length,
+
+          inFlight:
+            dbWritesInFlight,
+
+          activeTokens:
+            activeDbWriteTokens.size,
+
+          concurrency:
+            DB_WRITE_CONCURRENCY,
+
+          maxQueueSize:
+            MAX_DB_WRITE_QUEUE_SIZE,
+
+          oldestJobAgeMs:
+            Number(
+              oldestDbWriteJobAgeMs.toFixed(
+                2
+              )
+            ),
+
+          avgQueueWaitMs:
+            avgDbWriteQueueWaitMs,
+
+          maxQueueWaitMs:
+            stats.dbWriteQueueWaitSamples > 0
+              ? Number(
+                  stats.dbWriteQueueWaitMaxMs.toFixed(
+                    2
+                  )
+                )
+              : null,
+
+          jobsQueuedPerSecond:
+            dbJobsQueuedPerSecond,
+
+          jobsStartedPerSecond:
+            dbJobsStartedPerSecond,
+
+          jobsCompletedPerSecond:
+            dbJobsCompletedPerSecond,
+
+          queueDepthMax:
+            stats.dbWriteQueueDepthMax,
+
+          inFlightMax:
+            stats.dbWriteInFlightMax,
+
+          // NOTE:
+          // This is a dispatcher scan counter.
+          // It may count the same blocked queued job
+          // more than once across dispatch passes.
+          blockedSameTokenScans:
+            stats.dbWriteDispatchBlockedSameToken,
+
+          backpressureEvents:
+            stats.dbWriteDispatchBackpressure,
+
+          jobsQueued:
+            stats.dbWriteJobsQueued,
+
+          jobsStarted:
+            stats.dbWriteJobsStarted,
+
+          jobsCompleted:
+            stats.dbWriteJobsCompleted,
+
+          jobsFailed:
+            stats.dbWriteJobsFailed,
+        };
+
+        // ==========================================
+        // REAL TOKEN SERIALIZER HEALTH
+        // ==========================================
+
+        const avgTokenSerializerWaitMs =
+          stats.tokenSerializerWaited > 0
+            ? Number(
+                (
+                  stats.tokenSerializerWaitTotalMs /
+                  stats.tokenSerializerWaited
+                ).toFixed(2)
+              )
+            : null;
+
+        const avgTokenSerializerQueueDepth =
+          stats.tokenSerializerSamples > 0
+            ? Number(
+                (
+                  stats.tokenSerializerQueueDepthTotal /
+                  stats.tokenSerializerSamples
+                ).toFixed(2)
+              )
+            : null;
+
+        const tokenSerializerHealth = {
+          samples:
+            stats.tokenSerializerSamples,
+
+          immediate:
+            stats.tokenSerializerImmediate,
+
+          waited:
+            stats.tokenSerializerWaited,
+
+          avgWaitMs:
+            avgTokenSerializerWaitMs,
+
+          maxWaitMs:
+            stats.tokenSerializerWaited > 0
+              ? Number(
+                  stats.tokenSerializerWaitMaxMs.toFixed(
+                    2
+                  )
+                )
+              : null,
+
+          avgQueueDepth:
+            avgTokenSerializerQueueDepth,
+
+          maxQueueDepth:
+            stats.tokenSerializerQueueDepthMax,
+        };
+
+        // ==========================================
+        // TOKEN SERIALIZER WORKER PRESSURE
+        //
+        // With the DB dispatcher working correctly,
+        // these should remain near zero because the
+        // dispatcher should prevent same-token jobs
+        // from entering the serializer concurrently.
+        // ==========================================
+
+        const tokenSerializerWorkerHealth = {
+          waitingCurrent:
+            stats.tokenSerializerWorkersWaitingCurrent,
+
+          waitingMax:
+            stats.tokenSerializerWorkersWaitingMax,
+
+          waitSamples:
+            stats.tokenSerializerWorkerWaitSamples,
+
+          waitDepth1:
+            stats.tokenSerializerWorkerWaitDepth1,
+
+          waitDepth2:
+            stats.tokenSerializerWorkerWaitDepth2,
+
+          waitDepth3To5:
+            stats.tokenSerializerWorkerWaitDepth3To5,
+
+          waitDepth6To10:
+            stats.tokenSerializerWorkerWaitDepth6To10,
+
+          waitDepth11To20:
+            stats.tokenSerializerWorkerWaitDepth11To20,
+
+          waitDepth21Plus:
+            stats.tokenSerializerWorkerWaitDepth21Plus,
+
+          saturationSamples:
+            stats.tokenSerializerWorkerSaturationSamples,
+        };
+
+        // ==========================================
         // CURRENT INTAKE PAUSE
         //
-        // Completed pauses are recorded in stats.
-        // An ongoing pause must be measured here.
-        // ------------------------------------------
+        // Completed pauses are already represented by
+        // intakePausePerformance.
+        // ==========================================
 
         const currentPauseMs =
           intakePaused &&
@@ -11430,12 +12413,9 @@ function startQueueLogger() {
               )
             : 0;
 
-        // ------------------------------------------
+        // ==========================================
         // POSTGRESQL CONNECTION POOL
-        //
-        // These are synchronous pool properties.
-        // No additional database query is required.
-        // ------------------------------------------
+        // ==========================================
 
         const postgresPool = {
           totalConnections:
@@ -11451,12 +12431,12 @@ function startQueueLogger() {
             pool.options.max,
         };
 
-        // ------------------------------------------
+        // ==========================================
         // EFFECTIVE RUNTIME CONFIGURATION
         //
         // Queue limit and minimum SOL threshold may
         // be overridden by pregrad_system_control.
-        // ------------------------------------------
+        // ==========================================
 
         const effectiveConfiguration = {
           maxQueueSize:
@@ -11474,20 +12454,25 @@ function startQueueLogger() {
           maxTxPerSecond:
             MAX_TX_PER_SECOND,
 
+          dbWriteConcurrency:
+            DB_WRITE_CONCURRENCY,
+
+          maxDbWriteQueueSize:
+            MAX_DB_WRITE_QUEUE_SIZE,
+
           minSolAmount:
             effectiveMinSolAmount(),
 
           storeRawEvents:
             STORE_RAW_EVENTS,
 
-          
-  tokenDbSerializationEnabled:
-    TOKEN_DB_SERIALIZATION_ENABLED,
+          tokenDbSerializationEnabled:
+            TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
-        // ------------------------------------------
+        // ==========================================
         // EMIT SCANNER HEALTH RECORD
-        // ------------------------------------------
+        // ==========================================
 
         logInfo(
           "Scanner stats",
@@ -11510,6 +12495,10 @@ function startQueueLogger() {
 
             workerRunning,
 
+            // --------------------------------------
+            // SIGNATURE PIPELINE
+            // --------------------------------------
+
             queueSize:
               signatureQueue.length,
 
@@ -11525,71 +12514,88 @@ function startQueueLogger() {
             holderEnrichmentInFlight:
               tokenSafetyEnrichmentInFlight.size,
 
-            oldestSignatureAgeMs:
-              oldest
-                ? Math.max(
-                    now -
-                      oldest.enqueuedAt,
-                    0
-                  )
-                : 0,
+            oldestSignatureAgeMs,
 
-            // Interval rates
+            // --------------------------------------
+            // INTERVAL INGESTION RATES
+            // --------------------------------------
+
             incomingPerSecond,
             drainedPerSecond,
             insertedPerSecond,
             processedPerSecond,
 
-            // RPC latency
+            // --------------------------------------
+            // DB WRITE DISPATCHER
+            // --------------------------------------
+
+            dbWriteDispatcher,
+
+            // --------------------------------------
+            // TOKEN SERIALIZATION
+            // --------------------------------------
+
+            tokenSerializerHealth,
+            tokenSerializerWorkerHealth,
+
+            // --------------------------------------
+            // RPC PERFORMANCE
+            // --------------------------------------
+
             rpcFetchPerformance,
             rpcAttemptPerformance,
 
-            // Overall database latency
+            // --------------------------------------
+            // DATABASE PERFORMANCE
+            // --------------------------------------
+
             dbWritePerformance,
             dbPoolAcquirePerformance,
             dbQueryExecutionPerformance,
 
-            // Individual transaction stages
             dbBeginPerformance,
             dbTokenUpsertPerformance,
             dbEventInsertPerformance,
             dbMarketUpdatePerformance,
             dbCommitPerformance,
 
-            // Contention depth performance
-contentionDepthPerformance:
-  summarizeContentionDepth(),
+            contentionDepthPerformance,
 
-            // Slow transaction distribution
             slowDbQueries,
 
-            // Total processing latency
+            // --------------------------------------
+            // END-TO-END PROCESSING
+            // --------------------------------------
+
             processingPerformance,
 
-            // Intake-pause latency
-            intakePausePerformance,
+            // --------------------------------------
+            // COVERAGE / PAUSE HEALTH
+            // --------------------------------------
 
-            // Ongoing pause duration
+            intakePausePerformance,
             currentPauseMs,
 
-            // Database connection pressure
-            postgresPool,
+            // --------------------------------------
+            // POSTGRES / CONFIGURATION
+            // --------------------------------------
 
-            // Actual active settings
+            postgresPool,
             effectiveConfiguration,
 
-            // Preserve every existing counter,
-            // including raw DB diagnostic and
-            // transaction-stage counters.
+            // --------------------------------------
+            // PRESERVE ALL RAW CUMULATIVE COUNTERS
+            // --------------------------------------
+
             ...stats,
           }
         );
 
-        // ------------------------------------------
+        // ==========================================
         // UPDATE INTERVAL BASELINE
         //
         // Only advance after successful logging.
-        // ------------------------------------------
+        // ==========================================
 
         previousStats = {
           queued:
@@ -11603,6 +12609,15 @@ contentionDepthPerformance:
 
           processed:
             stats.processed,
+
+          dbWriteJobsQueued:
+            stats.dbWriteJobsQueued,
+
+          dbWriteJobsStarted:
+            stats.dbWriteJobsStarted,
+
+          dbWriteJobsCompleted:
+            stats.dbWriteJobsCompleted,
         };
 
         previousLogAt = now;
@@ -11611,10 +12626,11 @@ contentionDepthPerformance:
         logError(
           "Scanner stats logging failed",
           {
-            error: String(
-              error?.message ||
+            error:
+              String(
+                error?.message ||
                 error
-            ),
+              ),
           }
         );
 
@@ -11622,6 +12638,7 @@ contentionDepthPerformance:
         loggerRunning = false;
       }
     },
+
     QUEUE_LOG_EVERY_MS
   );
 
@@ -11633,7 +12650,6 @@ contentionDepthPerformance:
     }
   );
 }
-
 // ==================================================
 // 16D. TIMER SHUTDOWN
 //
@@ -11805,8 +12821,22 @@ http
 // 2. Stop new WebSocket intake
 // 3. Stop recurring timers
 // 4. Stop queue workers
-// 5. Wait for active workers to settle
-// 6. Close the PostgreSQL pool
+// 5. Wait for active signature workers to settle
+// 6. Drain queued / active DB dispatcher work
+// 7. Close the PostgreSQL pool
+//
+// IMPORTANT:
+//
+// Signature workers may hand accepted events to the
+// independent DB-write dispatcher and return before
+// PostgreSQL work finishes.
+//
+// Shutdown therefore MUST wait for BOTH:
+//
+// • dbWriteQueue.length === 0
+// • dbWritesInFlight === 0
+//
+// before closing the PostgreSQL pool.
 //
 // Raw-event retention is intentionally excluded from
 // this service.
@@ -11814,7 +12844,109 @@ http
 
 
 // ==================================================
-// 18A. BOOT
+// 18A. SHUTDOWN CONTROLS
+// ==================================================
+//
+// The drain timeout prevents shutdown from hanging
+// forever if PostgreSQL becomes unavailable.
+//
+// Polling is intentionally lightweight and does not
+// create any database work.
+// ==================================================
+
+const SHUTDOWN_DB_DRAIN_TIMEOUT_MS =
+  Number(
+    process.env
+      .SHUTDOWN_DB_DRAIN_TIMEOUT_MS ||
+    30000
+  );
+
+const SHUTDOWN_DB_DRAIN_POLL_MS =
+  Number(
+    process.env
+      .SHUTDOWN_DB_DRAIN_POLL_MS ||
+    100
+  );
+
+
+// ==================================================
+// 18B. WAIT FOR DB DISPATCHER DRAIN
+//
+// Wait until:
+//
+// • No queued DB jobs remain.
+// • No DB jobs are currently executing.
+//
+// Returns:
+//
+// true  = dispatcher fully drained
+// false = shutdown timeout reached
+//
+// IMPORTANT:
+//
+// Do NOT disable the dispatcher while draining.
+//
+// Active jobs may finish and make later same-token
+// FIFO jobs dispatchable. The normal dispatcher must
+// therefore remain operational until the queue is
+// completely empty.
+// ==================================================
+
+async function waitForDbWriteDispatcherDrain() {
+  const startedAt =
+    Date.now();
+
+  while (true) {
+    const queueSize =
+      dbWriteQueue.length;
+
+    const inFlight =
+      dbWritesInFlight;
+
+    if (
+      queueSize === 0 &&
+      inFlight === 0
+    ) {
+      return true;
+    }
+
+    const elapsedMs =
+      Date.now() -
+      startedAt;
+
+    if (
+      elapsedMs >=
+      SHUTDOWN_DB_DRAIN_TIMEOUT_MS
+    ) {
+      logError(
+        "Database write dispatcher drain timed out",
+        {
+          elapsedMs,
+
+          queueSize,
+
+          inFlight,
+
+          activeTokens:
+            activeDbWriteTokens.size,
+
+          maxDrainMs:
+            SHUTDOWN_DB_DRAIN_TIMEOUT_MS,
+        }
+      );
+
+      return false;
+    }
+
+    await sleep(
+      SHUTDOWN_DB_DRAIN_POLL_MS
+    );
+  }
+}
+
+
+// ==================================================
+// 18C. BOOT
 // ==================================================
 
 async function boot() {
@@ -11882,14 +13014,34 @@ async function boot() {
 
     connect();
 
+
+    // ----------------------------------------------
+    // BOOT SUMMARY
+    // ----------------------------------------------
+
     logInfo(
       "PreGrad scanner boot completed",
       {
         workerConcurrency:
           WORKER_CONCURRENCY,
 
+        maxTxPerSecond:
+          MAX_TX_PER_SECOND,
+
         maxQueueSize:
           MAX_QUEUE_SIZE,
+
+        resumeQueueSize:
+          RESUME_QUEUE_SIZE,
+
+        dbWriteConcurrency:
+          DB_WRITE_CONCURRENCY,
+
+        maxDbWriteQueueSize:
+          MAX_DB_WRITE_QUEUE_SIZE,
+
+        tokenDbSerializationEnabled:
+          TOKEN_DB_SERIALIZATION_ENABLED,
 
         rawEventStorage:
           STORE_RAW_EVENTS,
@@ -11898,6 +13050,7 @@ async function boot() {
           HOLDER_ENRICHMENT_ENABLED,
       }
     );
+
   } catch (error) {
     logError(
       "Boot failed",
@@ -11928,36 +13081,52 @@ async function boot() {
 
 
 // ==================================================
-// 18B. SHUTDOWN
+// 18D. SHUTDOWN
 // ==================================================
 
-async function shutdown(signal = "unknown") {
+async function shutdown(
+  signal = "unknown"
+) {
   if (intentionalShutdown) {
     return;
   }
 
   intentionalShutdown = true;
 
+
+  // ----------------------------------------------
+  // INITIAL SHUTDOWN SNAPSHOT
+  // ----------------------------------------------
+
   logInfo(
     "Shutting down PreGrad scanner",
     {
       signal,
 
-      queueSize:
+      signatureQueueSize:
         signatureQueue.length,
 
-      inFlightCount:
+      signatureInFlight:
         inFlightSignatures.size,
+
+      dbWriteQueueSize:
+        dbWriteQueue.length,
+
+      dbWritesInFlight,
+
+      activeDbWriteTokens:
+        activeDbWriteTokens.size,
     }
   );
 
 
   // ----------------------------------------------
-  // STOP NEW WORK
+  // STOP NEW INTAKE
+  //
+  // Existing accepted work is allowed to finish.
   // ----------------------------------------------
 
   intakePaused = true;
-  workerRunning = false;
 
   stopTimers();
 
@@ -11978,6 +13147,9 @@ async function shutdown(signal = "unknown") {
 
   // ----------------------------------------------
   // CLOSE WEBSOCKET
+  //
+  // No new signatures should enter the scanner after
+  // this point.
   // ----------------------------------------------
 
   if (ws) {
@@ -12004,18 +13176,132 @@ async function shutdown(signal = "unknown") {
 
 
   // ----------------------------------------------
-  // WAIT FOR WORKERS
+  // STOP SIGNATURE WORKERS
+  //
+  // Workers currently processing a signature are
+  // allowed to finish that iteration.
+  //
+  // This is important because a worker may still be
+  // preparing a DB dispatcher handoff.
+  // ----------------------------------------------
+
+  workerRunning = false;
+
+
+  // ----------------------------------------------
+  // WAIT FOR SIGNATURE WORKERS
+  //
+  // Once this completes, no worker can enqueue a new
+  // DB dispatcher job.
   // ----------------------------------------------
 
   try {
     await Promise.allSettled(
       workerPromises
     );
-  } catch (_) {}
+
+    logInfo(
+      "Signature workers stopped",
+      {
+        remainingSignatureQueue:
+          signatureQueue.length,
+
+        signatureInFlight:
+          inFlightSignatures.size,
+
+        dbWriteQueueSize:
+          dbWriteQueue.length,
+
+        dbWritesInFlight,
+      }
+    );
+
+  } catch (error) {
+    logError(
+      "Signature worker shutdown wait failed",
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ),
+      }
+    );
+  }
+
+
+  // ----------------------------------------------
+  // DRAIN DB WRITE DISPATCHER
+  //
+  // Signature workers are now stopped, so the DB
+  // dispatcher owns the final accepted work.
+  //
+  // Keep PostgreSQL OPEN while this drains.
+  // ----------------------------------------------
+
+  let dispatcherDrained =
+    false;
+
+  try {
+    dispatcherDrained =
+      await waitForDbWriteDispatcherDrain();
+
+  } catch (error) {
+    logError(
+      "Database write dispatcher drain failed",
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ),
+      }
+    );
+  }
+
+
+  // ----------------------------------------------
+  // FINAL DISPATCHER SNAPSHOT
+  // ----------------------------------------------
+
+  logInfo(
+    "Database write dispatcher shutdown state",
+    {
+      drained:
+        dispatcherDrained,
+
+      queueSize:
+        dbWriteQueue.length,
+
+      inFlight:
+        dbWritesInFlight,
+
+      activeTokens:
+        activeDbWriteTokens.size,
+
+      jobsQueued:
+        stats.dbWriteJobsQueued,
+
+      jobsStarted:
+        stats.dbWriteJobsStarted,
+
+      jobsCompleted:
+        stats.dbWriteJobsCompleted,
+
+      jobsFailed:
+        stats.dbWriteJobsFailed,
+    }
+  );
 
 
   // ----------------------------------------------
   // CLOSE DATABASE POOL
+  //
+  // Under normal operation the dispatcher is now
+  // completely empty.
+  //
+  // If the drain timed out, pool.end() is still
+  // attempted so the process can terminate cleanly.
   // ----------------------------------------------
 
   try {
@@ -12024,6 +13310,7 @@ async function shutdown(signal = "unknown") {
     logInfo(
       "Database pool closed"
     );
+
   } catch (error) {
     logError(
       "Database pool shutdown failed",
@@ -12037,29 +13324,61 @@ async function shutdown(signal = "unknown") {
     );
   }
 
+
+  // ----------------------------------------------
+  // FINAL SHUTDOWN SUMMARY
+  // ----------------------------------------------
+
+  logInfo(
+    "PreGrad scanner shutdown completed",
+    {
+      signal,
+
+      dispatcherDrained,
+
+      remainingSignatureQueue:
+        signatureQueue.length,
+
+      remainingInFlightSignatures:
+        inFlightSignatures.size,
+
+      remainingDbWriteQueue:
+        dbWriteQueue.length,
+
+      remainingDbWritesInFlight:
+        dbWritesInFlight,
+    }
+  );
+
   process.exit(0);
 }
 
 
 // ==================================================
-// 18C. PROCESS SIGNALS
+// 18E. PROCESS SIGNALS
 // ==================================================
 
 process.once(
   "SIGINT",
-  () =>
-    shutdown("SIGINT")
+  () => {
+    void shutdown(
+      "SIGINT"
+    );
+  }
 );
 
 process.once(
   "SIGTERM",
-  () =>
-    shutdown("SIGTERM")
+  () => {
+    void shutdown(
+      "SIGTERM"
+    );
+  }
 );
 
 
 // ==================================================
-// 18D. START SERVICE
+// 18F. START SERVICE
 // ==================================================
 
 boot();

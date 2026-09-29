@@ -490,6 +490,34 @@ sqlGraduationUpdateMaxMs: 0,
   unresolvedCandidatesNoPumpSuffix: 0,
   unresolvedCandidatesWithPumpSuffix: 0,
 
+
+  // ==========================================
+// TOKEN SERIALIZER WORKER WAIT DIAGNOSTICS
+//
+// Measures how many scanner workers are
+// simultaneously parked waiting for a
+// same-token serialization lane.
+//
+// Observation only:
+// • No database queries
+// • No scheduling changes
+// • No ingestion behavior changes
+// ==========================================
+
+tokenSerializerWorkersWaitingCurrent: 0,
+tokenSerializerWorkersWaitingMax: 0,
+
+tokenSerializerWorkerWaitSamples: 0,
+
+tokenSerializerWorkerWaitDepth1: 0,
+tokenSerializerWorkerWaitDepth2: 0,
+tokenSerializerWorkerWaitDepth3To5: 0,
+tokenSerializerWorkerWaitDepth6To10: 0,
+tokenSerializerWorkerWaitDepth11To20: 0,
+tokenSerializerWorkerWaitDepth21Plus: 0,
+
+tokenSerializerWorkerSaturationSamples: 0,
+
 // ==========================================
 // ERRORS
 // ==========================================
@@ -1564,13 +1592,80 @@ async function acquireTokenDbSerializationLane(
     );
 
   const waitStartedAt =
-    performanceNow();
+  performanceNow();
 
+// ================================================
+// WORKER WAIT DIAGNOSTIC
+//
+// queueDepth > 0 means another same-token write
+// is already ahead of this write.
+//
+// Because the caller awaits this function,
+// this scanner worker is now parked until its
+// token lane becomes available.
+// ================================================
+
+let countedAsWaitingWorker = false;
+
+if (queueDepth > 0) {
+  countedAsWaitingWorker = true;
+
+  stats.tokenSerializerWorkersWaitingCurrent += 1;
+
+  stats.tokenSerializerWorkerWaitSamples += 1;
+
+  stats.tokenSerializerWorkersWaitingMax =
+    Math.max(
+      stats.tokenSerializerWorkersWaitingMax,
+      stats.tokenSerializerWorkersWaitingCurrent
+    );
+
+  const workersWaiting =
+    stats.tokenSerializerWorkersWaitingCurrent;
+
+  if (workersWaiting === 1) {
+    stats.tokenSerializerWorkerWaitDepth1 += 1;
+
+  } else if (workersWaiting === 2) {
+    stats.tokenSerializerWorkerWaitDepth2 += 1;
+
+  } else if (workersWaiting <= 5) {
+    stats.tokenSerializerWorkerWaitDepth3To5 += 1;
+
+  } else if (workersWaiting <= 10) {
+    stats.tokenSerializerWorkerWaitDepth6To10 += 1;
+
+  } else if (workersWaiting <= 20) {
+    stats.tokenSerializerWorkerWaitDepth11To20 += 1;
+
+  } else {
+    stats.tokenSerializerWorkerWaitDepth21Plus += 1;
+  }
+
+  if (
+    workersWaiting >=
+    WORKER_CONCURRENCY
+  ) {
+    stats.tokenSerializerWorkerSaturationSamples += 1;
+  }
+}
+
+try {
   await previousTail;
 
-  const waitDurationMs =
-    performanceNow() -
-    waitStartedAt;
+} finally {
+  if (countedAsWaitingWorker) {
+    stats.tokenSerializerWorkersWaitingCurrent =
+      Math.max(
+        0,
+        stats.tokenSerializerWorkersWaitingCurrent - 1
+      );
+  }
+}
+
+const waitDurationMs =
+  performanceNow() -
+  waitStartedAt;
 
     if (waitDurationMs >= 1) {
     stats.tokenSerializerWaited += 1;

@@ -11317,17 +11317,6 @@ async function processQueuedSignature(item) {
 // ==================================================
 
 async function queueWorkerLoop(workerId) {
-  const minimumDelayMs = Math.max(
-    Math.floor(
-      (
-        1000 /
-        MAX_TX_PER_SECOND
-      ) *
-      WORKER_CONCURRENCY
-    ),
-    15
-  );
-
   while (workerRunning) {
     drainStaleQueueItems();
 
@@ -11336,6 +11325,9 @@ async function queueWorkerLoop(workerId) {
 
     if (!item) {
       maybeResumeIntake();
+
+      // Keep a small idle sleep so empty workers do not
+      // spin the CPU while waiting for new signatures.
       await sleep(100);
       continue;
     }
@@ -11349,14 +11341,42 @@ async function queueWorkerLoop(workerId) {
         "Queue worker error",
         {
           workerId,
-          error: error.message,
+          error:
+            error?.message ||
+            String(error),
         }
       );
     }
 
     maybeResumeIntake();
 
-    await sleep(minimumDelayMs);
+    // ================================================
+    // THROTTLE TEST
+    //
+    // Intentionally no fixed post-signature sleep.
+    //
+    // The old worker loop slept:
+    //
+    //   (1000 / MAX_TX_PER_SECOND)
+    //     * WORKER_CONCURRENCY
+    //
+    // after EVERY signature.
+    //
+    // With:
+    //   WORKER_CONCURRENCY=30
+    //   MAX_TX_PER_SECOND=80
+    //
+    // that imposed ~375ms of artificial delay per
+    // worker iteration.
+    //
+    // For this test we allow worker throughput to be
+    // governed by actual RPC latency and downstream
+    // backpressure.
+    //
+    // DB dispatcher, per-token FIFO, serializer,
+    // PostgreSQL concurrency, and RPC retry behavior
+    // remain unchanged.
+    // ================================================
   }
 }
 

@@ -8731,7 +8731,6 @@ function calculateEventMarketData(event) {
 // No additional database queries.
 // No changes to ingestion behavior.
 // ==================================================
-
 async function writeLaunchpadTokenAndEvent(
   token,
   event
@@ -8819,9 +8818,20 @@ async function writeLaunchpadTokenAndEvent(
       commit: null,
     };
 
+    // ================================================
+    // UPSERT EXECUTION CONTENTION DEPTH
+    //
+    // Declared outside the inner transaction try so
+    // transaction-finalization diagnostics can safely
+    // access it.
+    //
+    // Remains null if execution fails before reaching
+    // the token UPSERT.
+    // ================================================
+
+    let upsertExecutionDepth = null;
+
     try {
-
-
 
       // ================================================
       // BEGIN
@@ -8841,29 +8851,27 @@ async function writeLaunchpadTokenAndEvent(
         stageDurations.begin
       );
 
-
       // ================================================
       // STEP 1 — TOKEN UPSERT
       // ================================================
 
+      upsertExecutionDepth =
+        Math.max(
+          0,
+          (
+            activeTokenDbWrites.get(
+              tokenAddress
+            ) || 1
+          ) - 1
+        );
 
-const upsertExecutionDepth =
-  Math.max(
-    0,
-    (
-      activeTokenDbWrites.get(
-        tokenAddress
-      ) || 1
-    ) - 1
-  );
+      const tokenUpsertStartedAt =
+        performanceNow();
 
-const tokenUpsertStartedAt =
-  performanceNow();
-
-const tokenResult =
-  await client.query(
-    `
-      INSERT INTO pump_launchpad_tokens (
+      const tokenResult =
+        await client.query(
+          `
+          INSERT INTO pump_launchpad_tokens (
             token_address,
             creator_wallet,
             symbol,
@@ -8981,47 +8989,46 @@ const tokenResult =
           ]
         );
 
-  stageDurations.tokenUpsert =
-  performanceNow() -
-  tokenUpsertStartedAt;
+      stageDurations.tokenUpsert =
+        performanceNow() -
+        tokenUpsertStartedAt;
 
-recordDbStageTiming(
-  "tokenUpsert",
-  stageDurations.tokenUpsert
-);
+      recordDbStageTiming(
+        "tokenUpsert",
+        stageDurations.tokenUpsert
+      );
 
-// ================================================
-// CONTENTION DEPTH PERFORMANCE
-//
-// Compare:
-// • contention when the write entered the DB path
-// • contention immediately before this UPSERT
-// ================================================
+      // ================================================
+      // CONTENTION DEPTH PERFORMANCE
+      //
+      // Compare:
+      // • contention when the write entered the DB path
+      // • contention immediately before this UPSERT
+      // ================================================
 
-recordContentionDepthTiming(
-  "upsertAtArrival",
-  sameTokenContentionDepth,
-  stageDurations.tokenUpsert
-);
+      recordContentionDepthTiming(
+        "upsertAtArrival",
+        sameTokenContentionDepth,
+        stageDurations.tokenUpsert
+      );
 
-recordContentionDepthTiming(
-  "upsertAtExecution",
-  upsertExecutionDepth,
-  stageDurations.tokenUpsert
-);
+      recordContentionDepthTiming(
+        "upsertAtExecution",
+        upsertExecutionDepth,
+        stageDurations.tokenUpsert
+      );
 
-// ================================================
-// SLOW TOKEN UPSERT CONTENTION FORENSICS
-// ================================================
+      // ================================================
+      // SLOW TOKEN UPSERT CONTENTION FORENSICS
+      // ================================================
 
-recordSlowTokenUpsertForensic(
-  stageDurations.tokenUpsert,
-  sameTokenContentionDepth
-);
+      recordSlowTokenUpsertForensic(
+        stageDurations.tokenUpsert,
+        sameTokenContentionDepth
+      );
 
-tokenWritten =
-  tokenResult.rowCount > 0;
-
+      tokenWritten =
+        tokenResult.rowCount > 0;
 
       // ================================================
       // STEP 2 — EVENT INSERT
@@ -9094,7 +9101,6 @@ tokenWritten =
 
       inserted =
         eventResult.rowCount > 0;
-
 
       // ================================================
       // STEP 3 — MARKET UPDATE
@@ -9222,7 +9228,6 @@ tokenWritten =
           marketResult.rowCount > 0;
       }
 
-
       // ================================================
       // COMMIT
       // ================================================
@@ -9240,7 +9245,6 @@ tokenWritten =
         "commit",
         stageDurations.commit
       );
-
 
       // ================================================
       // STATS
@@ -9268,7 +9272,6 @@ tokenWritten =
         }
       }
 
-
       return inserted;
 
     } catch (error) {
@@ -9290,83 +9293,100 @@ tokenWritten =
 
     } finally {
 
-// ================================================
-// COMPLETE TRANSACTION PERFORMANCE
-// ================================================
+      // ================================================
+      // CONNECTION-SAFE TRANSACTION FINALIZATION
+      //
+      // Diagnostics must NEVER be able to prevent the
+      // PostgreSQL client from returning to the pool.
+      // ================================================
 
-const queryDurationMs =
-  performanceNow() -
-  writeStartedAt;
+      try {
 
-// ================================================
-// CONTENTION DEPTH PERFORMANCE
-//
-// Measure complete transaction duration against:
-// • contention when the write entered the DB path
-// • contention immediately before the token UPSERT
-// ================================================
+        // ================================================
+        // COMPLETE TRANSACTION PERFORMANCE
+        // ================================================
 
-recordContentionDepthTiming(
-  "transactionAtArrival",
-  sameTokenContentionDepth,
-  queryDurationMs
-);
+        const queryDurationMs =
+          performanceNow() -
+          writeStartedAt;
 
-recordContentionDepthTiming(
-  "transactionAtExecution",
-  upsertExecutionDepth,
-  queryDurationMs
-);
+        // ================================================
+        // CONTENTION DEPTH PERFORMANCE
+        //
+        // Measure complete transaction duration against:
+        // • contention when the write entered the DB path
+        // • contention immediately before the token UPSERT
+        // ================================================
 
-recordPerformanceTiming(
-  "sqlEventInsert",
-  queryDurationMs
-);
+        recordContentionDepthTiming(
+          "transactionAtArrival",
+          sameTokenContentionDepth,
+          queryDurationMs
+        );
 
-recordDbDiagnosticTiming(
-  "queryExecution",
-  queryDurationMs
-);
+        recordContentionDepthTiming(
+          "transactionAtExecution",
+          upsertExecutionDepth,
+          queryDurationMs
+        );
 
-recordSlowDbQuery(
-  queryDurationMs
-);
+        recordPerformanceTiming(
+          "sqlEventInsert",
+          queryDurationMs
+        );
 
-recordSlowTransactionForensic(
-  queryDurationMs,
-  stageDurations,
-  sameTokenContentionDepth
-);
+        recordDbDiagnosticTiming(
+          "queryExecution",
+          queryDurationMs
+        );
 
-// ================================================
-// SHADOW SERIALIZER COMPLETION
-//
-// The reservation receives its observed service
-// duration only after the real transaction has
-// completed or rolled back.
-// ================================================
+        recordSlowDbQuery(
+          queryDurationMs
+        );
 
-finishShadowTokenSerialization(
-  shadowReservation,
-  queryDurationMs
-);
+        recordSlowTransactionForensic(
+          queryDurationMs,
+          stageDurations,
+          sameTokenContentionDepth
+        );
 
-shadowReservationFinished = true;
+        // ================================================
+        // SHADOW SERIALIZER COMPLETION
+        //
+        // The reservation receives its observed service
+        // duration only after the real transaction has
+        // completed or rolled back.
+        // ================================================
 
-client.release();
-  }
+        finishShadowTokenSerialization(
+          shadowReservation,
+          queryDurationMs
+        );
+
+        shadowReservationFinished = true;
+
+      } finally {
+
+        // ================================================
+        // DATABASE CONNECTION RELEASE
+        //
+        // This MUST execute even if any observational
+        // diagnostic above throws.
+        // ================================================
+
+        client.release();
+      }
+    }
 
   } finally {
+
     // ================================================
     // SHADOW RESERVATION FAIL-SAFE
     //
-    // If we created a FIFO reservation but never
-    // reached transaction completion — most notably
-    // because pool.connect() failed — remove it from
-    // the shadow lane.
-    //
-    // Otherwise an unfinished FIFO head could block
-    // later shadow reservations forever.
+    // If the reservation never reached normal shadow
+    // completion — including pool acquisition failure
+    // or an unexpected diagnostic failure — remove it
+    // from the shadow lane.
     // ================================================
 
     if (

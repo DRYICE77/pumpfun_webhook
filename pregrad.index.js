@@ -684,6 +684,158 @@ slowTokenUpsertDurationMaxMs: 0,
   intakePauseTotalMs: 0,
   intakePauseMaxMs: 0,
 };
+
+// ==================================================
+// CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
+//
+// Observation only. No additional database queries.
+// ==================================================
+
+const CONTENTION_DEPTH_BUCKETS = [
+  "0",
+  "1",
+  "2",
+  "3-5",
+  "6-10",
+  "11+",
+];
+
+function makeDepthBucket() {
+  return {
+    samples: 0,
+    totalMs: 0,
+    maxMs: 0,
+    over250ms: 0,
+    over500ms: 0,
+    over1000ms: 0,
+  };
+}
+
+function makeDepthBuckets() {
+  return Object.fromEntries(
+    CONTENTION_DEPTH_BUCKETS.map(
+      (name) => [name, makeDepthBucket()]
+    )
+  );
+}
+
+const contentionDepthDiagnostics = {
+  upsertAtArrival: makeDepthBuckets(),
+  upsertAtExecution: makeDepthBuckets(),
+  transactionAtArrival: makeDepthBuckets(),
+  transactionAtExecution: makeDepthBuckets(),
+};
+
+function getContentionDepthBucket(depth) {
+  if (!Number.isFinite(depth) || depth < 0) {
+    return null;
+  }
+
+  const value = Math.floor(depth);
+
+  if (value === 0) return "0";
+  if (value === 1) return "1";
+  if (value === 2) return "2";
+  if (value <= 5) return "3-5";
+  if (value <= 10) return "6-10";
+
+  return "11+";
+}
+
+function recordContentionDepthTiming(
+  category,
+  depth,
+  durationMs
+) {
+  const bucketName =
+    getContentionDepthBucket(depth);
+
+  const bucket =
+    contentionDepthDiagnostics[category]?.[
+      bucketName
+    ];
+
+  if (
+    !bucket ||
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  bucket.samples += 1;
+  bucket.totalMs += durationMs;
+
+  bucket.maxMs = Math.max(
+    bucket.maxMs,
+    durationMs
+  );
+
+  if (durationMs >= 250) {
+    bucket.over250ms += 1;
+  }
+
+  if (durationMs >= 500) {
+    bucket.over500ms += 1;
+  }
+
+  if (durationMs >= 1000) {
+    bucket.over1000ms += 1;
+  }
+}
+
+function summarizeContentionDepth() {
+  return Object.fromEntries(
+    Object.entries(
+      contentionDepthDiagnostics
+    ).map(([category, buckets]) => [
+      category,
+
+      Object.fromEntries(
+        Object.entries(buckets).map(
+          ([depth, bucket]) => [
+            depth,
+            {
+              samples: bucket.samples,
+
+              avgMs:
+                bucket.samples > 0
+                  ? Number(
+                      (
+                        bucket.totalMs /
+                        bucket.samples
+                      ).toFixed(2)
+                    )
+                  : null,
+
+              maxMs:
+                bucket.samples > 0
+                  ? Number(
+                      bucket.maxMs.toFixed(2)
+                    )
+                  : null,
+
+              slow500Pct:
+                bucket.samples > 0
+                  ? Number(
+                      (
+                        100 *
+                        bucket.over500ms /
+                        bucket.samples
+                      ).toFixed(2)
+                    )
+                  : null,
+
+              over250ms: bucket.over250ms,
+              over500ms: bucket.over500ms,
+              over1000ms: bucket.over1000ms,
+            },
+          ]
+        )
+      ),
+    ])
+  );
+}
 // ==================================================
 // 6. LOGGING / BASIC HELPERS
 // ==================================================
@@ -8694,13 +8846,24 @@ async function writeLaunchpadTokenAndEvent(
       // STEP 1 — TOKEN UPSERT
       // ================================================
 
-      const tokenUpsertStartedAt =
-        performanceNow();
 
-      const tokenResult =
-        await client.query(
-          `
-          INSERT INTO pump_launchpad_tokens (
+const upsertExecutionDepth =
+  Math.max(
+    0,
+    (
+      activeTokenDbWrites.get(
+        tokenAddress
+      ) || 1
+    ) - 1
+  );
+
+const tokenUpsertStartedAt =
+  performanceNow();
+
+const tokenResult =
+  await client.query(
+    `
+      INSERT INTO pump_launchpad_tokens (
             token_address,
             creator_wallet,
             symbol,
@@ -8818,26 +8981,46 @@ async function writeLaunchpadTokenAndEvent(
           ]
         );
 
-      stageDurations.tokenUpsert =
-        performanceNow() -
-        tokenUpsertStartedAt;
+  stageDurations.tokenUpsert =
+  performanceNow() -
+  tokenUpsertStartedAt;
 
-      recordDbStageTiming(
-        "tokenUpsert",
-        stageDurations.tokenUpsert
-      );
+recordDbStageTiming(
+  "tokenUpsert",
+  stageDurations.tokenUpsert
+);
 
-      // ================================================
-      // SLOW TOKEN UPSERT CONTENTION FORENSICS
-      // ================================================
+// ================================================
+// CONTENTION DEPTH PERFORMANCE
+//
+// Compare:
+// • contention when the write entered the DB path
+// • contention immediately before this UPSERT
+// ================================================
 
-      recordSlowTokenUpsertForensic(
-        stageDurations.tokenUpsert,
-        sameTokenContentionDepth
-      );
+recordContentionDepthTiming(
+  "upsertAtArrival",
+  sameTokenContentionDepth,
+  stageDurations.tokenUpsert
+);
 
-      tokenWritten =
-        tokenResult.rowCount > 0;
+recordContentionDepthTiming(
+  "upsertAtExecution",
+  upsertExecutionDepth,
+  stageDurations.tokenUpsert
+);
+
+// ================================================
+// SLOW TOKEN UPSERT CONTENTION FORENSICS
+// ================================================
+
+recordSlowTokenUpsertForensic(
+  stageDurations.tokenUpsert,
+  sameTokenContentionDepth
+);
+
+tokenWritten =
+  tokenResult.rowCount > 0;
 
 
       // ================================================
@@ -9107,54 +9290,73 @@ async function writeLaunchpadTokenAndEvent(
 
     } finally {
 
-      // ================================================
-      // COMPLETE TRANSACTION PERFORMANCE
-      // ================================================
+// ================================================
+// COMPLETE TRANSACTION PERFORMANCE
+// ================================================
 
-      const queryDurationMs =
-        performanceNow() -
-        writeStartedAt;
+const queryDurationMs =
+  performanceNow() -
+  writeStartedAt;
 
-      recordPerformanceTiming(
-        "sqlEventInsert",
-        queryDurationMs
-      );
+// ================================================
+// CONTENTION DEPTH PERFORMANCE
+//
+// Measure complete transaction duration against:
+// • contention when the write entered the DB path
+// • contention immediately before the token UPSERT
+// ================================================
 
-      recordDbDiagnosticTiming(
-        "queryExecution",
-        queryDurationMs
-      );
+recordContentionDepthTiming(
+  "transactionAtArrival",
+  sameTokenContentionDepth,
+  queryDurationMs
+);
 
-      recordSlowDbQuery(
-        queryDurationMs
-      );
+recordContentionDepthTiming(
+  "transactionAtExecution",
+  upsertExecutionDepth,
+  queryDurationMs
+);
 
-      recordSlowTransactionForensic(
-        queryDurationMs,
-        stageDurations,
-        sameTokenContentionDepth
-      );
+recordPerformanceTiming(
+  "sqlEventInsert",
+  queryDurationMs
+);
 
-      // ================================================
-      // SHADOW SERIALIZER COMPLETION
-      //
-      // The reservation receives its observed service
-      // duration only after the real transaction has
-      // completed or rolled back.
-      // ================================================
+recordDbDiagnosticTiming(
+  "queryExecution",
+  queryDurationMs
+);
 
-      finishShadowTokenSerialization(
-        shadowReservation,
-        queryDurationMs
-      );
+recordSlowDbQuery(
+  queryDurationMs
+);
 
-      shadowReservationFinished = true;
+recordSlowTransactionForensic(
+  queryDurationMs,
+  stageDurations,
+  sameTokenContentionDepth
+);
 
-      client.release();
-    }
+// ================================================
+// SHADOW SERIALIZER COMPLETION
+//
+// The reservation receives its observed service
+// duration only after the real transaction has
+// completed or rolled back.
+// ================================================
+
+finishShadowTokenSerialization(
+  shadowReservation,
+  queryDurationMs
+);
+
+shadowReservationFinished = true;
+
+client.release();
+  }
 
   } finally {
-
     // ================================================
     // SHADOW RESERVATION FAIL-SAFE
     //
@@ -11016,6 +11218,10 @@ function startQueueLogger() {
             dbEventInsertPerformance,
             dbMarketUpdatePerformance,
             dbCommitPerformance,
+
+            // Contention depth performance
+contentionDepthPerformance:
+  summarizeContentionDepth(),
 
             // Slow transaction distribution
             slowDbQueries,

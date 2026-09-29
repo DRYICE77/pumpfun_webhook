@@ -359,6 +359,31 @@ const activeTokenDbWrites =
   new Map();
 
 // ==================================================
+// REAL PER-TOKEN DATABASE SERIALIZER
+//
+// When enabled:
+//
+// • Writes for DIFFERENT tokens remain concurrent.
+// • Writes for the SAME token execute one at a time.
+// • Serialization happens BEFORE pool.connect().
+// • No additional PostgreSQL queries are added.
+//
+// Controlled through:
+//
+// TOKEN_DB_SERIALIZATION_ENABLED=true
+// ==================================================
+
+const TOKEN_DB_SERIALIZATION_ENABLED =
+  String(
+    process.env
+      .TOKEN_DB_SERIALIZATION_ENABLED ||
+      "false"
+  ) === "true";
+
+const tokenDbSerializationLanes =
+  new Map();
+
+// ==================================================
 // SHADOW PER-TOKEN SERIALIZER
 //
 // Diagnostic-only simulation.
@@ -556,6 +581,20 @@ dbMarketUpdateMaxMs: 0,
 dbCommitSamples: 0,
 dbCommitTotalMs: 0,
 dbCommitMaxMs: 0,
+
+  // ==========================================
+// REAL TOKEN SERIALIZATION
+// ==========================================
+
+tokenSerializerSamples: 0,
+tokenSerializerImmediate: 0,
+tokenSerializerWaited: 0,
+
+tokenSerializerWaitTotalMs: 0,
+tokenSerializerWaitMaxMs: 0,
+
+tokenSerializerQueueDepthTotal: 0,
+tokenSerializerQueueDepthMax: 0,
 
   // ==========================================
 // SLOW TRANSACTION FORENSICS
@@ -1458,6 +1497,145 @@ function getDbStageSummary(
           )
         : null,
   };
+}
+// ==================================================
+// REAL PER-TOKEN DATABASE SERIALIZATION
+// ==================================================
+
+async function acquireTokenDbSerializationLane(
+  tokenAddress
+) {
+  if (
+    !TOKEN_DB_SERIALIZATION_ENABLED ||
+    !tokenAddress
+  ) {
+    return null;
+  }
+
+  let lane =
+    tokenDbSerializationLanes.get(
+      tokenAddress
+    );
+
+  if (!lane) {
+    lane = {
+      tail: Promise.resolve(),
+      pending: 0,
+    };
+
+    tokenDbSerializationLanes.set(
+      tokenAddress,
+      lane
+    );
+  }
+
+  lane.pending += 1;
+
+    const queueDepth =
+    Math.max(
+      0,
+      lane.pending - 1
+    );
+
+  stats.tokenSerializerSamples += 1;
+
+  stats.tokenSerializerQueueDepthTotal +=
+    queueDepth;
+
+  stats.tokenSerializerQueueDepthMax =
+    Math.max(
+      stats.tokenSerializerQueueDepthMax,
+      queueDepth
+    );
+
+  const previousTail =
+    lane.tail;
+
+  let releaseCurrent;
+
+  const currentGate =
+    new Promise((resolve) => {
+      releaseCurrent = resolve;
+    });
+
+  lane.tail =
+    previousTail.then(
+      () => currentGate
+    );
+
+  const waitStartedAt =
+    performanceNow();
+
+  await previousTail;
+
+  const waitDurationMs =
+    performanceNow() -
+    waitStartedAt;
+
+    if (waitDurationMs >= 1) {
+    stats.tokenSerializerWaited += 1;
+
+    stats.tokenSerializerWaitTotalMs +=
+      waitDurationMs;
+
+    stats.tokenSerializerWaitMaxMs =
+      Math.max(
+        stats.tokenSerializerWaitMaxMs,
+        waitDurationMs
+      );
+
+  } else {
+    stats.tokenSerializerImmediate += 1;
+  }
+
+  return {
+    tokenAddress,
+    lane,
+    releaseCurrent,
+    waitDurationMs,
+    released: false,
+  };
+}
+
+
+function releaseTokenDbSerializationLane(
+  reservation
+) {
+  if (
+    !reservation ||
+    reservation.released
+  ) {
+    return;
+  }
+
+  reservation.released = true;
+
+  const {
+    tokenAddress,
+    lane,
+    releaseCurrent,
+  } = reservation;
+
+  lane.pending = Math.max(
+    0,
+    lane.pending - 1
+  );
+
+  // Unblock exactly the next same-token write.
+  releaseCurrent();
+
+  // Delete only when this token has no current
+  // or queued serialized writes remaining.
+  if (
+    lane.pending === 0 &&
+    tokenDbSerializationLanes.get(
+      tokenAddress
+    ) === lane
+  ) {
+    tokenDbSerializationLanes.delete(
+      tokenAddress
+    );
+  }
 }
 
 // ==================================================
@@ -8743,15 +8921,40 @@ async function writeLaunchpadTokenAndEvent(
     return false;
   }
 
-  const market =
+   const market =
     calculateEventMarketData(event);
+
+  const tokenAddress =
+    token.token_address;
+
+  // ================================================
+  // REAL PER-TOKEN SERIALIZATION
+  //
+  // IMPORTANT:
+  //
+  // Acquire this BEFORE:
+  // • beginTokenDbWrite()
+  // • shadow diagnostics
+  // • pool.connect()
+  //
+  // Therefore queued same-token writes do not consume
+  // PostgreSQL connections and are not counted as
+  // simultaneously active DB writes.
+  // ================================================
+
+  let tokenSerializationReservation =
+    null;
+
+  if (TOKEN_DB_SERIALIZATION_ENABLED) {
+    tokenSerializationReservation =
+      await acquireTokenDbSerializationLane(
+        tokenAddress
+      );
+  }
 
   // ================================================
   // SAME-TOKEN CONTENTION DIAGNOSTIC
   // ================================================
-
-  const tokenAddress =
-    token.token_address;
 
   const sameTokenContentionDepth =
     beginTokenDbWrite(
@@ -8760,13 +8963,6 @@ async function writeLaunchpadTokenAndEvent(
 
   // ================================================
   // SHADOW PER-TOKEN SERIALIZER
-  //
-  // Diagnostic only.
-  //
-  // Creates the FIFO reservation before pool
-  // acquisition so the shadow model observes the
-  // same point at which a real per-token serializer
-  // would intercept the write.
   // ================================================
 
   const shadowReservation =
@@ -9290,7 +9486,6 @@ async function writeLaunchpadTokenAndEvent(
       }
 
       throw error;
-
     } finally {
 
       // ================================================
@@ -9400,10 +9595,33 @@ async function writeLaunchpadTokenAndEvent(
 
     // ================================================
     // SAME-TOKEN CONTENTION CLEANUP
+    //
+    // Remove this write from the real active-write
+    // diagnostic before allowing the next serialized
+    // write for this token to enter the DB path.
     // ================================================
 
     endTokenDbWrite(
       tokenAddress
+    );
+
+    // ================================================
+    // REAL PER-TOKEN SERIALIZER RELEASE
+    //
+    // MUST remain last.
+    //
+    // At this point:
+    // • the transaction has completed or failed
+    // • the PostgreSQL client has been released
+    // • shadow diagnostics have been cleaned up
+    // • active-token tracking has been cleaned up
+    //
+    // Only now may the next queued write for this
+    // SAME token enter the database path.
+    // ================================================
+
+    releaseTokenDbSerializationLane(
+      tokenSerializationReservation
     );
   }
 }
@@ -11166,6 +11384,10 @@ function startQueueLogger() {
 
           storeRawEvents:
             STORE_RAW_EVENTS,
+
+          
+  tokenDbSerializationEnabled:
+    TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
         // ------------------------------------------

@@ -497,6 +497,7 @@ const SEEN_SIGNATURE_LIMIT = Number(
 let queueLogTimer = null;
 let staleDrainTimer = null;
 let dbRttProbeTimer = null;
+let dbRttProbeRunning = false;
 
 // ==================================================
 // POSTGRES RTT DISTRIBUTION / RECENT HISTORY

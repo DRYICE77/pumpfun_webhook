@@ -120,20 +120,45 @@ const RESUME_QUEUE_SIZE = Number(
 
 // ==================================================
 // 2C. TRANSACTION WORKERS
-//
-// Preserve the proven operating profile.
-//
-// Eight workers provide healthy parallelism without
-// overwhelming the Railway PostgreSQL connection pool.
 // ==================================================
 
 const WORKER_CONCURRENCY = Number(
   process.env.WORKER_CONCURRENCY || 8
 );
 
-const MAX_TX_PER_SECOND = Number(
-  process.env.MAX_TX_PER_SECOND || 30
-);
+
+// ==================================================
+// 2C-1. GLOBAL HELIUS RPC PACER
+//
+// Limits aggregate Helius RPC request STARTS across:
+//
+// • getTransaction
+// • getTokenSupply
+// • getTokenLargestAccounts
+//
+// Workers remain concurrent.
+//
+// Unlike the old per-worker sleep, this does not
+// artificially delay a worker after its RPC work has
+// already completed.
+//
+// Requests are evenly spaced across time.
+// ==================================================
+
+const HELIUS_RPC_MAX_STARTS_PER_SECOND =
+  Number(
+    process.env
+      .HELIUS_RPC_MAX_STARTS_PER_SECOND ||
+      60
+  );
+
+const HELIUS_RPC_MIN_START_INTERVAL_MS =
+  HELIUS_RPC_MAX_STARTS_PER_SECOND > 0
+    ? (
+        1000 /
+        HELIUS_RPC_MAX_STARTS_PER_SECOND
+      )
+    : 0;
 
 // ==================================================
 // 2C-2. DATABASE WRITE DISPATCHER
@@ -379,6 +404,15 @@ const tokenSafetyEnrichmentInFlight = new Map();
 const tokenLastHolderEnrichedAt = new Map();
 
 // ==================================================
+// GLOBAL HELIUS RPC PACER STATE
+// ==================================================
+
+let heliusRpcNextStartAt = 0;
+
+let heliusRpcPacerTail =
+  Promise.resolve();
+
+// ==================================================
 // ACTIVE TOKEN DATABASE WRITES
 //
 // Diagnostic-only tracker for concurrent writes
@@ -519,6 +553,17 @@ sqlGraduationUpdateMaxMs: 0,
   unresolvedMultipleCandidates: 0,
   unresolvedCandidatesNoPumpSuffix: 0,
   unresolvedCandidatesWithPumpSuffix: 0,
+
+  // ==========================================
+// GLOBAL HELIUS RPC PACER
+// ==========================================
+
+heliusRpcPacerSamples: 0,
+heliusRpcPacerImmediate: 0,
+heliusRpcPacerWaited: 0,
+
+heliusRpcPacerWaitTotalMs: 0,
+heliusRpcPacerWaitMaxMs: 0,
 
 
   // ==========================================
@@ -2923,6 +2968,103 @@ function enqueueSignature(
 
   stats.queued += 1;
 }
+
+// ==================================================
+// GLOBAL HELIUS RPC PACER
+//
+// Serializes only RPC START permission.
+//
+// It does NOT serialize the actual HTTP requests.
+//
+// Example at 60 starts/sec:
+//
+// request A starts at 0ms
+// request B starts at ~16.7ms
+// request C starts at ~33.3ms
+//
+// A may still be running when B and C begin.
+//
+// This preserves concurrency while preventing bursts.
+// ==================================================
+
+async function acquireHeliusRpcStartSlot() {
+  if (
+    !Number.isFinite(
+      HELIUS_RPC_MIN_START_INTERVAL_MS
+    ) ||
+    HELIUS_RPC_MIN_START_INTERVAL_MS <= 0
+  ) {
+    return;
+  }
+
+  const waitStartedAt =
+    performanceNow();
+
+  let releaseGate;
+
+  const previousGate =
+    heliusRpcPacerTail;
+
+  heliusRpcPacerTail =
+    new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+
+  await previousGate;
+
+  try {
+    const now =
+      performanceNow();
+
+    const scheduledStartAt =
+      Math.max(
+        now,
+        heliusRpcNextStartAt
+      );
+
+    const waitMs =
+      Math.max(
+        0,
+        scheduledStartAt - now
+      );
+
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+
+    const actualStartAt =
+      performanceNow();
+
+    heliusRpcNextStartAt =
+      actualStartAt +
+      HELIUS_RPC_MIN_START_INTERVAL_MS;
+
+  } finally {
+    releaseGate();
+  }
+
+  const totalWaitMs =
+    performanceNow() -
+    waitStartedAt;
+
+  stats.heliusRpcPacerSamples += 1;
+
+  if (totalWaitMs >= 1) {
+    stats.heliusRpcPacerWaited += 1;
+
+    stats.heliusRpcPacerWaitTotalMs +=
+      totalWaitMs;
+
+    stats.heliusRpcPacerWaitMaxMs =
+      Math.max(
+        stats.heliusRpcPacerWaitMaxMs,
+        totalWaitMs
+      );
+
+  } else {
+    stats.heliusRpcPacerImmediate += 1;
+  }
+}
 // ==================================================
 // 9. HELIUS RPC
 //
@@ -2934,6 +3076,23 @@ function enqueueSignature(
 // ==================================================
 
 async function heliusRpc(method, params) {
+  // ----------------------------------------------
+  // GLOBAL HELIUS RPC PACER
+  //
+  // Every Helius HTTP request must acquire a start
+  // slot before it is allowed to begin.
+  //
+  // This limits aggregate request STARTS across all
+  // callers without serializing the requests
+  // themselves.
+  // ----------------------------------------------
+
+  await acquireHeliusRpcStartSlot();
+
+  // ----------------------------------------------
+  // SEND RPC REQUEST
+  // ----------------------------------------------
+
   const response = await fetch(RPC_URL, {
     method: "POST",
 
@@ -2949,26 +3108,48 @@ async function heliusRpc(method, params) {
     }),
   });
 
+  // ----------------------------------------------
+  // HTTP ERROR
+  //
+  // Preserve status on the error so the existing
+  // retry logic can specifically identify 429s.
+  // ----------------------------------------------
+
   if (!response.ok) {
     const error = new Error(
       `RPC HTTP error ${response.status}`
     );
 
     error.status = response.status;
+
     throw error;
   }
 
-  const json = await response.json();
+  // ----------------------------------------------
+  // PARSE JSON-RPC RESPONSE
+  // ----------------------------------------------
+
+  const json =
+    await response.json();
+
+  // ----------------------------------------------
+  // JSON-RPC ERROR
+  // ----------------------------------------------
 
   if (json.error) {
     throw new Error(
-      `RPC error: ${JSON.stringify(json.error)}`
+      `RPC error: ${JSON.stringify(
+        json.error
+      )}`
     );
   }
 
+  // ----------------------------------------------
+  // SUCCESS
+  // ----------------------------------------------
+
   return json.result;
 }
-
 
 
 // ==================================================
@@ -11406,12 +11587,17 @@ function startQueueWorkers() {
       workerConcurrency:
         WORKER_CONCURRENCY,
 
-      maxTxPerSecond:
-        MAX_TX_PER_SECOND,
+      heliusRpcMaxStartsPerSecond:
+        HELIUS_RPC_MAX_STARTS_PER_SECOND,
+
+      heliusRpcMinStartIntervalMs:
+        Number(
+          HELIUS_RPC_MIN_START_INTERVAL_MS
+            .toFixed(2)
+        ),
     }
   );
 }
-
 // ==================================================
 // 15. WEBSOCKET
 // ==================================================
@@ -11903,6 +12089,7 @@ let previousLogAt =
 // • Contention-depth diagnostics
 //
 // RPC
+// • Global Helius RPC pacing
 // • Full fetch lifecycle
 // • Individual RPC attempts
 //
@@ -12080,10 +12267,76 @@ function startQueueLogger() {
           );
 
         // ==========================================
+        // GLOBAL HELIUS RPC PACER
+        //
+        // Measures time callers spend waiting for
+        // permission to START a Helius RPC request.
+        //
+        // This does not measure HTTP request latency.
+        // rpcAttemptPerformance handles that.
+        // ==========================================
+
+        const heliusRpcPacerHealth = {
+          maxStartsPerSecond:
+            HELIUS_RPC_MAX_STARTS_PER_SECOND,
+
+          minStartIntervalMs:
+            Number.isFinite(
+              HELIUS_RPC_MIN_START_INTERVAL_MS
+            )
+              ? Number(
+                  HELIUS_RPC_MIN_START_INTERVAL_MS
+                    .toFixed(2)
+                )
+              : null,
+
+          samples:
+            stats.heliusRpcPacerSamples,
+
+          immediate:
+            stats.heliusRpcPacerImmediate,
+
+          waited:
+            stats.heliusRpcPacerWaited,
+
+          waitPct:
+            stats.heliusRpcPacerSamples > 0
+              ? Number(
+                  (
+                    (
+                      stats.heliusRpcPacerWaited /
+                      stats.heliusRpcPacerSamples
+                    ) *
+                    100
+                  ).toFixed(2)
+                )
+              : null,
+
+          avgWaitMs:
+            stats.heliusRpcPacerWaited > 0
+              ? Number(
+                  (
+                    stats.heliusRpcPacerWaitTotalMs /
+                    stats.heliusRpcPacerWaited
+                  ).toFixed(2)
+                )
+              : null,
+
+          maxWaitMs:
+            stats.heliusRpcPacerWaited > 0
+              ? Number(
+                  stats.heliusRpcPacerWaitMaxMs
+                    .toFixed(2)
+                )
+              : null,
+        };
+
+        // ==========================================
         // DATABASE DIAGNOSTIC SUMMARIES
         //
         // These diagnostics use their dedicated
-        // counters rather than getPerformanceSummary().
+        // counters rather than
+        // getPerformanceSummary().
         // ==========================================
 
         const dbPoolAcquirePerformance = {
@@ -12399,8 +12652,8 @@ function startQueueLogger() {
         // ==========================================
         // CURRENT INTAKE PAUSE
         //
-        // Completed pauses are already represented by
-        // intakePausePerformance.
+        // Completed pauses are already represented
+        // by intakePausePerformance.
         // ==========================================
 
         const currentPauseMs =
@@ -12453,8 +12706,18 @@ function startQueueLogger() {
           workerConcurrency:
             WORKER_CONCURRENCY,
 
-          maxTxPerSecond:
-            MAX_TX_PER_SECOND,
+          heliusRpcMaxStartsPerSecond:
+            HELIUS_RPC_MAX_STARTS_PER_SECOND,
+
+          heliusRpcMinStartIntervalMs:
+            Number.isFinite(
+              HELIUS_RPC_MIN_START_INTERVAL_MS
+            )
+              ? Number(
+                  HELIUS_RPC_MIN_START_INTERVAL_MS
+                    .toFixed(2)
+                )
+              : null,
 
           dbWriteConcurrency:
             DB_WRITE_CONCURRENCY,
@@ -12541,9 +12804,10 @@ function startQueueLogger() {
             tokenSerializerWorkerHealth,
 
             // --------------------------------------
-            // RPC PERFORMANCE
+            // RPC PACING / PERFORMANCE
             // --------------------------------------
 
+            heliusRpcPacerHealth,
             rpcFetchPerformance,
             rpcAttemptPerformance,
 
@@ -13017,70 +13281,75 @@ async function boot() {
     connect();
 
 
-    // ----------------------------------------------
-    // BOOT SUMMARY
-    // ----------------------------------------------
+ // ----------------------------------------------
+// BOOT SUMMARY
+// ----------------------------------------------
 
-    logInfo(
-      "PreGrad scanner boot completed",
-      {
-        workerConcurrency:
-          WORKER_CONCURRENCY,
+logInfo(
+  "PreGrad scanner boot completed",
+  {
+    workerConcurrency:
+      WORKER_CONCURRENCY,
 
-        maxTxPerSecond:
-          MAX_TX_PER_SECOND,
+    heliusRpcMaxStartsPerSecond:
+      HELIUS_RPC_MAX_STARTS_PER_SECOND,
 
-        maxQueueSize:
-          MAX_QUEUE_SIZE,
+    heliusRpcMinStartIntervalMs:
+      Number(
+        HELIUS_RPC_MIN_START_INTERVAL_MS
+          .toFixed(2)
+      ),
 
-        resumeQueueSize:
-          RESUME_QUEUE_SIZE,
+    maxQueueSize:
+      MAX_QUEUE_SIZE,
 
-        dbWriteConcurrency:
-          DB_WRITE_CONCURRENCY,
+    resumeQueueSize:
+      RESUME_QUEUE_SIZE,
 
-        maxDbWriteQueueSize:
-          MAX_DB_WRITE_QUEUE_SIZE,
+    dbWriteConcurrency:
+      DB_WRITE_CONCURRENCY,
 
-        tokenDbSerializationEnabled:
-          TOKEN_DB_SERIALIZATION_ENABLED,
+    maxDbWriteQueueSize:
+      MAX_DB_WRITE_QUEUE_SIZE,
 
-        rawEventStorage:
-          STORE_RAW_EVENTS,
+    tokenDbSerializationEnabled:
+      TOKEN_DB_SERIALIZATION_ENABLED,
 
-        holderEnrichment:
-          HOLDER_ENRICHMENT_ENABLED,
-      }
-    );
+    rawEventStorage:
+      STORE_RAW_EVENTS,
 
-  } catch (error) {
-    logError(
-      "Boot failed",
-      {
-        error:
-          String(
-            error?.message ||
-            error
-          ),
-
-        stack:
-          error?.stack ||
-          null,
-      }
-    );
-
-    try {
-      stopTimers();
-    } catch (_) {}
-
-    try {
-      await pool.end();
-    } catch (_) {}
-
-    process.exit(1);
+    holderEnrichment:
+      HOLDER_ENRICHMENT_ENABLED,
   }
-}
+);
 
+} catch (error) {
+  logError(
+    "Boot failed",
+    {
+      error:
+        String(
+          error?.message ||
+          error
+        ),
+
+      stack:
+        error?.stack ||
+        null,
+    }
+  );
+
+  try {
+    stopTimers();
+  } catch (_) {}
+
+  try {
+    await pool.end();
+  } catch (_) {}
+
+  process.exit(1);
+}
+}
 
 // ==================================================
 // 18D. SHUTDOWN

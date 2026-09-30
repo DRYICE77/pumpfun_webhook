@@ -13165,33 +13165,6 @@ async function runDbRttProbe() {
         durationMs
       );
 
-    recordDbRttBucket(
-      durationMs
-    );
-
-    recordRecentDbRttProbe(
-      durationMs
-    );
-
-  } catch (error) {
-    stats.dbRttProbeErrors += 1;
-
-    logError(
-      "Postgres RTT probe failed",
-      {
-        error:
-          String(
-            error?.message ||
-            error
-          ),
-      }
-    );
-
-  } finally {
-    dbRttProbeRunning = false;
-  }
-}
-
     // ----------------------------------------------
     // RTT DISTRIBUTION
     // ----------------------------------------------
@@ -13221,9 +13194,11 @@ async function runDbRttProbe() {
           ),
       }
     );
+
+  } finally {
+    dbRttProbeRunning = false;
   }
 }
-
 
 function startDbRttProbe() {
   if (dbRttProbeTimer) {

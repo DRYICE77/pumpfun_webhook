@@ -498,6 +498,25 @@ let queueLogTimer = null;
 let staleDrainTimer = null;
 let dbRttProbeTimer = null;
 
+// ==================================================
+// POSTGRES RTT DISTRIBUTION / RECENT HISTORY
+// ==================================================
+
+const DB_RTT_RECENT_LIMIT = 10;
+
+const dbRttProbeBuckets = {
+  under10ms: 0,
+  ms10To25: 0,
+  ms25To50: 0,
+  ms50To100: 0,
+  ms100To150: 0,
+  ms150To250: 0,
+  ms250To500: 0,
+  ms500Plus: 0,
+};
+
+const dbRttRecentProbes = [];
+
 
 const stats = {
   // ==========================================
@@ -12766,7 +12785,7 @@ function startQueueLogger() {
             TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
-        const dbRttProbeHealth = {
+const dbRttProbeHealth = {
   samples:
     stats.dbRttProbeSamples,
 
@@ -12798,6 +12817,39 @@ function startQueueLogger() {
             .toFixed(2)
         )
       : null,
+
+  distribution: {
+    under10ms:
+      dbRttProbeBuckets.under10ms,
+
+    ms10To25:
+      dbRttProbeBuckets.ms10To25,
+
+    ms25To50:
+      dbRttProbeBuckets.ms25To50,
+
+    ms50To100:
+      dbRttProbeBuckets.ms50To100,
+
+    ms100To150:
+      dbRttProbeBuckets.ms100To150,
+
+    ms150To250:
+      dbRttProbeBuckets.ms150To250,
+
+    ms250To500:
+      dbRttProbeBuckets.ms250To500,
+
+    ms500Plus:
+      dbRttProbeBuckets.ms500Plus,
+  },
+
+  recent:
+    dbRttRecentProbes.map(
+      (probe) => ({
+        ...probe,
+      })
+    ),
 };
 
         // ==========================================
@@ -12986,6 +13038,84 @@ slowDbQueries,
   );
 }
 
+function recordDbRttBucket(
+  durationMs
+) {
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return;
+  }
+
+  if (durationMs < 10) {
+    dbRttProbeBuckets.under10ms += 1;
+
+  } else if (durationMs < 25) {
+    dbRttProbeBuckets.ms10To25 += 1;
+
+  } else if (durationMs < 50) {
+    dbRttProbeBuckets.ms25To50 += 1;
+
+  } else if (durationMs < 100) {
+    dbRttProbeBuckets.ms50To100 += 1;
+
+  } else if (durationMs < 150) {
+    dbRttProbeBuckets.ms100To150 += 1;
+
+  } else if (durationMs < 250) {
+    dbRttProbeBuckets.ms150To250 += 1;
+
+  } else if (durationMs < 500) {
+    dbRttProbeBuckets.ms250To500 += 1;
+
+  } else {
+    dbRttProbeBuckets.ms500Plus += 1;
+  }
+}
+
+
+function recordRecentDbRttProbe(
+  durationMs
+) {
+  dbRttRecentProbes.push({
+    time:
+      nowIso(),
+
+    rttMs:
+      Number(
+        durationMs.toFixed(2)
+      ),
+
+    poolTotal:
+      pool.totalCount,
+
+    poolIdle:
+      pool.idleCount,
+
+    poolWaiting:
+      pool.waitingCount,
+
+    dbQueueSize:
+      dbWriteQueue.length,
+
+    dbWritesInFlight,
+
+    activeTokens:
+      activeDbWriteTokens.size,
+
+    signatureQueueSize:
+      signatureQueue.length,
+  });
+
+  while (
+    dbRttRecentProbes.length >
+    DB_RTT_RECENT_LIMIT
+  ) {
+    dbRttRecentProbes.shift();
+  }
+}
+
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC
 //
@@ -13003,6 +13133,12 @@ slowDbQueries,
 // ==================================================
 
 async function runDbRttProbe() {
+  if (dbRttProbeRunning) {
+    return;
+  }
+
+  dbRttProbeRunning = true;
+
   const startedAt =
     performanceNow();
 
@@ -13028,6 +13164,49 @@ async function runDbRttProbe() {
         stats.dbRttProbeMaxMs,
         durationMs
       );
+
+    recordDbRttBucket(
+      durationMs
+    );
+
+    recordRecentDbRttProbe(
+      durationMs
+    );
+
+  } catch (error) {
+    stats.dbRttProbeErrors += 1;
+
+    logError(
+      "Postgres RTT probe failed",
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ),
+      }
+    );
+
+  } finally {
+    dbRttProbeRunning = false;
+  }
+}
+
+    // ----------------------------------------------
+    // RTT DISTRIBUTION
+    // ----------------------------------------------
+
+    recordDbRttBucket(
+      durationMs
+    );
+
+    // ----------------------------------------------
+    // RECENT RTT HISTORY + SYSTEM STATE
+    // ----------------------------------------------
+
+    recordRecentDbRttProbe(
+      durationMs
+    );
 
   } catch (error) {
     stats.dbRttProbeErrors += 1;

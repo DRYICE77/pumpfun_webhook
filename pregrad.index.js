@@ -221,6 +221,26 @@ const QUEUE_LOG_EVERY_MS = Number(
   process.env.QUEUE_LOG_EVERY_MS || 10000
 );
 
+// ==================================================
+// 2E-1. POSTGRES BASELINE RTT DIAGNOSTIC
+//
+// Measures end-to-end latency of a minimal:
+//
+//   SELECT 1
+//
+// against the same PostgreSQL pool used by ingestion.
+//
+// Diagnostic only:
+// • No writes
+// • No locks
+// • No schema changes
+// • Runs independently of transaction writes
+// ==================================================
+
+const DB_RTT_PROBE_INTERVAL_MS = Number(
+  process.env.DB_RTT_PROBE_INTERVAL_MS || 10000
+);
+
 
 // ==================================================
 // 2F. HELIUS RPC RETRIES
@@ -476,6 +496,7 @@ const SEEN_SIGNATURE_LIMIT = Number(
 
 let queueLogTimer = null;
 let staleDrainTimer = null;
+let dbRttProbeTimer = null;
 
 
 const stats = {
@@ -706,6 +727,16 @@ dbWriteQueueWaitSamples: 0,
 dbWriteQueueWaitTotalMs: 0,
 dbWriteQueueWaitMaxMs: 0,
 
+  // ==========================================
+// POSTGRES BASELINE RTT DIAGNOSTIC
+// ==========================================
+
+dbRttProbeSamples: 0,
+dbRttProbeErrors: 0,
+
+dbRttProbeTotalMs: 0,
+dbRttProbeLatestMs: 0,
+dbRttProbeMaxMs: 0,
   // ==========================================
 // REAL TOKEN SERIALIZATION
 // ==========================================
@@ -12735,6 +12766,40 @@ function startQueueLogger() {
             TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
+        const dbRttProbeHealth = {
+  samples:
+    stats.dbRttProbeSamples,
+
+  errors:
+    stats.dbRttProbeErrors,
+
+  latestMs:
+    stats.dbRttProbeSamples > 0
+      ? Number(
+          stats.dbRttProbeLatestMs
+            .toFixed(2)
+        )
+      : null,
+
+  avgMs:
+    stats.dbRttProbeSamples > 0
+      ? Number(
+          (
+            stats.dbRttProbeTotalMs /
+            stats.dbRttProbeSamples
+          ).toFixed(2)
+        )
+      : null,
+
+  maxMs:
+    stats.dbRttProbeSamples > 0
+      ? Number(
+          stats.dbRttProbeMaxMs
+            .toFixed(2)
+        )
+      : null,
+};
+
         // ==========================================
         // EMIT SCANNER HEALTH RECORD
         // ==========================================
@@ -12811,23 +12876,27 @@ function startQueueLogger() {
             rpcFetchPerformance,
             rpcAttemptPerformance,
 
-            // --------------------------------------
-            // DATABASE PERFORMANCE
-            // --------------------------------------
+// --------------------------------------
+// DATABASE PERFORMANCE
+// --------------------------------------
 
-            dbWritePerformance,
-            dbPoolAcquirePerformance,
-            dbQueryExecutionPerformance,
+dbWritePerformance,
+dbPoolAcquirePerformance,
+dbQueryExecutionPerformance,
 
-            dbBeginPerformance,
-            dbTokenUpsertPerformance,
-            dbEventInsertPerformance,
-            dbMarketUpdatePerformance,
-            dbCommitPerformance,
+dbRttProbeHealth,
 
-            contentionDepthPerformance,
+dbBeginPerformance,
+dbTokenUpsertPerformance,
+dbEventInsertPerformance,
+dbMarketUpdatePerformance,
+dbCommitPerformance,
 
-            slowDbQueries,
+contentionDepthPerformance,
+
+slowDbQueries,
+
+
 
             // --------------------------------------
             // END-TO-END PROCESSING
@@ -12916,6 +12985,91 @@ function startQueueLogger() {
     }
   );
 }
+
+// ==================================================
+// 16C. POSTGRES BASELINE RTT DIAGNOSTIC
+//
+// Periodically executes:
+//
+//   SELECT 1
+//
+// through the normal PostgreSQL pool.
+//
+// This measures the baseline application → PostgreSQL
+// round-trip independently of the ingestion write
+// transaction.
+//
+// Observation only.
+// ==================================================
+
+async function runDbRttProbe() {
+  const startedAt =
+    performanceNow();
+
+  try {
+    await pool.query(
+      "SELECT 1"
+    );
+
+    const durationMs =
+      performanceNow() -
+      startedAt;
+
+    stats.dbRttProbeSamples += 1;
+
+    stats.dbRttProbeTotalMs +=
+      durationMs;
+
+    stats.dbRttProbeLatestMs =
+      durationMs;
+
+    stats.dbRttProbeMaxMs =
+      Math.max(
+        stats.dbRttProbeMaxMs,
+        durationMs
+      );
+
+  } catch (error) {
+    stats.dbRttProbeErrors += 1;
+
+    logError(
+      "Postgres RTT probe failed",
+      {
+        error:
+          String(
+            error?.message ||
+            error
+          ),
+      }
+    );
+  }
+}
+
+
+function startDbRttProbe() {
+  if (dbRttProbeTimer) {
+    return;
+  }
+
+  // Get one baseline measurement immediately.
+  runDbRttProbe().catch(() => {});
+
+  dbRttProbeTimer =
+    setInterval(
+      () => {
+        runDbRttProbe().catch(() => {});
+      },
+      DB_RTT_PROBE_INTERVAL_MS
+    );
+
+  logInfo(
+    "Postgres RTT probe started",
+    {
+      intervalMs:
+        DB_RTT_PROBE_INTERVAL_MS,
+    }
+  );
+}
 // ==================================================
 // 16D. TIMER SHUTDOWN
 //
@@ -12944,6 +13098,15 @@ function stopTimers() {
     );
 
     staleDrainTimer =
+      null;
+  }
+
+  if (dbRttProbeTimer) {
+    clearInterval(
+      dbRttProbeTimer
+    );
+
+    dbRttProbeTimer =
       null;
   }
 }
@@ -13266,9 +13429,10 @@ async function boot() {
     // START INTERNAL SERVICES
     // ----------------------------------------------
 
-    startQueueWorkers();
-    startQueueLogger();
-    startStaleDrainer();
+   startQueueWorkers();
+startQueueLogger();
+startStaleDrainer();
+startDbRttProbe();
 
 
     // ----------------------------------------------

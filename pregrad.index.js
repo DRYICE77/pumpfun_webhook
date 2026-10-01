@@ -518,6 +518,24 @@ const dbRttProbeBuckets = {
 
 const dbRttRecentProbes = [];
 
+// ==================================================
+// POSTGRES RTT BACKEND IDENTITY DIAGNOSTIC
+//
+// Tracks RTT behavior by PostgreSQL backend PID.
+//
+// This lets us determine whether:
+//
+// • individual pooled connections remain FAST / SLOW
+// • or the SAME connection switches between regimes
+//
+// Diagnostic only:
+// • No additional PostgreSQL queries
+// • Uses node-postgres client.processID
+// ==================================================
+
+const dbRttBackendDiagnostics =
+  new Map();
+
 
 const stats = {
   // ==========================================
@@ -12802,6 +12820,63 @@ function startQueueLogger() {
             TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
+        const dbRttBackendHealth =
+  Array.from(
+    dbRttBackendDiagnostics.values()
+  )
+    .map((backend) => ({
+      backendPid:
+        backend.backendPid,
+
+      samples:
+        backend.samples,
+
+      avgQueryMs:
+        backend.samples > 0
+          ? Number(
+              (
+                backend.totalQueryMs /
+                backend.samples
+              ).toFixed(2)
+            )
+          : null,
+
+      minQueryMs:
+        backend.minQueryMs !== null
+          ? Number(
+              backend.minQueryMs
+                .toFixed(2)
+            )
+          : null,
+
+      maxQueryMs:
+        backend.samples > 0
+          ? Number(
+              backend.maxQueryMs
+                .toFixed(2)
+            )
+          : null,
+
+      fastUnder10ms:
+        backend.fastUnder10ms,
+
+      middle10To100ms:
+        backend.middle10To100ms,
+
+      slow100msPlus:
+        backend.slow100msPlus,
+
+      firstSeenAt:
+        backend.firstSeenAt,
+
+      lastSeenAt:
+        backend.lastSeenAt,
+    }))
+    .sort(
+      (a, b) =>
+        b.samples - a.samples
+    );
+
 const dbRttProbeHealth = {
   samples:
     stats.dbRttProbeSamples,
@@ -12918,6 +12993,67 @@ const dbRttProbeHealth = {
     ms500Plus:
       dbRttProbeBuckets.ms500Plus,
   },
+
+  // ==========================================
+  // POSTGRES BACKEND IDENTITY
+  // ==========================================
+
+  backends:
+    Array.from(
+      dbRttBackendDiagnostics.values()
+    )
+      .map((backend) => ({
+        backendPid:
+          backend.backendPid,
+
+        samples:
+          backend.samples,
+
+        avgQueryMs:
+          backend.samples > 0
+            ? Number(
+                (
+                  backend.totalQueryMs /
+                  backend.samples
+                ).toFixed(2)
+              )
+            : null,
+
+        minQueryMs:
+          backend.minQueryMs !== null
+            ? Number(
+                backend.minQueryMs
+                  .toFixed(2)
+              )
+            : null,
+
+        maxQueryMs:
+          backend.samples > 0
+            ? Number(
+                backend.maxQueryMs
+                  .toFixed(2)
+              )
+            : null,
+
+        fastUnder10ms:
+          backend.fastUnder10ms,
+
+        middle10To100ms:
+          backend.middle10To100ms,
+
+        slow100msPlus:
+          backend.slow100msPlus,
+
+        firstSeenAt:
+          backend.firstSeenAt,
+
+        lastSeenAt:
+          backend.lastSeenAt,
+      }))
+      .sort(
+        (a, b) =>
+          b.samples - a.samples
+      ),
 
   // ==========================================
   // RECENT PROBE HISTORY
@@ -13157,11 +13293,17 @@ function recordDbRttBucket(
 function recordRecentDbRttProbe(
   durationMs,
   acquireMs,
-  queryMs
+  queryMs,
+  backendPid
 ) {
   dbRttRecentProbes.push({
     time:
       nowIso(),
+
+    backendPid:
+      Number.isFinite(backendPid)
+        ? backendPid
+        : null,
 
     rttMs:
       Number(
@@ -13206,6 +13348,94 @@ function recordRecentDbRttProbe(
     dbRttRecentProbes.shift();
   }
 }
+
+
+function recordDbRttBackendProbe(
+  backendPid,
+  queryMs
+) {
+  if (
+    !Number.isFinite(backendPid) ||
+    !Number.isFinite(queryMs) ||
+    queryMs < 0
+  ) {
+    return;
+  }
+
+  let backend =
+    dbRttBackendDiagnostics.get(
+      backendPid
+    );
+
+  if (!backend) {
+    backend = {
+      backendPid,
+
+      samples: 0,
+
+      totalQueryMs: 0,
+
+      minQueryMs: null,
+
+      maxQueryMs: 0,
+
+      fastUnder10ms: 0,
+
+      middle10To100ms: 0,
+
+      slow100msPlus: 0,
+
+      firstSeenAt: null,
+
+      lastSeenAt: null,
+    };
+
+    dbRttBackendDiagnostics.set(
+      backendPid,
+      backend
+    );
+  }
+
+  const timestamp =
+    nowIso();
+
+  backend.samples += 1;
+
+  backend.totalQueryMs +=
+    queryMs;
+
+  backend.minQueryMs =
+    backend.minQueryMs === null
+      ? queryMs
+      : Math.min(
+          backend.minQueryMs,
+          queryMs
+        );
+
+  backend.maxQueryMs =
+    Math.max(
+      backend.maxQueryMs,
+      queryMs
+    );
+
+  if (queryMs < 10) {
+    backend.fastUnder10ms += 1;
+
+  } else if (queryMs < 100) {
+    backend.middle10To100ms += 1;
+
+  } else {
+    backend.slow100msPlus += 1;
+  }
+
+  if (!backend.firstSeenAt) {
+    backend.firstSeenAt =
+      timestamp;
+  }
+
+  backend.lastSeenAt =
+    timestamp;
+}
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC
 //
@@ -13244,6 +13474,10 @@ async function runDbRttProbe() {
 
     client =
       await pool.connect();
+    const backendPid =
+  Number.isFinite(client.processID)
+    ? client.processID
+    : null;
 
     const acquireMs =
       performanceNow() -
@@ -13274,6 +13508,10 @@ async function runDbRttProbe() {
     const queryMs =
       performanceNow() -
       queryStartedAt;
+    recordDbRttBackendProbe(
+  backendPid,
+  queryMs
+);
 
     stats.dbRttQuerySamples += 1;
 
@@ -13313,10 +13551,11 @@ async function runDbRttProbe() {
     );
 
     recordRecentDbRttProbe(
-      durationMs,
-      acquireMs,
-      queryMs
-    );
+  durationMs,
+  acquireMs,
+  queryMs,
+  backendPid
+);
 
   } catch (error) {
     stats.dbRttProbeErrors += 1;

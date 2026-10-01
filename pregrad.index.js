@@ -757,6 +757,22 @@ dbRttProbeErrors: 0,
 dbRttProbeTotalMs: 0,
 dbRttProbeLatestMs: 0,
 dbRttProbeMaxMs: 0,
+
+  // ==========================================
+// POSTGRES RTT COMPONENT DIAGNOSTIC
+// ==========================================
+
+// Time spent acquiring a client specifically
+// for the baseline RTT probe.
+dbRttAcquireSamples: 0,
+dbRttAcquireTotalMs: 0,
+dbRttAcquireMaxMs: 0,
+
+// Time spent executing SELECT 1 after the
+// probe already owns a PostgreSQL client.
+dbRttQuerySamples: 0,
+dbRttQueryTotalMs: 0,
+dbRttQueryMaxMs: 0,
   // ==========================================
 // REAL TOKEN SERIALIZATION
 // ==========================================
@@ -12819,6 +12835,64 @@ const dbRttProbeHealth = {
         )
       : null,
 
+  // ==========================================
+  // POOL ACQUISITION COMPONENT
+  // ==========================================
+
+  acquire: {
+    samples:
+      stats.dbRttAcquireSamples,
+
+    avgMs:
+      stats.dbRttAcquireSamples > 0
+        ? Number(
+            (
+              stats.dbRttAcquireTotalMs /
+              stats.dbRttAcquireSamples
+            ).toFixed(2)
+          )
+        : null,
+
+    maxMs:
+      stats.dbRttAcquireSamples > 0
+        ? Number(
+            stats.dbRttAcquireMaxMs
+              .toFixed(2)
+          )
+        : null,
+  },
+
+  // ==========================================
+  // SELECT 1 EXECUTION COMPONENT
+  // ==========================================
+
+  query: {
+    samples:
+      stats.dbRttQuerySamples,
+
+    avgMs:
+      stats.dbRttQuerySamples > 0
+        ? Number(
+            (
+              stats.dbRttQueryTotalMs /
+              stats.dbRttQuerySamples
+            ).toFixed(2)
+          )
+        : null,
+
+    maxMs:
+      stats.dbRttQuerySamples > 0
+        ? Number(
+            stats.dbRttQueryMaxMs
+              .toFixed(2)
+          )
+        : null,
+  },
+
+  // ==========================================
+  // TOTAL RTT DISTRIBUTION
+  // ==========================================
+
   distribution: {
     under10ms:
       dbRttProbeBuckets.under10ms,
@@ -12844,6 +12918,10 @@ const dbRttProbeHealth = {
     ms500Plus:
       dbRttProbeBuckets.ms500Plus,
   },
+
+  // ==========================================
+  // RECENT PROBE HISTORY
+  // ==========================================
 
   recent:
     dbRttRecentProbes.map(
@@ -13077,7 +13155,9 @@ function recordDbRttBucket(
 
 
 function recordRecentDbRttProbe(
-  durationMs
+  durationMs,
+  acquireMs,
+  queryMs
 ) {
   dbRttRecentProbes.push({
     time:
@@ -13086,6 +13166,16 @@ function recordRecentDbRttProbe(
     rttMs:
       Number(
         durationMs.toFixed(2)
+      ),
+
+    acquireMs:
+      Number(
+        acquireMs.toFixed(2)
+      ),
+
+    queryMs:
+      Number(
+        queryMs.toFixed(2)
       ),
 
     poolTotal:
@@ -13116,7 +13206,6 @@ function recordRecentDbRttProbe(
     dbRttRecentProbes.shift();
   }
 }
-
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC
 //
@@ -13140,17 +13229,70 @@ async function runDbRttProbe() {
 
   dbRttProbeRunning = true;
 
-  const startedAt =
+  const totalStartedAt =
     performanceNow();
 
+  let client = null;
+
   try {
-    await pool.query(
+    // ==============================================
+    // PHASE 1 — POOL ACQUISITION
+    // ==============================================
+
+    const acquireStartedAt =
+      performanceNow();
+
+    client =
+      await pool.connect();
+
+    const acquireMs =
+      performanceNow() -
+      acquireStartedAt;
+
+    stats.dbRttAcquireSamples += 1;
+
+    stats.dbRttAcquireTotalMs +=
+      acquireMs;
+
+    stats.dbRttAcquireMaxMs =
+      Math.max(
+        stats.dbRttAcquireMaxMs,
+        acquireMs
+      );
+
+    // ==============================================
+    // PHASE 2 — SELECT 1 ON ACQUIRED CLIENT
+    // ==============================================
+
+    const queryStartedAt =
+      performanceNow();
+
+    await client.query(
       "SELECT 1"
     );
 
+    const queryMs =
+      performanceNow() -
+      queryStartedAt;
+
+    stats.dbRttQuerySamples += 1;
+
+    stats.dbRttQueryTotalMs +=
+      queryMs;
+
+    stats.dbRttQueryMaxMs =
+      Math.max(
+        stats.dbRttQueryMaxMs,
+        queryMs
+      );
+
+    // ==============================================
+    // TOTAL PROBE
+    // ==============================================
+
     const durationMs =
       performanceNow() -
-      startedAt;
+      totalStartedAt;
 
     stats.dbRttProbeSamples += 1;
 
@@ -13166,20 +13308,14 @@ async function runDbRttProbe() {
         durationMs
       );
 
-    // ----------------------------------------------
-    // RTT DISTRIBUTION
-    // ----------------------------------------------
-
     recordDbRttBucket(
       durationMs
     );
 
-    // ----------------------------------------------
-    // RECENT RTT HISTORY + SYSTEM STATE
-    // ----------------------------------------------
-
     recordRecentDbRttProbe(
-      durationMs
+      durationMs,
+      acquireMs,
+      queryMs
     );
 
   } catch (error) {
@@ -13197,9 +13333,14 @@ async function runDbRttProbe() {
     );
 
   } finally {
+    if (client) {
+      client.release();
+    }
+
     dbRttProbeRunning = false;
   }
 }
+   
 
 function startDbRttProbe() {
   if (dbRttProbeTimer) {

@@ -498,6 +498,7 @@ let queueLogTimer = null;
 let staleDrainTimer = null;
 let dbRttProbeTimer = null;
 let dbRttProbeRunning = false;
+let intakeCompletenessTimer = null;
 
 // ==================================================
 // POSTGRES RTT DISTRIBUTION / RECENT HISTORY
@@ -12090,6 +12091,781 @@ let previousStats = {
 let previousLogAt =
   Date.now();
 
+
+// ==================================================
+// 16B-1. INTAKE COMPLETENESS MINUTE COLLECTOR
+//
+// Purpose:
+// • Persist one auditable scanner-health row per FULL minute.
+// • Use deltas of cumulative counters for minute-local counts.
+// • Sample queue pressure from the existing health logger.
+// • Keep the scoring layer provisional / shadow-only.
+//
+// IMPORTANT:
+// • The first partial minute after boot is intentionally skipped.
+// • No ingestion behavior is changed.
+// • One INSERT ... ON CONFLICT UPDATE is issued per full minute.
+// ==================================================
+
+const INTAKE_COMPLETENESS_FLUSH_GRACE_MS = 250;
+
+let intakeCompletenessReady = false;
+let intakeCompletenessMinuteAt = null;
+let intakeCompletenessBaseline = null;
+
+let intakeCompletenessSamples = {
+  samples: 0,
+  queueSizeTotal: 0,
+  queueSizeMax: 0,
+  oldestSignatureAgeTotalMs: 0,
+  oldestSignatureAgeMaxMs: 0,
+  dbQueueSizeTotal: 0,
+  dbQueueSizeMax: 0,
+  enabledSamples: 0,
+  socketHealthySamples: 0,
+};
+
+function resetIntakeCompletenessSamples() {
+  intakeCompletenessSamples = {
+    samples: 0,
+    queueSizeTotal: 0,
+    queueSizeMax: 0,
+    oldestSignatureAgeTotalMs: 0,
+    oldestSignatureAgeMaxMs: 0,
+    dbQueueSizeTotal: 0,
+    dbQueueSizeMax: 0,
+    enabledSamples: 0,
+    socketHealthySamples: 0,
+  };
+}
+
+function currentCumulativePauseMs() {
+  const activePauseMs =
+    intakePaused && intakePausedAt !== null
+      ? Math.max(
+          performanceNow() - intakePausedAt,
+          0
+        )
+      : 0;
+
+  return (
+    stats.intakePauseTotalMs +
+    activePauseMs
+  );
+}
+
+function captureIntakeCompletenessCounters() {
+  return {
+    capturedAt: Date.now(),
+
+    queued: stats.queued,
+    dequeued: stats.dequeued,
+    processed: stats.processed,
+    insertedEvents: stats.insertedEvents,
+
+    intakePausedCount: stats.intakePausedCount,
+    cumulativePauseMs: currentCumulativePauseMs(),
+    droppedDuringPause: stats.droppedDuringPause,
+    droppedQueueFull: stats.droppedQueueFull,
+    droppedStale: stats.droppedStale,
+
+    rpcAttemptSamples: stats.rpcAttemptSamples,
+    rpcAttemptTotalMs: stats.rpcAttemptTotalMs,
+    rpcFetchSamples: stats.rpcFetchSamples,
+    rpcFetchTotalMs: stats.rpcFetchTotalMs,
+    rpcRetries: stats.rpcRetries,
+    rpcRateLimitedRetries: stats.rpcRateLimitedRetries,
+    rpcNullRetries: stats.rpcNullRetries,
+    heliusRpcPacerWaited: stats.heliusRpcPacerWaited,
+    heliusRpcPacerWaitTotalMs: stats.heliusRpcPacerWaitTotalMs,
+
+    dbWriteJobsQueued: stats.dbWriteJobsQueued,
+    dbWriteJobsCompleted: stats.dbWriteJobsCompleted,
+    dbWriteJobsFailed: stats.dbWriteJobsFailed,
+    dbWriteQueueWaitSamples: stats.dbWriteQueueWaitSamples,
+    dbWriteQueueWaitTotalMs: stats.dbWriteQueueWaitTotalMs,
+    dbWriteSamples: stats.dbWriteSamples,
+    dbWriteTotalMs: stats.dbWriteTotalMs,
+
+    workerErrors: stats.workerErrors,
+    txFetchErrors: stats.txFetchErrors,
+  };
+}
+
+function nonNegativeDelta(current, previous) {
+  const a = Number(current);
+  const b = Number(previous);
+
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    return 0;
+  }
+
+  return Math.max(a - b, 0);
+}
+
+function deltaAverage(
+  currentSamples,
+  previousSamples,
+  currentTotal,
+  previousTotal
+) {
+  const samples =
+    nonNegativeDelta(
+      currentSamples,
+      previousSamples
+    );
+
+  if (samples <= 0) {
+    return null;
+  }
+
+  const total =
+    nonNegativeDelta(
+      currentTotal,
+      previousTotal
+    );
+
+  return Number(
+    (total / samples).toFixed(2)
+  );
+}
+
+function calculateIntakeCompletenessScore(m) {
+  let score = 100;
+
+  // Known loss is intentionally punished heavily.
+  if (m.dropped_during_pause > 0) score -= 60;
+  if (m.dropped_queue_full > 0) score -= 60;
+  if (m.dropped_stale > 0) score -= 50;
+
+  if (m.intake_paused_ms > 0) {
+    score -= Math.min(
+      40,
+      (m.intake_paused_ms / 60000) * 40
+    );
+  }
+
+  if (m.oldest_signature_age_ms_max > 60000) score -= 35;
+  else if (m.oldest_signature_age_ms_max > 30000) score -= 20;
+  else if (m.oldest_signature_age_ms_max > 15000) score -= 10;
+  else if (m.oldest_signature_age_ms_max > 5000) score -= 3;
+
+  const maxQueue = Math.max(
+    effectiveMaxQueueSize(),
+    1
+  );
+
+  const queuePressure =
+    m.queue_size_max / maxQueue;
+
+  if (queuePressure >= 0.96) score -= 20;
+  else if (queuePressure >= 0.80) score -= 10;
+  else if (queuePressure >= 0.40) score -= 5;
+
+  const retryRate =
+    m.rpc_attempt_count > 0
+      ? m.rpc_retry_count /
+        m.rpc_attempt_count
+      : 0;
+
+  if (retryRate > 0.05) score -= 15;
+  else if (retryRate > 0.02) score -= 8;
+  else if (retryRate > 0.01) score -= 3;
+
+  if (m.db_jobs_failed > 0) score -= 30;
+  if (m.worker_errors > 0) score -= 20;
+  if (m.tx_fetch_errors > 0) score -= 20;
+
+  return Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(score)
+    )
+  );
+}
+
+function classifyIntakeCompleteness(
+  score,
+  knownLoss
+) {
+  if (knownLoss) return "BAD";
+  if (score >= 95) return "ELITE";
+  if (score >= 85) return "GOOD";
+  if (score >= 70) return "DEGRADED";
+  return "BAD";
+}
+
+function recordIntakeCompletenessHealthSample(
+  now = Date.now()
+) {
+  if (!intakeCompletenessReady) {
+    return;
+  }
+
+  const sampleMinuteAt =
+    Math.floor(now / 60000) * 60000;
+
+  // Only sample the minute currently being collected.
+  if (sampleMinuteAt !== intakeCompletenessMinuteAt) {
+    return;
+  }
+
+  const oldestSignature = signatureQueue[0];
+
+  const oldestSignatureAgeMs =
+    oldestSignature
+      ? Math.max(
+          now - oldestSignature.enqueuedAt,
+          0
+        )
+      : 0;
+
+  const queueSize = signatureQueue.length;
+  const dbQueueSize = dbWriteQueue.length;
+
+  intakeCompletenessSamples.samples += 1;
+  intakeCompletenessSamples.queueSizeTotal += queueSize;
+  intakeCompletenessSamples.queueSizeMax = Math.max(
+    intakeCompletenessSamples.queueSizeMax,
+    queueSize
+  );
+
+  intakeCompletenessSamples.oldestSignatureAgeTotalMs +=
+    oldestSignatureAgeMs;
+
+  intakeCompletenessSamples.oldestSignatureAgeMaxMs =
+    Math.max(
+      intakeCompletenessSamples.oldestSignatureAgeMaxMs,
+      oldestSignatureAgeMs
+    );
+
+  intakeCompletenessSamples.dbQueueSizeTotal +=
+    dbQueueSize;
+
+  intakeCompletenessSamples.dbQueueSizeMax = Math.max(
+    intakeCompletenessSamples.dbQueueSizeMax,
+    dbQueueSize
+  );
+
+  if (isPregradEnabled()) {
+    intakeCompletenessSamples.enabledSamples += 1;
+  }
+
+  if (socketAlive) {
+    intakeCompletenessSamples.socketHealthySamples += 1;
+  }
+}
+
+async function flushIntakeCompletenessMinute(
+  minuteAt,
+  baseline,
+  current,
+  samples
+) {
+  if (!baseline || !current) {
+    return;
+  }
+
+  const elapsedSeconds = Math.max(
+    (current.capturedAt - baseline.capturedAt) / 1000,
+    1
+  );
+
+  const sampleCount = samples.samples;
+
+  const row = {
+    minute_at: new Date(minuteAt).toISOString(),
+
+    incoming_count: nonNegativeDelta(current.queued, baseline.queued),
+    dequeued_count: nonNegativeDelta(current.dequeued, baseline.dequeued),
+    processed_count: nonNegativeDelta(current.processed, baseline.processed),
+    inserted_event_count: nonNegativeDelta(current.insertedEvents, baseline.insertedEvents),
+
+    incoming_per_second: null,
+    drained_per_second: null,
+    processed_per_second: null,
+
+    queue_size_avg:
+      sampleCount > 0
+        ? Number(
+            (
+              samples.queueSizeTotal /
+              sampleCount
+            ).toFixed(2)
+          )
+        : null,
+
+    queue_size_max: samples.queueSizeMax,
+
+    oldest_signature_age_ms_avg:
+      sampleCount > 0
+        ? Number(
+            (
+              samples.oldestSignatureAgeTotalMs /
+              sampleCount
+            ).toFixed(2)
+          )
+        : null,
+
+    oldest_signature_age_ms_max:
+      samples.oldestSignatureAgeMaxMs,
+
+    intake_pause_count:
+      nonNegativeDelta(
+        current.intakePausedCount,
+        baseline.intakePausedCount
+      ),
+
+    intake_paused_ms:
+      Math.round(
+        nonNegativeDelta(
+          current.cumulativePauseMs,
+          baseline.cumulativePauseMs
+        )
+      ),
+
+    dropped_during_pause:
+      nonNegativeDelta(
+        current.droppedDuringPause,
+        baseline.droppedDuringPause
+      ),
+
+    dropped_queue_full:
+      nonNegativeDelta(
+        current.droppedQueueFull,
+        baseline.droppedQueueFull
+      ),
+
+    dropped_stale:
+      nonNegativeDelta(
+        current.droppedStale,
+        baseline.droppedStale
+      ),
+
+    rpc_attempt_count:
+      nonNegativeDelta(
+        current.rpcAttemptSamples,
+        baseline.rpcAttemptSamples
+      ),
+
+    rpc_retry_count:
+      nonNegativeDelta(
+        current.rpcRetries,
+        baseline.rpcRetries
+      ),
+
+    rpc_rate_limited_retry_count:
+      nonNegativeDelta(
+        current.rpcRateLimitedRetries,
+        baseline.rpcRateLimitedRetries
+      ),
+
+    rpc_null_retry_count:
+      nonNegativeDelta(
+        current.rpcNullRetries,
+        baseline.rpcNullRetries
+      ),
+
+    rpc_fetch_avg_ms:
+      deltaAverage(
+        current.rpcFetchSamples,
+        baseline.rpcFetchSamples,
+        current.rpcFetchTotalMs,
+        baseline.rpcFetchTotalMs
+      ),
+
+    rpc_attempt_avg_ms:
+      deltaAverage(
+        current.rpcAttemptSamples,
+        baseline.rpcAttemptSamples,
+        current.rpcAttemptTotalMs,
+        baseline.rpcAttemptTotalMs
+      ),
+
+    rpc_pacer_wait_avg_ms:
+      deltaAverage(
+        current.heliusRpcPacerWaited,
+        baseline.heliusRpcPacerWaited,
+        current.heliusRpcPacerWaitTotalMs,
+        baseline.heliusRpcPacerWaitTotalMs
+      ),
+
+    db_jobs_queued:
+      nonNegativeDelta(
+        current.dbWriteJobsQueued,
+        baseline.dbWriteJobsQueued
+      ),
+
+    db_jobs_completed:
+      nonNegativeDelta(
+        current.dbWriteJobsCompleted,
+        baseline.dbWriteJobsCompleted
+      ),
+
+    db_jobs_failed:
+      nonNegativeDelta(
+        current.dbWriteJobsFailed,
+        baseline.dbWriteJobsFailed
+      ),
+
+    db_queue_size_avg:
+      sampleCount > 0
+        ? Number(
+            (
+              samples.dbQueueSizeTotal /
+              sampleCount
+            ).toFixed(2)
+          )
+        : null,
+
+    db_queue_size_max:
+      samples.dbQueueSizeMax,
+
+    db_queue_wait_avg_ms:
+      deltaAverage(
+        current.dbWriteQueueWaitSamples,
+        baseline.dbWriteQueueWaitSamples,
+        current.dbWriteQueueWaitTotalMs,
+        baseline.dbWriteQueueWaitTotalMs
+      ),
+
+    db_write_avg_ms:
+      deltaAverage(
+        current.dbWriteSamples,
+        baseline.dbWriteSamples,
+        current.dbWriteTotalMs,
+        baseline.dbWriteTotalMs
+      ),
+
+    worker_errors:
+      nonNegativeDelta(
+        current.workerErrors,
+        baseline.workerErrors
+      ),
+
+    tx_fetch_errors:
+      nonNegativeDelta(
+        current.txFetchErrors,
+        baseline.txFetchErrors
+      ),
+  };
+
+  row.incoming_per_second = Number(
+    (row.incoming_count / elapsedSeconds).toFixed(2)
+  );
+
+  row.drained_per_second = Number(
+    (row.dequeued_count / elapsedSeconds).toFixed(2)
+  );
+
+  row.processed_per_second = Number(
+    (row.processed_count / elapsedSeconds).toFixed(2)
+  );
+
+  const expectedHealthSamples =
+    Math.max(
+      1,
+      Math.floor(
+        60000 /
+        Math.max(QUEUE_LOG_EVERY_MS, 1)
+      ) - 1
+    );
+
+  const healthSamplingComplete =
+    sampleCount >= expectedHealthSamples;
+
+  const systemHealthyForAllSamples =
+    sampleCount > 0 &&
+    samples.enabledSamples === sampleCount &&
+    samples.socketHealthySamples === sampleCount;
+
+  const knownLoss =
+    row.dropped_during_pause > 0 ||
+    row.dropped_queue_full > 0 ||
+    row.dropped_stale > 0 ||
+    row.db_jobs_failed > 0 ||
+    row.tx_fetch_errors > 0;
+
+  row.completeness_score =
+    calculateIntakeCompletenessScore(row);
+
+  // Missing health samples or scanner/socket downtime
+  // makes the minute unsafe for completeness-sensitive
+  // research even if no explicit drop counter moved.
+  if (!healthSamplingComplete) {
+    row.completeness_score = Math.min(
+      row.completeness_score,
+      69
+    );
+  }
+
+  if (!systemHealthyForAllSamples) {
+    row.completeness_score = Math.min(
+      row.completeness_score,
+      49
+    );
+  }
+
+  row.completeness_state =
+    classifyIntakeCompleteness(
+      row.completeness_score,
+      knownLoss
+    );
+
+  row.coverage_eligible =
+    !knownLoss &&
+    healthSamplingComplete &&
+    systemHealthyForAllSamples &&
+    row.intake_paused_ms === 0 &&
+    row.oldest_signature_age_ms_max < 30000;
+
+  await pool.query(
+    `
+      INSERT INTO northstar_intake_completeness_minutes (
+        minute_at,
+        incoming_count,
+        dequeued_count,
+        processed_count,
+        inserted_event_count,
+        incoming_per_second,
+        drained_per_second,
+        processed_per_second,
+        queue_size_avg,
+        queue_size_max,
+        oldest_signature_age_ms_avg,
+        oldest_signature_age_ms_max,
+        intake_pause_count,
+        intake_paused_ms,
+        dropped_during_pause,
+        dropped_queue_full,
+        dropped_stale,
+        rpc_attempt_count,
+        rpc_retry_count,
+        rpc_rate_limited_retry_count,
+        rpc_null_retry_count,
+        rpc_fetch_avg_ms,
+        rpc_attempt_avg_ms,
+        rpc_pacer_wait_avg_ms,
+        db_jobs_queued,
+        db_jobs_completed,
+        db_jobs_failed,
+        db_queue_size_avg,
+        db_queue_size_max,
+        db_queue_wait_avg_ms,
+        db_write_avg_ms,
+        worker_errors,
+        tx_fetch_errors,
+        completeness_score,
+        completeness_state,
+        coverage_eligible
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+        $31,$32,$33,$34,$35,$36
+      )
+      ON CONFLICT (minute_at)
+      DO UPDATE SET
+        incoming_count = EXCLUDED.incoming_count,
+        dequeued_count = EXCLUDED.dequeued_count,
+        processed_count = EXCLUDED.processed_count,
+        inserted_event_count = EXCLUDED.inserted_event_count,
+        incoming_per_second = EXCLUDED.incoming_per_second,
+        drained_per_second = EXCLUDED.drained_per_second,
+        processed_per_second = EXCLUDED.processed_per_second,
+        queue_size_avg = EXCLUDED.queue_size_avg,
+        queue_size_max = EXCLUDED.queue_size_max,
+        oldest_signature_age_ms_avg = EXCLUDED.oldest_signature_age_ms_avg,
+        oldest_signature_age_ms_max = EXCLUDED.oldest_signature_age_ms_max,
+        intake_pause_count = EXCLUDED.intake_pause_count,
+        intake_paused_ms = EXCLUDED.intake_paused_ms,
+        dropped_during_pause = EXCLUDED.dropped_during_pause,
+        dropped_queue_full = EXCLUDED.dropped_queue_full,
+        dropped_stale = EXCLUDED.dropped_stale,
+        rpc_attempt_count = EXCLUDED.rpc_attempt_count,
+        rpc_retry_count = EXCLUDED.rpc_retry_count,
+        rpc_rate_limited_retry_count = EXCLUDED.rpc_rate_limited_retry_count,
+        rpc_null_retry_count = EXCLUDED.rpc_null_retry_count,
+        rpc_fetch_avg_ms = EXCLUDED.rpc_fetch_avg_ms,
+        rpc_attempt_avg_ms = EXCLUDED.rpc_attempt_avg_ms,
+        rpc_pacer_wait_avg_ms = EXCLUDED.rpc_pacer_wait_avg_ms,
+        db_jobs_queued = EXCLUDED.db_jobs_queued,
+        db_jobs_completed = EXCLUDED.db_jobs_completed,
+        db_jobs_failed = EXCLUDED.db_jobs_failed,
+        db_queue_size_avg = EXCLUDED.db_queue_size_avg,
+        db_queue_size_max = EXCLUDED.db_queue_size_max,
+        db_queue_wait_avg_ms = EXCLUDED.db_queue_wait_avg_ms,
+        db_write_avg_ms = EXCLUDED.db_write_avg_ms,
+        worker_errors = EXCLUDED.worker_errors,
+        tx_fetch_errors = EXCLUDED.tx_fetch_errors,
+        completeness_score = EXCLUDED.completeness_score,
+        completeness_state = EXCLUDED.completeness_state,
+        coverage_eligible = EXCLUDED.coverage_eligible
+    `,
+    [
+      row.minute_at,
+      row.incoming_count,
+      row.dequeued_count,
+      row.processed_count,
+      row.inserted_event_count,
+      row.incoming_per_second,
+      row.drained_per_second,
+      row.processed_per_second,
+      row.queue_size_avg,
+      row.queue_size_max,
+      row.oldest_signature_age_ms_avg,
+      row.oldest_signature_age_ms_max,
+      row.intake_pause_count,
+      row.intake_paused_ms,
+      row.dropped_during_pause,
+      row.dropped_queue_full,
+      row.dropped_stale,
+      row.rpc_attempt_count,
+      row.rpc_retry_count,
+      row.rpc_rate_limited_retry_count,
+      row.rpc_null_retry_count,
+      row.rpc_fetch_avg_ms,
+      row.rpc_attempt_avg_ms,
+      row.rpc_pacer_wait_avg_ms,
+      row.db_jobs_queued,
+      row.db_jobs_completed,
+      row.db_jobs_failed,
+      row.db_queue_size_avg,
+      row.db_queue_size_max,
+      row.db_queue_wait_avg_ms,
+      row.db_write_avg_ms,
+      row.worker_errors,
+      row.tx_fetch_errors,
+      row.completeness_score,
+      row.completeness_state,
+      row.coverage_eligible,
+    ]
+  );
+
+  logInfo(
+    "Intake completeness minute written",
+    {
+      minuteAt: row.minute_at,
+      completenessScore: row.completeness_score,
+      completenessState: row.completeness_state,
+      coverageEligible: row.coverage_eligible,
+      queueSizeMax: row.queue_size_max,
+      oldestSignatureAgeMsMax:
+        row.oldest_signature_age_ms_max,
+      droppedDuringPause:
+        row.dropped_during_pause,
+      droppedQueueFull:
+        row.dropped_queue_full,
+      droppedStale:
+        row.dropped_stale,
+    }
+  );
+}
+
+async function rollIntakeCompletenessMinute() {
+  const now = Date.now();
+  const currentMinuteAt =
+    Math.floor(now / 60000) * 60000;
+
+  // First boundary after boot establishes a clean
+  // baseline. The boot partial-minute is skipped.
+  if (!intakeCompletenessReady) {
+    intakeCompletenessReady = true;
+    intakeCompletenessMinuteAt = currentMinuteAt;
+    intakeCompletenessBaseline =
+      captureIntakeCompletenessCounters();
+    resetIntakeCompletenessSamples();
+    return;
+  }
+
+  const minuteToFlush =
+    intakeCompletenessMinuteAt;
+
+  const baseline =
+    intakeCompletenessBaseline;
+
+  const samples = {
+    ...intakeCompletenessSamples,
+  };
+
+  const current =
+    captureIntakeCompletenessCounters();
+
+  // Advance state BEFORE the DB write so a slow
+  // completeness INSERT cannot corrupt the next minute.
+  intakeCompletenessMinuteAt = currentMinuteAt;
+  intakeCompletenessBaseline = current;
+  resetIntakeCompletenessSamples();
+
+  try {
+    await flushIntakeCompletenessMinute(
+      minuteToFlush,
+      baseline,
+      current,
+      samples
+    );
+  } catch (error) {
+    logError(
+      "Intake completeness minute write failed",
+      {
+        minuteAt:
+          new Date(minuteToFlush).toISOString(),
+        error:
+          String(error?.message || error),
+      }
+    );
+  }
+}
+
+function scheduleNextIntakeCompletenessBoundary() {
+  if (intentionalShutdown) {
+    return;
+  }
+
+  const now = Date.now();
+  const nextMinuteAt =
+    Math.floor(now / 60000) * 60000 +
+    60000;
+
+  const delayMs = Math.max(
+    nextMinuteAt - now +
+      INTAKE_COMPLETENESS_FLUSH_GRACE_MS,
+    50
+  );
+
+  intakeCompletenessTimer = setTimeout(
+    async () => {
+      intakeCompletenessTimer = null;
+
+      await rollIntakeCompletenessMinute();
+
+      scheduleNextIntakeCompletenessBoundary();
+    },
+    delayMs
+  );
+}
+
+function startIntakeCompletenessCollector() {
+  if (intakeCompletenessTimer) {
+    return;
+  }
+
+  // Intentionally wait for the next UTC minute boundary
+  // before establishing the first full-minute baseline.
+  scheduleNextIntakeCompletenessBoundary();
+
+  logInfo(
+    "Intake completeness collector started",
+    {
+      table:
+        "northstar_intake_completeness_minutes",
+      firstPartialMinuteSkipped: true,
+    }
+  );
+}
+
 // ==================================================
 // 16C. SCANNER STATS LOGGER
 //
@@ -12213,6 +12989,10 @@ function startQueueLogger() {
         await getPregradControl();
 
         const now = Date.now();
+
+        // Feed queue-pressure samples into the current
+        // full-minute completeness bucket.
+        recordIntakeCompletenessHealthSample(now);
 
         const seconds = Math.max(
           (now - previousLogAt) / 1000,
@@ -13644,6 +14424,15 @@ function stopTimers() {
     dbRttProbeTimer =
       null;
   }
+
+  if (intakeCompletenessTimer) {
+    clearTimeout(
+      intakeCompletenessTimer
+    );
+
+    intakeCompletenessTimer =
+      null;
+  }
 }
 // ==================================================
 // 17. HEALTH SERVER
@@ -13968,6 +14757,7 @@ async function boot() {
 startQueueLogger();
 startStaleDrainer();
 startDbRttProbe();
+startIntakeCompletenessCollector();
 
 
     // ----------------------------------------------

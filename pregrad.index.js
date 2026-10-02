@@ -128,7 +128,7 @@ const WORKER_CONCURRENCY = Number(
 
 
 // ==================================================
-// 2C-1. GLOBAL HELIUS RPC PACER
+// 2C-1. GLOBAL HELIUS RPC TOKEN BUCKET
 //
 // Limits aggregate Helius RPC request STARTS across:
 //
@@ -136,29 +136,32 @@ const WORKER_CONCURRENCY = Number(
 // • getTokenSupply
 // • getTokenLargestAccounts
 //
-// Workers remain concurrent.
+// Tokens refill continuously at the configured
+// long-run rate.
 //
-// Unlike the old per-worker sleep, this does not
-// artificially delay a worker after its RPC work has
-// already completed.
+// Unused capacity may accumulate up to the configured
+// burst capacity so short traffic spikes can be
+// absorbed without permanently increasing the
+// long-run RPC rate.
 //
-// Requests are evenly spaced across time.
+// V1.2:
+// • Refill rate: 55 starts/sec
+// • Burst capacity: 15 starts
 // ==================================================
 
 const HELIUS_RPC_MAX_STARTS_PER_SECOND =
   Number(
     process.env
       .HELIUS_RPC_MAX_STARTS_PER_SECOND ||
-      60
+      55
   );
 
-const HELIUS_RPC_MIN_START_INTERVAL_MS =
-  HELIUS_RPC_MAX_STARTS_PER_SECOND > 0
-    ? (
-        1000 /
-        HELIUS_RPC_MAX_STARTS_PER_SECOND
-      )
-    : 0;
+const HELIUS_RPC_BURST_CAPACITY =
+  Number(
+    process.env
+      .HELIUS_RPC_BURST_CAPACITY ||
+      15
+  );
 
 // ==================================================
 // 2C-2. DATABASE WRITE DISPATCHER
@@ -424,10 +427,17 @@ const tokenSafetyEnrichmentInFlight = new Map();
 const tokenLastHolderEnrichedAt = new Map();
 
 // ==================================================
-// GLOBAL HELIUS RPC PACER STATE
+// GLOBAL HELIUS RPC TOKEN BUCKET STATE
 // ==================================================
 
-let heliusRpcNextStartAt = 0;
+let heliusRpcTokens =
+  Math.max(
+    0,
+    HELIUS_RPC_BURST_CAPACITY
+  );
+
+let heliusRpcLastRefillAt =
+  performanceNow();
 
 let heliusRpcPacerTail =
   Promise.resolve();
@@ -3076,12 +3086,22 @@ function enqueueSignature(
 async function acquireHeliusRpcStartSlot() {
   if (
     !Number.isFinite(
-      HELIUS_RPC_MIN_START_INTERVAL_MS
+      HELIUS_RPC_MAX_STARTS_PER_SECOND
     ) ||
-    HELIUS_RPC_MIN_START_INTERVAL_MS <= 0
+    HELIUS_RPC_MAX_STARTS_PER_SECOND <= 0
   ) {
     return;
   }
+
+  const refillRatePerMs =
+    HELIUS_RPC_MAX_STARTS_PER_SECOND /
+    1000;
+
+  const capacity =
+    Math.max(
+      1,
+      HELIUS_RPC_BURST_CAPACITY
+    );
 
   const waitStartedAt =
     performanceNow();
@@ -3099,31 +3119,48 @@ async function acquireHeliusRpcStartSlot() {
   await previousGate;
 
   try {
-    const now =
-      performanceNow();
+    while (true) {
+      const now =
+        performanceNow();
 
-    const scheduledStartAt =
-      Math.max(
-        now,
-        heliusRpcNextStartAt
+      const elapsedMs =
+        Math.max(
+          0,
+          now - heliusRpcLastRefillAt
+        );
+
+      if (elapsedMs > 0) {
+        heliusRpcTokens =
+          Math.min(
+            capacity,
+            heliusRpcTokens +
+              elapsedMs *
+                refillRatePerMs
+          );
+
+        heliusRpcLastRefillAt =
+          now;
+      }
+
+      if (heliusRpcTokens >= 1) {
+        heliusRpcTokens -= 1;
+        break;
+      }
+
+      const tokensNeeded =
+        1 - heliusRpcTokens;
+
+      const waitMs =
+        tokensNeeded /
+        refillRatePerMs;
+
+      await sleep(
+        Math.max(
+          1,
+          Math.ceil(waitMs)
+        )
       );
-
-    const waitMs =
-      Math.max(
-        0,
-        scheduledStartAt - now
-      );
-
-    if (waitMs > 0) {
-      await sleep(waitMs);
     }
-
-    const actualStartAt =
-      performanceNow();
-
-    heliusRpcNextStartAt =
-      actualStartAt +
-      HELIUS_RPC_MIN_START_INTERVAL_MS;
 
   } finally {
     releaseGate();
@@ -11617,32 +11654,36 @@ async function queueWorkerLoop(workerId) {
 
     maybeResumeIntake();
 
-    // ================================================
-    // THROTTLE TEST
+       // ================================================
+    // V1.2 RPC TOKEN-BUCKET THROTTLE
     //
     // Intentionally no fixed post-signature sleep.
     //
-    // The old worker loop slept:
+    // Worker throughput is governed by:
     //
-    //   (1000 / MAX_TX_PER_SECOND)
-    //     * WORKER_CONCURRENCY
+    // • Helius global RPC token bucket
+    // • Actual RPC latency
+    // • Signature queue pressure
+    // • Downstream DB backpressure
     //
-    // after EVERY signature.
+    // The token bucket preserves the configured
+    // long-run Helius RPC start rate while allowing
+    // unused capacity to accumulate for short bursts.
     //
-    // With:
-    //   WORKER_CONCURRENCY=30
-    //   MAX_TX_PER_SECOND=80
+    // V1.2 controlled experiment:
     //
-    // that imposed ~375ms of artificial delay per
-    // worker iteration.
+    //   Refill rate:
+    //     HELIUS_RPC_MAX_STARTS_PER_SECOND
     //
-    // For this test we allow worker throughput to be
-    // governed by actual RPC latency and downstream
-    // backpressure.
+    //   Burst capacity:
+    //     HELIUS_RPC_BURST_CAPACITY
+    //
+    // There is no fixed sleep after each processed
+    // signature.
     //
     // DB dispatcher, per-token FIFO, serializer,
-    // PostgreSQL concurrency, and RPC retry behavior
-    // remain unchanged.
+    // PostgreSQL concurrency, queue configuration,
+    // and RPC retry behavior remain unchanged.
     // ================================================
   }
 }
@@ -11673,14 +11714,14 @@ function startQueueWorkers() {
       workerConcurrency:
         WORKER_CONCURRENCY,
 
+      heliusRpcMode:
+        "token_bucket",
+
       heliusRpcMaxStartsPerSecond:
         HELIUS_RPC_MAX_STARTS_PER_SECOND,
 
-      heliusRpcMinStartIntervalMs:
-        Number(
-          HELIUS_RPC_MIN_START_INTERVAL_MS
-            .toFixed(2)
-        ),
+      heliusRpcBurstCapacity:
+        HELIUS_RPC_BURST_CAPACITY,
     }
   );
 }
@@ -13141,60 +13182,61 @@ function startQueueLogger() {
         // rpcAttemptPerformance handles that.
         // ==========================================
 
-        const heliusRpcPacerHealth = {
-          maxStartsPerSecond:
-            HELIUS_RPC_MAX_STARTS_PER_SECOND,
+  const heliusRpcPacerHealth = {
+  mode:
+    "token_bucket",
 
-          minStartIntervalMs:
-            Number.isFinite(
-              HELIUS_RPC_MIN_START_INTERVAL_MS
-            )
-              ? Number(
-                  HELIUS_RPC_MIN_START_INTERVAL_MS
-                    .toFixed(2)
-                )
-              : null,
+  maxStartsPerSecond:
+    HELIUS_RPC_MAX_STARTS_PER_SECOND,
 
-          samples:
-            stats.heliusRpcPacerSamples,
+  burstCapacity:
+    HELIUS_RPC_BURST_CAPACITY,
 
-          immediate:
-            stats.heliusRpcPacerImmediate,
+  availableTokens:
+    Number(
+      heliusRpcTokens.toFixed(2)
+    ),
 
-          waited:
-            stats.heliusRpcPacerWaited,
+  samples:
+    stats.heliusRpcPacerSamples,
 
-          waitPct:
-            stats.heliusRpcPacerSamples > 0
-              ? Number(
-                  (
-                    (
-                      stats.heliusRpcPacerWaited /
-                      stats.heliusRpcPacerSamples
-                    ) *
-                    100
-                  ).toFixed(2)
-                )
-              : null,
+  immediate:
+    stats.heliusRpcPacerImmediate,
 
-          avgWaitMs:
-            stats.heliusRpcPacerWaited > 0
-              ? Number(
-                  (
-                    stats.heliusRpcPacerWaitTotalMs /
-                    stats.heliusRpcPacerWaited
-                  ).toFixed(2)
-                )
-              : null,
+  waited:
+    stats.heliusRpcPacerWaited,
 
-          maxWaitMs:
-            stats.heliusRpcPacerWaited > 0
-              ? Number(
-                  stats.heliusRpcPacerWaitMaxMs
-                    .toFixed(2)
-                )
-              : null,
-        };
+  waitPct:
+    stats.heliusRpcPacerSamples > 0
+      ? Number(
+          (
+            (
+              stats.heliusRpcPacerWaited /
+              stats.heliusRpcPacerSamples
+            ) *
+            100
+          ).toFixed(2)
+        )
+      : null,
+
+  avgWaitMs:
+    stats.heliusRpcPacerWaited > 0
+      ? Number(
+          (
+            stats.heliusRpcPacerWaitTotalMs /
+            stats.heliusRpcPacerWaited
+          ).toFixed(2)
+        )
+      : null,
+
+  maxWaitMs:
+    stats.heliusRpcPacerWaited > 0
+      ? Number(
+          stats.heliusRpcPacerWaitMaxMs
+            .toFixed(2)
+        )
+      : null,
+};
 
         // ==========================================
         // DATABASE DIAGNOSTIC SUMMARIES
@@ -14780,20 +14822,32 @@ logInfo(
     workerConcurrency:
       WORKER_CONCURRENCY,
 
+    // ------------------------------------------
+    // HELIUS RPC TOKEN BUCKET
+    // ------------------------------------------
+
+    heliusRpcMode:
+      "token_bucket",
+
     heliusRpcMaxStartsPerSecond:
       HELIUS_RPC_MAX_STARTS_PER_SECOND,
 
-    heliusRpcMinStartIntervalMs:
-      Number(
-        HELIUS_RPC_MIN_START_INTERVAL_MS
-          .toFixed(2)
-      ),
+    heliusRpcBurstCapacity:
+      HELIUS_RPC_BURST_CAPACITY,
+
+    // ------------------------------------------
+    // SIGNATURE QUEUE
+    // ------------------------------------------
 
     maxQueueSize:
-      MAX_QUEUE_SIZE,
+      effectiveMaxQueueSize(),
 
     resumeQueueSize:
       RESUME_QUEUE_SIZE,
+
+    // ------------------------------------------
+    // DATABASE WRITE PIPELINE
+    // ------------------------------------------
 
     dbWriteConcurrency:
       DB_WRITE_CONCURRENCY,
@@ -14803,6 +14857,10 @@ logInfo(
 
     tokenDbSerializationEnabled:
       TOKEN_DB_SERIALIZATION_ENABLED,
+
+    // ------------------------------------------
+    // OPTIONAL PIPELINES
+    // ------------------------------------------
 
     rawEventStorage:
       STORE_RAW_EVENTS,

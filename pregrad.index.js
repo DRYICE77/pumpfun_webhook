@@ -2900,6 +2900,33 @@ function effectiveMinSolAmount() {
 
 let intakePausedAt = null;
 
+// ==================================================
+// 8A-1. EXACT OLDEST SIGNATURE AGE
+//
+// Returns the age of the oldest signature currently
+// waiting in the signature queue.
+//
+// Diagnostic only.
+// No queue behavior is changed.
+// ==================================================
+
+function getOldestSignatureAgeMs() {
+  const oldestSignature =
+    signatureQueue[0];
+
+  if (
+    !oldestSignature ||
+    !Number.isFinite(oldestSignature.enqueuedAt)
+  ) {
+    return 0;
+  }
+
+  return Math.max(
+    Date.now() - oldestSignature.enqueuedAt,
+    0
+  );
+}
+
 
 // ==================================================
 // 8B. PAUSE INTAKE
@@ -2913,16 +2940,53 @@ function maybePauseIntake() {
     !intakePaused &&
     signatureQueue.length >= maxQueueSize
   ) {
+    const transitionAt = new Date().toISOString();
+    const transitionPerformanceAt = performanceNow();
+
+    // Capture exact state at the instant the pause fires.
+    const transitionQueueSize = signatureQueue.length;
+    const transitionOldestSignatureAgeMs =
+      getOldestSignatureAgeMs();
+
     intakePaused = true;
 
     // Begin measuring this pause.
-    intakePausedAt = performanceNow();
+    intakePausedAt = transitionPerformanceAt;
 
     stats.intakePausedCount += 1;
 
     logInfo("Intake paused", {
-      queueSize: signatureQueue.length,
+      transitionType: "PAUSE",
+      transitionAt,
+
+      queueSizeExact: transitionQueueSize,
       maxQueueSize,
+
+      oldestSignatureAgeMs:
+        transitionOldestSignatureAgeMs === null
+          ? null
+          : Number(
+              transitionOldestSignatureAgeMs.toFixed(2)
+            ),
+
+      dbWriteQueueSize:
+        dbWriteQueue.length,
+
+      dbWritesInFlight,
+
+      inFlightSignatures:
+  inFlightSignatures.size,
+
+      heliusAvailableTokens:
+        Number.isFinite(heliusRpcTokens)
+          ? Number(heliusRpcTokens.toFixed(2))
+          : null,
+
+      queuedTotal:
+        stats.queued ?? null,
+
+      dequeuedTotal:
+        stats.dequeued ?? null,
     });
   }
 }
@@ -2938,11 +3002,19 @@ function maybeResumeIntake() {
     signatureQueue.length <= RESUME_QUEUE_SIZE &&
     isPregradEnabled()
   ) {
+    const transitionAt = new Date().toISOString();
+    const transitionPerformanceAt = performanceNow();
+
+    // Capture exact state BEFORE changing pause state.
+    const transitionQueueSize = signatureQueue.length;
+    const transitionOldestSignatureAgeMs =
+      getOldestSignatureAgeMs();
+
     // Capture duration before clearing pause state.
     const pauseDurationMs =
       intakePausedAt === null
         ? null
-        : performanceNow() - intakePausedAt;
+        : transitionPerformanceAt - intakePausedAt;
 
     intakePaused = false;
 
@@ -2959,8 +3031,18 @@ function maybeResumeIntake() {
     stats.intakeResumedCount += 1;
 
     logInfo("Intake resumed", {
-      queueSize: signatureQueue.length,
+      transitionType: "RESUME",
+      transitionAt,
+
+      queueSizeExact: transitionQueueSize,
       resumeQueueSize: RESUME_QUEUE_SIZE,
+
+      oldestSignatureAgeMs:
+        transitionOldestSignatureAgeMs === null
+          ? null
+          : Number(
+              transitionOldestSignatureAgeMs.toFixed(2)
+            ),
 
       pauseDurationMs:
         pauseDurationMs === null
@@ -2968,6 +3050,25 @@ function maybeResumeIntake() {
           : Number(
               pauseDurationMs.toFixed(2)
             ),
+
+      dbWriteQueueSize:
+        dbWriteQueue.length,
+
+      dbWritesInFlight,
+
+      inFlightSignatures:
+  inFlightSignatures.size,
+
+      heliusAvailableTokens:
+        Number.isFinite(heliusRpcTokens)
+          ? Number(heliusRpcTokens.toFixed(2))
+          : null,
+
+      queuedTotal:
+        stats.queued ?? null,
+
+      dequeuedTotal:
+        stats.dequeued ?? null,
     });
   }
 }

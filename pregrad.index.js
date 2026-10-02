@@ -13693,39 +13693,41 @@ function startQueueLogger() {
           configuredMaxConnections:
             pool.options.max,
         };
+// ==========================================
+// EFFECTIVE RUNTIME CONFIGURATION
+//
+// Queue limit and minimum SOL threshold may
+// be overridden by pregrad_system_control.
+// ==========================================
 
-        // ==========================================
-        // EFFECTIVE RUNTIME CONFIGURATION
-        //
-        // Queue limit and minimum SOL threshold may
-        // be overridden by pregrad_system_control.
-        // ==========================================
+const effectiveConfiguration = {
+  maxQueueSize:
+    effectiveMaxQueueSize(),
 
-        const effectiveConfiguration = {
-          maxQueueSize:
-            effectiveMaxQueueSize(),
+  resumeQueueSize:
+    RESUME_QUEUE_SIZE,
 
-          resumeQueueSize:
-            RESUME_QUEUE_SIZE,
+  signatureMaxAgeMs:
+    SIGNATURE_MAX_AGE_MS,
 
-          signatureMaxAgeMs:
-            SIGNATURE_MAX_AGE_MS,
+  workerConcurrency:
+    WORKER_CONCURRENCY,
 
-          workerConcurrency:
-            WORKER_CONCURRENCY,
+  heliusRpcMode:
+    "token_bucket",
 
-          heliusRpcMaxStartsPerSecond:
-            HELIUS_RPC_MAX_STARTS_PER_SECOND,
+  heliusRpcMaxStartsPerSecond:
+    HELIUS_RPC_MAX_STARTS_PER_SECOND,
 
-          heliusRpcMinStartIntervalMs:
-            Number.isFinite(
-              HELIUS_RPC_MIN_START_INTERVAL_MS
-            )
-              ? Number(
-                  HELIUS_RPC_MIN_START_INTERVAL_MS
-                    .toFixed(2)
-                )
-              : null,
+  heliusRpcBurstCapacity:
+    HELIUS_RPC_BURST_CAPACITY,
+
+  heliusRpcAvailableTokens:
+    Number.isFinite(heliusRpcTokens)
+      ? Number(
+          heliusRpcTokens.toFixed(2)
+        )
+      : null,
 
           dbWriteConcurrency:
             DB_WRITE_CONCURRENCY,

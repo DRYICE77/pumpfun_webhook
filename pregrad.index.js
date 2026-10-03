@@ -547,6 +547,32 @@ const dbRttRecentProbes = [];
 const dbRttBackendDiagnostics =
   new Map();
 
+// ==================================================
+// POSTGRES SERVER-SIDE BACKEND METADATA
+//
+// Captured once per observed PostgreSQL backend PID.
+//
+// Purpose:
+//
+// Compare FAST_ONLY and SLOW_ONLY connections using
+// PostgreSQL's own view of the session/backend.
+//
+// IMPORTANT:
+//
+// • Metadata query is NOT included in RTT timing.
+// • Runs only once per newly observed backend PID.
+// • No writes.
+// • No locks.
+// • No pool configuration changes.
+// • No ingestion behavior changes.
+// ==================================================
+
+const dbRttBackendServerMetadata =
+  new Map();
+
+const dbRttBackendMetadataInFlight =
+  new Set();
+
 
 const stats = {
   // ==========================================
@@ -14727,7 +14753,182 @@ function recordDbRttBackendProbe(
   }
 }
 
+async function capturePostgresBackendServerMetadata(
+  client,
+  backendPid
+) {
+  if (
+    !client ||
+    !Number.isFinite(backendPid) ||
+    dbRttBackendServerMetadata.has(
+      backendPid
+    ) ||
+    dbRttBackendMetadataInFlight.has(
+      backendPid
+    )
+  ) {
+    return;
+  }
 
+  dbRttBackendMetadataInFlight.add(
+    backendPid
+  );
+
+  try {
+    const result =
+      await client.query(`
+        SELECT
+          pg_backend_pid() AS backend_pid,
+
+          inet_server_addr()::text
+            AS server_addr,
+
+          inet_server_port()
+            AS server_port,
+
+          inet_client_addr()::text
+            AS client_addr,
+
+          inet_client_port()
+            AS client_port,
+
+          current_database()
+            AS database_name,
+
+          current_user
+            AS user_name,
+
+          current_setting(
+            'server_version'
+          ) AS server_version,
+
+          current_setting(
+            'TimeZone'
+          ) AS timezone,
+
+          pg_is_in_recovery()
+            AS in_recovery,
+
+          backend_start,
+          backend_type,
+          application_name
+
+        FROM pg_stat_activity
+
+        WHERE pid = pg_backend_pid()
+      `);
+
+    const row =
+      result.rows?.[0];
+
+    if (!row) {
+      return;
+    }
+
+    const metadata = {
+      backendPid:
+        Number(row.backend_pid),
+
+      serverAddress:
+        row.server_addr || null,
+
+      serverPort:
+        row.server_port !== null
+          ? Number(row.server_port)
+          : null,
+
+      clientAddress:
+        row.client_addr || null,
+
+      clientPort:
+        row.client_port !== null
+          ? Number(row.client_port)
+          : null,
+
+      databaseName:
+        row.database_name || null,
+
+      userName:
+        row.user_name || null,
+
+      serverVersion:
+        row.server_version || null,
+
+      timezone:
+        row.timezone || null,
+
+      inRecovery:
+        typeof row.in_recovery ===
+          "boolean"
+          ? row.in_recovery
+          : null,
+
+      backendStart:
+        row.backend_start || null,
+
+      backendType:
+        row.backend_type || null,
+
+      applicationName:
+        row.application_name || null,
+
+      capturedAt:
+        nowIso(),
+    };
+
+    dbRttBackendServerMetadata.set(
+      backendPid,
+      metadata
+    );
+
+    const backend =
+      dbRttBackendDiagnostics.get(
+        backendPid
+      );
+
+    logInfo(
+      "Postgres backend server metadata captured",
+      {
+        backendPid,
+
+        latencyClassification:
+          backend?.latestClassification ||
+          null,
+
+        latestQueryMs:
+          Number.isFinite(
+            backend?.latestQueryMs
+          )
+            ? Number(
+                backend.latestQueryMs
+                  .toFixed(2)
+              )
+            : null,
+
+        ...metadata,
+      }
+    );
+
+  } catch (error) {
+    logError(
+      "Postgres backend server metadata capture failed",
+      {
+        backendPid,
+
+        error:
+          String(
+            error?.message ||
+            error
+          ),
+      }
+    );
+
+  } finally {
+    dbRttBackendMetadataInFlight.delete(
+      backendPid
+    );
+  }
+}
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC
 //
@@ -14766,6 +14967,10 @@ async function runDbRttProbe() {
     client =
       await pool.connect();
 
+    const acquireMs =
+      performanceNow() -
+      acquireStartedAt;
+
     const backendPid =
       Number.isFinite(client.processID)
         ? client.processID
@@ -14779,10 +14984,6 @@ async function runDbRttProbe() {
       getPostgresConnectionFingerprint(
         client
       );
-
-    const acquireMs =
-      performanceNow() -
-      acquireStartedAt;
 
     stats.dbRttAcquireSamples += 1;
 
@@ -14810,11 +15011,44 @@ async function runDbRttProbe() {
       performanceNow() -
       queryStartedAt;
 
+    // ==============================================
+    // FREEZE ORIGINAL RTT MEASUREMENT
+    //
+    // IMPORTANT:
+    //
+    // Everything included in durationMs happened
+    // BEFORE the server-side metadata diagnostic.
+    //
+    // Therefore:
+    //
+    // queryMs =
+    //   SELECT 1 execution only
+    //
+    // durationMs =
+    //   pool acquisition + SELECT 1 + negligible
+    //   local diagnostic bookkeeping
+    //
+    // The metadata query below cannot contaminate
+    // either measurement.
+    // ==============================================
+
+    const durationMs =
+      performanceNow() -
+      totalStartedAt;
+
+    // ==============================================
+    // RECORD BACKEND LATENCY / CLIENT FINGERPRINT
+    // ==============================================
+
     recordDbRttBackendProbe(
       backendPid,
       queryMs,
       connectionFingerprint
     );
+
+    // ==============================================
+    // RECORD EXISTING RTT STATISTICS
+    // ==============================================
 
     stats.dbRttQuerySamples += 1;
 
@@ -14826,14 +15060,6 @@ async function runDbRttProbe() {
         stats.dbRttQueryMaxMs,
         queryMs
       );
-
-    // ==============================================
-    // TOTAL PROBE
-    // ==============================================
-
-    const durationMs =
-      performanceNow() -
-      totalStartedAt;
 
     stats.dbRttProbeSamples += 1;
 
@@ -14859,6 +15085,36 @@ async function runDbRttProbe() {
       queryMs,
       backendPid
     );
+
+    // ==============================================
+    // PHASE 3 — ONE-TIME SERVER-SIDE IDENTITY
+    //
+    // IMPORTANT:
+    //
+    // This runs AFTER all RTT measurements have
+    // already been captured.
+    //
+    // Only unseen backend PIDs perform this query.
+    //
+    // It therefore does NOT affect:
+    //
+    // • queryMs
+    // • durationMs
+    // • RTT buckets
+    // • recent RTT history
+    // ==============================================
+
+    if (
+      Number.isFinite(backendPid) &&
+      !dbRttBackendServerMetadata.has(
+        backendPid
+      )
+    ) {
+      await capturePostgresBackendServerMetadata(
+        client,
+        backendPid
+      );
+    }
 
   } catch (error) {
     stats.dbRttProbeErrors += 1;

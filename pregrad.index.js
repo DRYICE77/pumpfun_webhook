@@ -13745,62 +13745,199 @@ const effectiveConfiguration = {
             TOKEN_DB_SERIALIZATION_ENABLED,
         };
 
-        const dbRttBackendHealth =
+const dbRttBackendRows =
   Array.from(
     dbRttBackendDiagnostics.values()
-  )
-    .map((backend) => ({
-      backendPid:
-        backend.backendPid,
+  );
 
-      samples:
-        backend.samples,
+let dbRttFastOnlyBackends = 0;
+let dbRttSlowOnlyBackends = 0;
+let dbRttMixedBackends = 0;
+let dbRttMiddleOnlyBackends = 0;
 
-      avgQueryMs:
-        backend.samples > 0
-          ? Number(
-              (
-                backend.totalQueryMs /
-                backend.samples
-              ).toFixed(2)
-            )
-          : null,
+let dbRttClassificationChanges = 0;
 
-      minQueryMs:
-        backend.minQueryMs !== null
-          ? Number(
-              backend.minQueryMs
-                .toFixed(2)
-            )
-          : null,
+for (
+  const backend of dbRttBackendRows
+) {
+  const hasFast =
+    backend.fastUnder10ms > 0;
 
-      maxQueryMs:
-        backend.samples > 0
-          ? Number(
-              backend.maxQueryMs
-                .toFixed(2)
-            )
-          : null,
+  const hasMiddle =
+    backend.middle10To100ms > 0;
 
-      fastUnder10ms:
-        backend.fastUnder10ms,
+  const hasSlow =
+    backend.slow100msPlus > 0;
 
-      middle10To100ms:
-        backend.middle10To100ms,
+  if (
+    hasFast &&
+    hasSlow
+  ) {
+    dbRttMixedBackends += 1;
 
-      slow100msPlus:
-        backend.slow100msPlus,
+  } else if (
+    hasFast &&
+    !hasSlow
+  ) {
+    dbRttFastOnlyBackends += 1;
 
-      firstSeenAt:
-        backend.firstSeenAt,
+  } else if (
+    hasSlow &&
+    !hasFast
+  ) {
+    dbRttSlowOnlyBackends += 1;
 
-      lastSeenAt:
-        backend.lastSeenAt,
-    }))
-    .sort(
-      (a, b) =>
-        b.samples - a.samples
-    );
+  } else if (hasMiddle) {
+    dbRttMiddleOnlyBackends += 1;
+  }
+
+  dbRttClassificationChanges +=
+    backend.classificationChanges || 0;
+}
+
+
+const dbRttBackendHealth = {
+  connectionsObserved:
+    dbRttBackendRows.length,
+
+  fastOnly:
+    dbRttFastOnlyBackends,
+
+  slowOnly:
+    dbRttSlowOnlyBackends,
+
+  mixed:
+    dbRttMixedBackends,
+
+  middleOnly:
+    dbRttMiddleOnlyBackends,
+
+  totalClassificationChanges:
+    dbRttClassificationChanges,
+
+  mostSampledConnections:
+    dbRttBackendRows
+      .slice()
+      .sort(
+        (a, b) =>
+          b.samples - a.samples
+      )
+      .slice(0, 20)
+      .map((backend) => {
+        const hasFast =
+          backend.fastUnder10ms > 0;
+
+        const hasMiddle =
+          backend.middle10To100ms > 0;
+
+        const hasSlow =
+          backend.slow100msPlus > 0;
+
+        let cohort = "UNKNOWN";
+
+        if (
+          hasFast &&
+          hasSlow
+        ) {
+          cohort = "MIXED";
+
+        } else if (
+          hasFast &&
+          !hasSlow
+        ) {
+          cohort = "FAST_ONLY";
+
+        } else if (
+          hasSlow &&
+          !hasFast
+        ) {
+          cohort = "SLOW_ONLY";
+
+        } else if (hasMiddle) {
+          cohort = "MIDDLE_ONLY";
+        }
+
+        return {
+          backendPid:
+            backend.backendPid,
+
+          cohort,
+
+          samples:
+            backend.samples,
+
+          avgQueryMs:
+            backend.samples > 0
+              ? Number(
+                  (
+                    backend.totalQueryMs /
+                    backend.samples
+                  ).toFixed(2)
+                )
+              : null,
+
+          minQueryMs:
+            backend.minQueryMs !== null
+              ? Number(
+                  backend.minQueryMs
+                    .toFixed(2)
+                )
+              : null,
+
+          maxQueryMs:
+            backend.samples > 0
+              ? Number(
+                  backend.maxQueryMs
+                    .toFixed(2)
+                )
+              : null,
+
+          firstQueryMs:
+            backend.firstQueryMs !== null
+              ? Number(
+                  backend.firstQueryMs
+                    .toFixed(2)
+                )
+              : null,
+
+          latestQueryMs:
+            backend.latestQueryMs !== null
+              ? Number(
+                  backend.latestQueryMs
+                    .toFixed(2)
+                )
+              : null,
+
+          fastUnder10ms:
+            backend.fastUnder10ms,
+
+          middle10To100ms:
+            backend.middle10To100ms,
+
+          slow100msPlus:
+            backend.slow100msPlus,
+
+          firstClassification:
+            backend.firstClassification,
+
+          latestClassification:
+            backend.latestClassification,
+
+          classificationChanges:
+            backend.classificationChanges,
+
+          firstSeenAt:
+            backend.firstSeenAt,
+
+          lastSeenAt:
+            backend.lastSeenAt,
+        };
+      }),
+};
+
+        // ==========================================
+// POSTGRES BASELINE RTT HEALTH
+// ==========================================
 
 const dbRttProbeHealth = {
   samples:
@@ -13809,14 +13946,6 @@ const dbRttProbeHealth = {
   errors:
     stats.dbRttProbeErrors,
 
-  latestMs:
-    stats.dbRttProbeSamples > 0
-      ? Number(
-          stats.dbRttProbeLatestMs
-            .toFixed(2)
-        )
-      : null,
-
   avgMs:
     stats.dbRttProbeSamples > 0
       ? Number(
@@ -13824,6 +13953,14 @@ const dbRttProbeHealth = {
             stats.dbRttProbeTotalMs /
             stats.dbRttProbeSamples
           ).toFixed(2)
+        )
+      : null,
+
+  latestMs:
+    stats.dbRttProbeSamples > 0
+      ? Number(
+          stats.dbRttProbeLatestMs
+            .toFixed(2)
         )
       : null,
 
@@ -13920,65 +14057,11 @@ const dbRttProbeHealth = {
   },
 
   // ==========================================
-  // POSTGRES BACKEND IDENTITY
+  // POSTGRES CONNECTION COHORT
   // ==========================================
 
-  backends:
-    Array.from(
-      dbRttBackendDiagnostics.values()
-    )
-      .map((backend) => ({
-        backendPid:
-          backend.backendPid,
-
-        samples:
-          backend.samples,
-
-        avgQueryMs:
-          backend.samples > 0
-            ? Number(
-                (
-                  backend.totalQueryMs /
-                  backend.samples
-                ).toFixed(2)
-              )
-            : null,
-
-        minQueryMs:
-          backend.minQueryMs !== null
-            ? Number(
-                backend.minQueryMs
-                  .toFixed(2)
-              )
-            : null,
-
-        maxQueryMs:
-          backend.samples > 0
-            ? Number(
-                backend.maxQueryMs
-                  .toFixed(2)
-              )
-            : null,
-
-        fastUnder10ms:
-          backend.fastUnder10ms,
-
-        middle10To100ms:
-          backend.middle10To100ms,
-
-        slow100msPlus:
-          backend.slow100msPlus,
-
-        firstSeenAt:
-          backend.firstSeenAt,
-
-        lastSeenAt:
-          backend.lastSeenAt,
-      }))
-      .sort(
-        (a, b) =>
-          b.samples - a.samples
-      ),
+  connectionCohort:
+    dbRttBackendHealth,
 
   // ==========================================
   // RECENT PROBE HISTORY
@@ -13991,7 +14074,7 @@ const dbRttProbeHealth = {
       })
     ),
 };
-
+ 
         // ==========================================
         // EMIT SCANNER HEALTH RECORD
         // ==========================================
@@ -14275,6 +14358,28 @@ function recordRecentDbRttProbe(
 }
 
 
+function classifyDbRttBackendLatency(
+  queryMs
+) {
+  if (
+    !Number.isFinite(queryMs) ||
+    queryMs < 0
+  ) {
+    return "unknown";
+  }
+
+  if (queryMs < 10) {
+    return "fast";
+  }
+
+  if (queryMs >= 100) {
+    return "slow";
+  }
+
+  return "middle";
+}
+
+
 function recordDbRttBackendProbe(
   backendPid,
   queryMs
@@ -14292,6 +14397,17 @@ function recordDbRttBackendProbe(
       backendPid
     );
 
+  const timestamp =
+    nowIso();
+
+  const classification =
+    classifyDbRttBackendLatency(
+      queryMs
+    );
+
+  const isNewBackend =
+    !backend;
+
   if (!backend) {
     backend = {
       backendPid,
@@ -14301,18 +14417,22 @@ function recordDbRttBackendProbe(
       totalQueryMs: 0,
 
       minQueryMs: null,
-
       maxQueryMs: 0,
 
       fastUnder10ms: 0,
-
       middle10To100ms: 0,
-
       slow100msPlus: 0,
 
-      firstSeenAt: null,
+      firstQueryMs: null,
+      latestQueryMs: null,
 
-      lastSeenAt: null,
+      firstClassification: null,
+      latestClassification: null,
+
+      classificationChanges: 0,
+
+      firstSeenAt: timestamp,
+      lastSeenAt: timestamp,
     };
 
     dbRttBackendDiagnostics.set(
@@ -14321,8 +14441,42 @@ function recordDbRttBackendProbe(
     );
   }
 
-  const timestamp =
-    nowIso();
+  // ================================================
+  // DETECT LATENCY-REGIME CHANGE
+  // ================================================
+
+  if (
+    backend.latestClassification !== null &&
+    backend.latestClassification !==
+      classification
+  ) {
+    backend.classificationChanges += 1;
+
+    logInfo(
+      "Postgres backend latency classification changed",
+      {
+        backendPid,
+
+        previousClassification:
+          backend.latestClassification,
+
+        newClassification:
+          classification,
+
+        queryMs:
+          Number(
+            queryMs.toFixed(2)
+          ),
+
+        samplesBeforeChange:
+          backend.samples,
+      }
+    );
+  }
+
+  // ================================================
+  // RECORD SAMPLE
+  // ================================================
 
   backend.samples += 1;
 
@@ -14343,23 +14497,65 @@ function recordDbRttBackendProbe(
       queryMs
     );
 
-  if (queryMs < 10) {
+  if (classification === "fast") {
     backend.fastUnder10ms += 1;
 
-  } else if (queryMs < 100) {
+  } else if (
+    classification === "middle"
+  ) {
     backend.middle10To100ms += 1;
 
-  } else {
+  } else if (
+    classification === "slow"
+  ) {
     backend.slow100msPlus += 1;
   }
 
-  if (!backend.firstSeenAt) {
-    backend.firstSeenAt =
-      timestamp;
+  if (backend.firstQueryMs === null) {
+    backend.firstQueryMs =
+      queryMs;
+
+    backend.firstClassification =
+      classification;
   }
+
+  backend.latestQueryMs =
+    queryMs;
+
+  backend.latestClassification =
+    classification;
 
   backend.lastSeenAt =
     timestamp;
+
+  // ================================================
+  // LOG FIRST OBSERVATION OF EACH BACKEND
+  // ================================================
+
+  if (isNewBackend) {
+    logInfo(
+      "Postgres backend initial latency classified",
+      {
+        backendPid,
+
+        queryMs:
+          Number(
+            queryMs.toFixed(2)
+          ),
+
+        classification,
+
+        poolTotal:
+          pool.totalCount,
+
+        poolIdle:
+          pool.idleCount,
+
+        poolWaiting:
+          pool.waitingCount,
+      }
+    );
+  }
 }
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC

@@ -13862,6 +13862,15 @@ const dbRttBackendHealth = {
             backend.backendPid,
 
           cohort,
+                    connectionFingerprint:
+            backend.connectionFingerprint
+              ? {
+                  ...backend.connectionFingerprint,
+                }
+              : null,
+
+          connectionFingerprintChanges:
+            backend.connectionFingerprintChanges || 0,
 
           samples:
             backend.samples,
@@ -14357,6 +14366,86 @@ function recordRecentDbRttProbe(
   }
 }
 
+// ==================================================
+// POSTGRES CONNECTION ENDPOINT FINGERPRINT
+//
+// Diagnostic only.
+//
+// Reads connection/socket metadata already available
+// on the acquired node-postgres client.
+//
+// IMPORTANT:
+//
+// • No PostgreSQL queries are added.
+// • No pool behavior changes.
+// • No connection behavior changes.
+// • No ingestion behavior changes.
+// ==================================================
+
+function getPostgresConnectionFingerprint(
+  client
+) {
+  if (!client) {
+    return null;
+  }
+
+  const connectionParameters =
+    client.connectionParameters || {};
+
+  const stream =
+    client.connection?.stream ||
+    client.stream ||
+    null;
+
+  return {
+    configuredHost:
+      connectionParameters.host || null,
+
+    configuredPort:
+      Number.isFinite(
+        Number(connectionParameters.port)
+      )
+        ? Number(connectionParameters.port)
+        : null,
+
+    remoteAddress:
+      stream?.remoteAddress || null,
+
+    remotePort:
+      Number.isFinite(
+        Number(stream?.remotePort)
+      )
+        ? Number(stream.remotePort)
+        : null,
+
+    remoteFamily:
+      stream?.remoteFamily || null,
+
+    localAddress:
+      stream?.localAddress || null,
+
+    localPort:
+      Number.isFinite(
+        Number(stream?.localPort)
+      )
+        ? Number(stream.localPort)
+        : null,
+
+    encrypted:
+      typeof stream?.encrypted === "boolean"
+        ? stream.encrypted
+        : null,
+
+    tlsAuthorized:
+      typeof stream?.authorized === "boolean"
+        ? stream.authorized
+        : null,
+
+    tlsServername:
+      stream?.servername || null,
+  };
+}
+
 
 function classifyDbRttBackendLatency(
   queryMs
@@ -14382,7 +14471,8 @@ function classifyDbRttBackendLatency(
 
 function recordDbRttBackendProbe(
   backendPid,
-  queryMs
+  queryMs,
+  connectionFingerprint = null
 ) {
   if (
     !Number.isFinite(backendPid) ||
@@ -14408,6 +14498,10 @@ function recordDbRttBackendProbe(
   const isNewBackend =
     !backend;
 
+  // ================================================
+  // CREATE BACKEND RECORD
+  // ================================================
+
   if (!backend) {
     backend = {
       backendPid,
@@ -14431,6 +14525,15 @@ function recordDbRttBackendProbe(
 
       classificationChanges: 0,
 
+      connectionFingerprint:
+        connectionFingerprint
+          ? {
+              ...connectionFingerprint,
+            }
+          : null,
+
+      connectionFingerprintChanges: 0,
+
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
     };
@@ -14439,6 +14542,69 @@ function recordDbRttBackendProbe(
       backendPid,
       backend
     );
+  }
+
+  // ================================================
+  // DETECT CONNECTION-FINGERPRINT CHANGE
+  //
+  // The same PostgreSQL backend PID should normally
+  // remain associated with the same underlying
+  // network endpoint.
+  // ================================================
+
+  if (
+    backend.connectionFingerprint &&
+    connectionFingerprint
+  ) {
+    const previousRemoteAddress =
+      backend.connectionFingerprint
+        .remoteAddress;
+
+    const currentRemoteAddress =
+      connectionFingerprint
+        .remoteAddress;
+
+    const previousRemotePort =
+      backend.connectionFingerprint
+        .remotePort;
+
+    const currentRemotePort =
+      connectionFingerprint
+        .remotePort;
+
+    if (
+      previousRemoteAddress !==
+        currentRemoteAddress ||
+      previousRemotePort !==
+        currentRemotePort
+    ) {
+      backend.connectionFingerprintChanges +=
+        1;
+
+      logInfo(
+        "Postgres backend connection fingerprint changed",
+        {
+          backendPid,
+
+          previousRemoteAddress,
+          currentRemoteAddress,
+
+          previousRemotePort,
+          currentRemotePort,
+
+          samplesBeforeChange:
+            backend.samples,
+        }
+      );
+    }
+  }
+
+  // Keep the most recently observed fingerprint.
+
+  if (connectionFingerprint) {
+    backend.connectionFingerprint = {
+      ...connectionFingerprint,
+    };
   }
 
   // ================================================
@@ -14545,6 +14711,9 @@ function recordDbRttBackendProbe(
 
         classification,
 
+        connectionFingerprint:
+          backend.connectionFingerprint,
+
         poolTotal:
           pool.totalCount,
 
@@ -14557,6 +14726,8 @@ function recordDbRttBackendProbe(
     );
   }
 }
+
+
 // ==================================================
 // 16C. POSTGRES BASELINE RTT DIAGNOSTIC
 //
@@ -14572,7 +14743,6 @@ function recordDbRttBackendProbe(
 //
 // Observation only.
 // ==================================================
-
 async function runDbRttProbe() {
   if (dbRttProbeRunning) {
     return;
@@ -14595,10 +14765,20 @@ async function runDbRttProbe() {
 
     client =
       await pool.connect();
+
     const backendPid =
-  Number.isFinite(client.processID)
-    ? client.processID
-    : null;
+      Number.isFinite(client.processID)
+        ? client.processID
+        : null;
+
+    // ==============================================
+    // CONNECTION ENDPOINT FINGERPRINT
+    // ==============================================
+
+    const connectionFingerprint =
+      getPostgresConnectionFingerprint(
+        client
+      );
 
     const acquireMs =
       performanceNow() -
@@ -14629,10 +14809,12 @@ async function runDbRttProbe() {
     const queryMs =
       performanceNow() -
       queryStartedAt;
+
     recordDbRttBackendProbe(
-  backendPid,
-  queryMs
-);
+      backendPid,
+      queryMs,
+      connectionFingerprint
+    );
 
     stats.dbRttQuerySamples += 1;
 
@@ -14672,11 +14854,11 @@ async function runDbRttProbe() {
     );
 
     recordRecentDbRttProbe(
-  durationMs,
-  acquireMs,
-  queryMs,
-  backendPid
-);
+      durationMs,
+      acquireMs,
+      queryMs,
+      backendPid
+    );
 
   } catch (error) {
     stats.dbRttProbeErrors += 1;
@@ -14700,7 +14882,7 @@ async function runDbRttProbe() {
     dbRttProbeRunning = false;
   }
 }
-   
+
 
 function startDbRttProbe() {
   if (dbRttProbeTimer) {

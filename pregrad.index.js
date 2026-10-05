@@ -3654,19 +3654,33 @@ async function heliusRpc(method, params) {
   const json =
     await response.json();
 
-  // ----------------------------------------------
-  // JSON-RPC ERROR
-  // ----------------------------------------------
+if (json.error) {
+  diagnostic.jsonRpcErrors += 1;
 
-  if (json.error) {
-    diagnostic.jsonRpcErrors += 1;
-
-    throw new Error(
+  // Preserve the structured JSON-RPC error so
+  // downstream callers can classify failures
+  // without parsing the formatted message.
+  const error =
+    new Error(
       `RPC error: ${JSON.stringify(
         json.error
       )}`
     );
-  }
+
+  error.rpcMethod =
+    method;
+
+  error.rpcCode =
+    json.error?.code ?? null;
+
+  error.rpcMessage =
+    json.error?.message ?? null;
+
+  error.rpcData =
+    json.error?.data ?? null;
+
+  throw error;
+}
 
   // ----------------------------------------------
   // SUCCESS
@@ -10831,13 +10845,23 @@ async function upsertTokenSafetyEnrichment({
 
 
 // ==================================================
-// 12E. RPC ERROR CLASSIFICATION
+// 12E. HOLDER RPC ERROR CLASSIFICATION
 //
-// Some very new token mints may not yet be available
-// through getTokenSupply or getTokenLargestAccounts.
+// Very new Pump.fun token mints may temporarily be
+// unavailable through:
 //
-// These should be treated as temporary unavailable
-// accounts rather than fatal scanner errors.
+// • getTokenSupply
+// • getTokenLargestAccounts
+//
+// Preserve structured Helius JSON-RPC diagnostics
+// so expected account-availability failures can be
+// distinguished from real RPC / request problems.
+//
+// IMPORTANT:
+//
+// Do not broadly classify "invalid param" as an
+// unavailable account. That could hide an actual
+// request-construction bug.
 // ==================================================
 
 function isHolderAccountUnavailableError(
@@ -10845,7 +10869,9 @@ function isHolderAccountUnavailableError(
 ) {
   const message =
     String(
-      error?.message || ""
+      error?.rpcMessage ||
+      error?.message ||
+      ""
     ).toLowerCase();
 
   return (
@@ -10854,180 +10880,282 @@ function isHolderAccountUnavailableError(
     ) ||
     message.includes(
       "account not found"
-    ) ||
-    message.includes(
-      "invalid param"
     )
   );
 }
 
 
 // ==================================================
+// 12E-1. HOLDER RPC ERROR DETAILS
+//
+// Produces a compact diagnostic object for holder
+// enrichment failures.
+//
+// Observation only.
+// ==================================================
+
+function getHolderRpcErrorDetails(
+  error
+) {
+  return {
+    rpcMethod:
+      error?.rpcMethod ?? null,
+
+    rpcCode:
+      error?.rpcCode ?? null,
+
+    rpcMessage:
+      error?.rpcMessage ?? null,
+
+    rpcData:
+      error?.rpcData ?? null,
+
+    error:
+      String(
+        error?.message ||
+        error
+      ),
+  };
+}
+
+
+
+// ==================================================
 // 12F. HOLDER ENRICHMENT RUN
+//
+// Runs holder concentration enrichment asynchronously.
+//
+// Safety:
+// • Never blocks the live ingestion path.
+// • Prevents duplicate concurrent enrichment.
+// • Respects the holder refresh cooldown.
+// • Preserves prior successful enrichment data.
+// • Treats temporarily unavailable mint accounts as
+//   recoverable.
+// • Logs structured Helius JSON-RPC error details.
 // ==================================================
 
 async function enrichTokenHolderConcentration(
   tokenAddress
 ) {
   if (
+    !tokenAddress ||
     !TOKEN_SAFETY_ENRICHMENT_ENABLED ||
-    !HOLDER_ENRICHMENT_ENABLED ||
-    !tokenAddress
+    !HOLDER_ENRICHMENT_ENABLED
   ) {
     return;
   }
 
-  const now = Date.now();
+  // ----------------------------------------------
+  // REFRESH COOLDOWN
+  // ----------------------------------------------
 
-  const lastRun =
+  const now =
+    Date.now();
+
+  const lastEnrichedAt =
     tokenLastHolderEnrichedAt.get(
       tokenAddress
-    ) || 0;
+    );
 
   if (
-    now - lastRun <
-    HOLDER_REFRESH_COOLDOWN_MS
+    Number.isFinite(lastEnrichedAt) &&
+    now - lastEnrichedAt <
+      HOLDER_REFRESH_COOLDOWN_MS
   ) {
-    stats.safetyEnrichmentSkippedCooldown += 1;
+    stats.safetyEnrichmentSkippedCooldown +=
+      1;
+
     return;
   }
 
-  if (
-    tokenSafetyEnrichmentInFlight.has(
-      tokenAddress
-    )
-  ) {
-    return tokenSafetyEnrichmentInFlight.get(
+  // ----------------------------------------------
+  // PREVENT DUPLICATE CONCURRENT ENRICHMENT
+  // ----------------------------------------------
+
+  const existingPromise =
+    tokenSafetyEnrichmentInFlight.get(
       tokenAddress
     );
+
+  if (existingPromise) {
+    return existingPromise;
   }
 
-  const runPromise = (async () => {
-    try {
-      const [
-        supplyResult,
-        largestResult,
-      ] = await Promise.all([
-        fetchTokenSupply(
-          tokenAddress
-        ),
+  // ----------------------------------------------
+  // CREATE ENRICHMENT RUN
+  // ----------------------------------------------
 
-        fetchLargestTokenAccounts(
-          tokenAddress
-        ),
-      ]);
-
-      const supplyValue =
-        supplyResult?.value;
-
-      const totalSupplyUi =
-        supplyValue?.uiAmount != null
-          ? Number(
-              supplyValue.uiAmount
-            )
-          : (
-              supplyValue?.amount != null &&
-              supplyValue?.decimals != null
-            )
-            ? (
-                Number(
-                  supplyValue.amount
-                ) /
-                10 **
-                Number(
-                  supplyValue.decimals
-                )
-              )
-            : 0;
-
-      if (
-        !Number.isFinite(
-          totalSupplyUi
-        ) ||
-        totalSupplyUi <= 0
-      ) {
-        throw new Error(
-          "Holder supply unavailable"
-        );
-      }
-
-      const concentration =
-        calculateHolderConcentration(
-          largestResult?.value || [],
-          totalSupplyUi
-        );
-
-      const concentrationRisk =
-        classifyConcentrationRisk(
-          concentration
-        );
-
-      await upsertTokenSafetyEnrichment({
-        tokenAddress,
-        concentration,
-        concentrationRisk,
-      });
-
-      tokenLastHolderEnrichedAt.set(
-        tokenAddress,
-        Date.now()
-      );
-
+  const runPromise =
+    (async () => {
       stats.safetyEnrichmentRuns += 1;
 
-      logInfo(
-        "Token holder enrichment updated",
-        {
-          tokenAddress,
-          totalSupplyUi,
-          ...concentration,
-          concentrationRisk,
-        }
-      );
-    } catch (error) {
-      stats.safetyEnrichmentErrors += 1;
+      try {
+        // ----------------------------------------
+        // TOKEN SUPPLY
+        // ----------------------------------------
 
-      if (
-        isHolderAccountUnavailableError(
-          error
-        )
-      ) {
-        // Apply the normal cooldown so the same
-        // unavailable account is not retried on
-        // every incoming transaction.
+        const supplyResult =
+          await heliusRpc(
+            "getTokenSupply",
+            [
+              tokenAddress,
+              {
+                commitment:
+                  "confirmed",
+              },
+            ]
+          );
+
+        const totalSupplyUi =
+          toNumber(
+            supplyResult?.value?.uiAmountString ??
+              supplyResult?.value?.uiAmount,
+            0
+          );
+
+        if (
+          !Number.isFinite(
+            totalSupplyUi
+          ) ||
+          totalSupplyUi <= 0
+        ) {
+          throw new Error(
+            "Holder enrichment token supply unavailable"
+          );
+        }
+
+        // ----------------------------------------
+        // LARGEST TOKEN ACCOUNTS
+        // ----------------------------------------
+
+        const largestAccountsResult =
+          await heliusRpc(
+            "getTokenLargestAccounts",
+            [
+              tokenAddress,
+              {
+                commitment:
+                  "confirmed",
+              },
+            ]
+          );
+
+        const largestAccounts =
+          Array.isArray(
+            largestAccountsResult?.value
+          )
+            ? largestAccountsResult.value
+            : [];
+
+        // ----------------------------------------
+        // CALCULATE HOLDER CONCENTRATION
+        // ----------------------------------------
+
+        const concentration =
+          calculateHolderConcentration(
+            largestAccounts,
+            totalSupplyUi
+          );
+
+        const concentrationRisk =
+          classifyConcentrationRisk(
+            concentration
+          );
+
+        // ----------------------------------------
+        // WRITE ENRICHMENT
+        // ----------------------------------------
+
+        await upsertTokenSafetyEnrichment({
+          tokenAddress,
+          concentration,
+          concentrationRisk,
+        });
+
+        // ----------------------------------------
+        // SUCCESSFUL REFRESH
+        //
+        // Start cooldown only after the enrichment
+        // has completed successfully.
+        // ----------------------------------------
+
         tokenLastHolderEnrichedAt.set(
           tokenAddress,
           Date.now()
         );
 
-        logInfo(
-          "Holder enrichment account unavailable",
+      } catch (error) {
+        stats.safetyEnrichmentErrors += 1;
+
+        const rpcError =
+          getHolderRpcErrorDetails(
+            error
+          );
+
+        // ----------------------------------------
+        // EXPECTED TEMPORARY ACCOUNT UNAVAILABILITY
+        //
+        // Very new Pump.fun mints may not yet be
+        // visible to the holder RPC methods.
+        //
+        // Apply the normal cooldown so the same
+        // mint is not hammered on every trade.
+        // ----------------------------------------
+
+        if (
+          isHolderAccountUnavailableError(
+            error
+          )
+        ) {
+          tokenLastHolderEnrichedAt.set(
+            tokenAddress,
+            Date.now()
+          );
+
+          logInfo(
+            "Holder enrichment account unavailable",
+            {
+              tokenAddress,
+              ...rpcError,
+            }
+          );
+
+          return;
+        }
+
+        // ----------------------------------------
+        // REAL / UNKNOWN HOLDER ENRICHMENT FAILURE
+        //
+        // Do NOT apply the cooldown here.
+        //
+        // This allows a later event to try again
+        // while exposing the structured Helius
+        // error for diagnosis.
+        // ----------------------------------------
+
+        logError(
+          "Failed token holder enrichment",
           {
             tokenAddress,
+            ...rpcError,
           }
         );
 
-        return;
+      } finally {
+        // ----------------------------------------
+        // RELEASE IN-FLIGHT RESERVATION
+        // ----------------------------------------
+
+        tokenSafetyEnrichmentInFlight.delete(
+          tokenAddress
+        );
       }
+    })();
 
-      logError(
-        "Failed token holder enrichment",
-        {
-          tokenAddress,
-
-          error:
-            String(
-              error?.message ||
-              error
-            ),
-        }
-      );
-    } finally {
-      tokenSafetyEnrichmentInFlight.delete(
-        tokenAddress
-      );
-    }
-  })();
+  // ----------------------------------------------
+  // REGISTER IN-FLIGHT RUN
+  // ----------------------------------------------
 
   tokenSafetyEnrichmentInFlight.set(
     tokenAddress,

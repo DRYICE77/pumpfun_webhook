@@ -338,6 +338,31 @@ const HOLDER_REFRESH_COOLDOWN_MS = Number(
   10 * 60 * 1000
 );
 
+// ==================================================
+// HOLDER ACCOUNT AVAILABILITY RETRIES
+//
+// Very new Pump.fun mints may briefly be unavailable
+// through Solana holder RPC methods.
+//
+// Retry ONLY the confirmed temporary condition:
+//
+//   -32602 / could not find account
+//
+// Retry schedule:
+//
+// • Initial request
+// • Retry 1 after 1 second
+// • Retry 2 after 2 seconds
+//
+// These retries run only inside asynchronous holder
+// enrichment and never block live ingestion.
+// ==================================================
+
+const HOLDER_ACCOUNT_RETRY_DELAYS_MS = [
+  1000,
+  2000,
+];
+
 const HOLDER_MIN_TOP1_RISK_PCT = Number(
   process.env.HOLDER_MIN_TOP1_RISK_PCT || 15
 );
@@ -10917,7 +10942,84 @@ function getHolderRpcErrorDetails(
       ),
   };
 }
+// ==================================================
+// 12E-2. HOLDER RPC WITH ACCOUNT-AVAILABILITY RETRY
+//
+// Retries only the known fresh-mint availability
+// race.
+//
+// All other RPC errors are thrown immediately.
+//
+// Returns the successful RPC result.
+// ==================================================
 
+async function holderRpcWithAvailabilityRetry(
+  method,
+  params,
+  tokenAddress
+) {
+  const maxAttempts =
+    HOLDER_ACCOUNT_RETRY_DELAYS_MS.length + 1;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt += 1
+  ) {
+    try {
+      return await heliusRpc(
+        method,
+        params
+      );
+
+    } catch (error) {
+      const unavailable =
+        isHolderAccountUnavailableError(
+          error
+        );
+
+      // ------------------------------------------
+      // NOT OUR KNOWN TEMPORARY CONDITION
+      // ------------------------------------------
+
+      if (!unavailable) {
+        throw error;
+      }
+
+      // ------------------------------------------
+      // NO RETRIES REMAIN
+      // ------------------------------------------
+
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
+
+      const delayMs =
+        HOLDER_ACCOUNT_RETRY_DELAYS_MS[
+          attempt - 1
+        ];
+
+      logInfo(
+        "Holder RPC account unavailable; retrying",
+        {
+          tokenAddress,
+          method,
+          attempt,
+          nextAttempt:
+            attempt + 1,
+          delayMs,
+          ...getHolderRpcErrorDetails(
+            error
+          ),
+        }
+      );
+
+      await sleep(delayMs);
+    }
+  }
+
+  return null;
+}
 
 
 // ==================================================
@@ -10930,8 +11032,10 @@ function getHolderRpcErrorDetails(
 // • Prevents duplicate concurrent enrichment.
 // • Respects the holder refresh cooldown.
 // • Preserves prior successful enrichment data.
-// • Treats temporarily unavailable mint accounts as
-//   recoverable.
+// • Retries temporarily unavailable fresh mint
+//   accounts through the targeted holder RPC retry.
+// • Applies cooldown after exhausted temporary
+//   account-availability retries.
 // • Logs structured Helius JSON-RPC error details.
 // ==================================================
 
@@ -10993,10 +11097,19 @@ async function enrichTokenHolderConcentration(
       try {
         // ----------------------------------------
         // TOKEN SUPPLY
+        //
+        // Very new Pump.fun mints may briefly be
+        // unavailable through this RPC.
+        //
+        // The retry helper retries ONLY the known:
+        //
+        //   -32602 / could not find account
+        //
+        // condition.
         // ----------------------------------------
 
         const supplyResult =
-          await heliusRpc(
+          await holderRpcWithAvailabilityRetry(
             "getTokenSupply",
             [
               tokenAddress,
@@ -11004,7 +11117,8 @@ async function enrichTokenHolderConcentration(
                 commitment:
                   "confirmed",
               },
-            ]
+            ],
+            tokenAddress
           );
 
         const totalSupplyUi =
@@ -11027,10 +11141,14 @@ async function enrichTokenHolderConcentration(
 
         // ----------------------------------------
         // LARGEST TOKEN ACCOUNTS
+        //
+        // Use the same targeted availability retry
+        // because newly created mint accounts may
+        // also briefly be unavailable here.
         // ----------------------------------------
 
         const largestAccountsResult =
-          await heliusRpc(
+          await holderRpcWithAvailabilityRetry(
             "getTokenLargestAccounts",
             [
               tokenAddress,
@@ -11038,7 +11156,8 @@ async function enrichTokenHolderConcentration(
                 commitment:
                   "confirmed",
               },
-            ]
+            ],
+            tokenAddress
           );
 
         const largestAccounts =
@@ -11076,8 +11195,8 @@ async function enrichTokenHolderConcentration(
         // ----------------------------------------
         // SUCCESSFUL REFRESH
         //
-        // Start cooldown only after the enrichment
-        // has completed successfully.
+        // Start cooldown only after enrichment has
+        // completed successfully.
         // ----------------------------------------
 
         tokenLastHolderEnrichedAt.set(
@@ -11094,13 +11213,14 @@ async function enrichTokenHolderConcentration(
           );
 
         // ----------------------------------------
-        // EXPECTED TEMPORARY ACCOUNT UNAVAILABILITY
+        // EXHAUSTED TEMPORARY ACCOUNT AVAILABILITY
         //
-        // Very new Pump.fun mints may not yet be
-        // visible to the holder RPC methods.
+        // The targeted retry helper has already
+        // exhausted its configured attempts.
         //
-        // Apply the normal cooldown so the same
-        // mint is not hammered on every trade.
+        // Apply the normal cooldown so this mint is
+        // not hammered again on every incoming
+        // transaction.
         // ----------------------------------------
 
         if (
@@ -11114,7 +11234,7 @@ async function enrichTokenHolderConcentration(
           );
 
           logInfo(
-            "Holder enrichment account unavailable",
+            "Holder enrichment account unavailable after retries",
             {
               tokenAddress,
               ...rpcError,
@@ -11164,7 +11284,6 @@ async function enrichTokenHolderConcentration(
 
   return runPromise;
 }
-
 
 // ==================================================
 // 12G. ASYNC ENRICHMENT DISPATCH

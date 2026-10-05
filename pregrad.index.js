@@ -766,6 +766,33 @@ shadowProgramIdOnlyUnsupported: 0,
 shadowProgramIdOnlyUnresolvedMint: 0,
 shadowProgramIdOnlyOtherRejected: 0,
 
+    // ==========================================
+  // SHADOW SMALL-TRADE PREFILTER EXPERIMENT
+  //
+  // Tests whether websocket-only information can
+  // identify buy/sell transactions that production
+  // later rejects for being below MIN_SOL_AMOUNT.
+  //
+  // Observation only:
+  // • Does NOT reject signatures.
+  // • Does NOT add RPC calls.
+  // • Does NOT add database work.
+  // • Does NOT change production filtering.
+  // ==========================================
+
+  shadowSmallTradeSamples: 0,
+  shadowSmallTradeSmall: 0,
+  shadowSmallTradeKeep: 0,
+  shadowSmallTradeUnknownAmount: 0,
+
+  shadowSmallTradeBuySamples: 0,
+  shadowSmallTradeBuySmall: 0,
+  shadowSmallTradeBuyKeep: 0,
+
+  shadowSmallTradeSellSamples: 0,
+  shadowSmallTradeSellSmall: 0,
+  shadowSmallTradeSellKeep: 0,
+
   // ==========================================
   // ENRICHMENT
   // ==========================================
@@ -1218,6 +1245,334 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// ==================================================
+// SHADOW SMALL-TRADE PREFILTER DIAGNOSTICS
+//
+// Aggregate websocket-only fingerprints against the
+// hydrated transaction's eventual SOL-size outcome.
+//
+// IMPORTANT:
+//
+// This is observation only.
+// No production filtering occurs here.
+// ==================================================
+
+const shadowSmallTradeFingerprints =
+  new Map();
+
+const SHADOW_SMALL_TRADE_MAX_FINGERPRINTS =
+  250;
+
+function buildSmallTradeShadowFingerprint(
+  value
+) {
+  const logs =
+    Array.isArray(value?.logs)
+      ? value.logs.map(
+          line => String(line)
+        )
+      : [];
+
+  const lowerLogs =
+    logs.map(
+      line => line.toLowerCase()
+    );
+
+  const hasBuy =
+    lowerLogs.some(
+      line =>
+        line.includes(
+          "instruction: buy"
+        )
+    );
+
+  const hasSell =
+    lowerLogs.some(
+      line =>
+        line.includes(
+          "instruction: sell"
+        )
+    );
+
+  const eventHint =
+    hasBuy && !hasSell
+      ? "buy"
+      : hasSell && !hasBuy
+        ? "sell"
+        : hasBuy && hasSell
+          ? "buy_sell"
+          : "other";
+
+  let maxComputeUnits = null;
+
+  for (const line of logs) {
+    const match =
+      line.match(
+        /consumed\s+(\d+)\s+of\s+\d+\s+compute units/i
+      );
+
+    if (!match) {
+      continue;
+    }
+
+    const units =
+      Number(match[1]);
+
+    if (!Number.isFinite(units)) {
+      continue;
+    }
+
+    maxComputeUnits =
+      maxComputeUnits === null
+        ? units
+        : Math.max(
+            maxComputeUnits,
+            units
+          );
+  }
+
+  const logCount =
+    logs.length;
+
+  const totalLogChars =
+    logs.reduce(
+      (sum, line) =>
+        sum + line.length,
+      0
+    );
+
+  const invokeCount =
+    lowerLogs.filter(
+      line =>
+        line.includes(
+          " invoke ["
+        )
+    ).length;
+
+  const programDataCount =
+    lowerLogs.filter(
+      line =>
+        line.startsWith(
+          "program data:"
+        )
+    ).length;
+
+  const programLogCount =
+    lowerLogs.filter(
+      line =>
+        line.startsWith(
+          "program log:"
+        )
+    ).length;
+
+  const successCount =
+    lowerLogs.filter(
+      line =>
+        line.endsWith(
+          " success"
+        )
+    ).length;
+
+  const computeBucket =
+    maxComputeUnits === null
+      ? "none"
+      : String(
+          Math.floor(
+            maxComputeUnits / 5000
+          ) * 5000
+        );
+
+  const logCountBucket =
+    String(
+      Math.floor(
+        logCount / 5
+      ) * 5
+    );
+
+  const charBucket =
+    String(
+      Math.floor(
+        totalLogChars / 500
+      ) * 500
+    );
+
+  const key = [
+    `event=${eventHint}`,
+    `logs=${logCountBucket}`,
+    `chars=${charBucket}`,
+    `cu=${computeBucket}`,
+    `invoke=${invokeCount}`,
+    `data=${programDataCount}`,
+    `plog=${programLogCount}`,
+    `success=${successCount}`,
+  ].join("|");
+
+  return {
+    key,
+    eventHint,
+    logCount,
+    totalLogChars,
+    maxComputeUnits,
+    invokeCount,
+    programDataCount,
+    programLogCount,
+    successCount,
+  };
+}
+
+function recordSmallTradeShadowOutcome(
+  fingerprint,
+  event
+) {
+  if (
+    !fingerprint?.key ||
+    !event ||
+    !["buy", "sell"].includes(
+      event.event_type
+    )
+  ) {
+    return;
+  }
+
+  const minSolAmount =
+    effectiveMinSolAmount();
+
+  const solAmount =
+    Number(
+      event.sol_amount
+    );
+
+  stats.shadowSmallTradeSamples += 1;
+
+  const isBuy =
+    event.event_type === "buy";
+
+  if (isBuy) {
+    stats.shadowSmallTradeBuySamples += 1;
+  } else {
+    stats.shadowSmallTradeSellSamples += 1;
+  }
+
+  let outcome;
+
+  if (!Number.isFinite(solAmount)) {
+    outcome = "unknown";
+
+    stats.shadowSmallTradeUnknownAmount +=
+      1;
+
+  } else if (
+    solAmount < minSolAmount
+  ) {
+    outcome = "small";
+
+    stats.shadowSmallTradeSmall += 1;
+
+    if (isBuy) {
+      stats.shadowSmallTradeBuySmall += 1;
+    } else {
+      stats.shadowSmallTradeSellSmall += 1;
+    }
+
+  } else {
+    outcome = "keep";
+
+    stats.shadowSmallTradeKeep += 1;
+
+    if (isBuy) {
+      stats.shadowSmallTradeBuyKeep += 1;
+    } else {
+      stats.shadowSmallTradeSellKeep += 1;
+    }
+  }
+
+  let row =
+    shadowSmallTradeFingerprints.get(
+      fingerprint.key
+    );
+
+  if (!row) {
+    if (
+      shadowSmallTradeFingerprints.size >=
+      SHADOW_SMALL_TRADE_MAX_FINGERPRINTS
+    ) {
+      return;
+    }
+
+    row = {
+      key: fingerprint.key,
+      samples: 0,
+      small: 0,
+      keep: 0,
+      unknown: 0,
+    };
+
+    shadowSmallTradeFingerprints.set(
+      fingerprint.key,
+      row
+    );
+  }
+
+  row.samples += 1;
+  row[outcome] += 1;
+}
+
+function getSmallTradeShadowSummary() {
+  const rows =
+    Array.from(
+      shadowSmallTradeFingerprints.values()
+    )
+      .filter(
+        row =>
+          row.samples >= 10
+      )
+      .map(row => {
+        const known =
+          row.small + row.keep;
+
+        return {
+          ...row,
+
+          smallPct:
+            known > 0
+              ? Number(
+                  (
+                    100 *
+                    row.small /
+                    known
+                  ).toFixed(3)
+                )
+              : null,
+        };
+      })
+      .sort((a, b) => {
+        if (
+          b.smallPct !==
+          a.smallPct
+        ) {
+          return (
+            (b.smallPct || 0) -
+            (a.smallPct || 0)
+          );
+        }
+
+        return (
+          b.samples -
+          a.samples
+        );
+      });
+
+  return {
+    thresholdSol:
+      effectiveMinSolAmount(),
+
+    fingerprintsTracked:
+      shadowSmallTradeFingerprints.size,
+
+    topSmallFingerprints:
+      rows.slice(0, 15),
+  };
+}
 // ==================================================
 // 6A. PERFORMANCE DIAGNOSTICS
 //
@@ -3199,7 +3554,8 @@ function enqueueSignature(
   signature,
   slot = null,
   blockTime = null,
-  prefilterMatchType = null
+  prefilterMatchType = null,
+  smallTradeShadowFingerprint = null
 ) {
   if (!signature) {
     return;
@@ -3255,6 +3611,17 @@ function enqueueSignature(
     // ----------------------------------------------
 
     prefilterMatchType,
+
+        // ----------------------------------------------
+    // SHADOW SMALL-TRADE PREFILTER EXPERIMENT
+    //
+    // Compact websocket-only metadata captured
+    // BEFORE transaction hydration.
+    //
+    // Observation only.
+    // ----------------------------------------------
+
+    smallTradeShadowFingerprint,
 
     enqueuedAt: Date.now(),
   });
@@ -12277,7 +12644,26 @@ if (
 
     const token =
       classified.tokenUpsert;
+    // ==============================================
+    // SHADOW SMALL-TRADE PREFILTER OUTCOME
+    //
+    // Compare the PRE-RPC websocket fingerprint
+    // against the hydrated transaction's actual
+    // event type and SOL amount.
+    //
+    // IMPORTANT:
+    //
+    // This happens BEFORE production's minimum-SOL
+    // rejection so both SMALL and KEEP populations
+    // are measured.
+    //
+    // Observation only.
+    // ==============================================
 
+    recordSmallTradeShadowOutcome(
+      item.smallTradeShadowFingerprint,
+      event
+    );
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
@@ -12861,11 +13247,26 @@ if (
 stats.shadowPrefilterExplicitMatches +=
   1;
 
+// ----------------------------------------------
+// SHADOW SMALL-TRADE PREFILTER EXPERIMENT
+//
+// Capture websocket-only information BEFORE
+// getTransaction.
+//
+// This fingerprint does NOT affect admission.
+// ----------------------------------------------
+
+const smallTradeShadowFingerprint =
+  buildSmallTradeShadowFingerprint(
+    value
+  );
+
 enqueueSignature(
   value.signature,
   context?.slot || null,
   value.blockTime || null,
-  prefilterMatchType
+  prefilterMatchType,
+  smallTradeShadowFingerprint
 );
     } catch (error) {
       logError(
@@ -15032,6 +15433,44 @@ shadowWebsocketPrefilter: {
 
   otherRejected:
     stats.shadowProgramIdOnlyOtherRejected,
+},
+
+            shadowSmallTradePrefilter: {
+  samples:
+    stats.shadowSmallTradeSamples,
+
+  small:
+    stats.shadowSmallTradeSmall,
+
+  keep:
+    stats.shadowSmallTradeKeep,
+
+  unknownAmount:
+    stats.shadowSmallTradeUnknownAmount,
+
+  buy: {
+    samples:
+      stats.shadowSmallTradeBuySamples,
+
+    small:
+      stats.shadowSmallTradeBuySmall,
+
+    keep:
+      stats.shadowSmallTradeBuyKeep,
+  },
+
+  sell: {
+    samples:
+      stats.shadowSmallTradeSellSamples,
+
+    small:
+      stats.shadowSmallTradeSellSmall,
+
+    keep:
+      stats.shadowSmallTradeSellKeep,
+  },
+
+  ...getSmallTradeShadowSummary(),
 },
 
 // --------------------------------------

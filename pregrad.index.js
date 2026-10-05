@@ -1261,7 +1261,7 @@ const shadowSmallTradeFingerprints =
   new Map();
 
 const SHADOW_SMALL_TRADE_MAX_FINGERPRINTS =
-  250;
+  2500;
 
 function buildSmallTradeShadowFingerprint(
   value

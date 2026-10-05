@@ -739,6 +739,34 @@ controlFetchErrors: 0,
   classifiedUnknown: 0,
 
   // ==========================================
+// SHADOW WEBSOCKET PREFILTER EXPERIMENT
+//
+// Measures whether transactions admitted only
+// because their websocket logs contain the Pump
+// program ID ever become valid North Star events.
+//
+// Observation only:
+// • Does NOT filter signatures.
+// • Does NOT add RPC calls.
+// • Does NOT add database work.
+// • Does NOT change ingestion behavior.
+// ==========================================
+
+shadowPrefilterExplicitMatches: 0,
+shadowPrefilterProgramIdOnlyMatches: 0,
+
+shadowProgramIdOnlyFetched: 0,
+
+shadowProgramIdOnlyAcceptedCreate: 0,
+shadowProgramIdOnlyAcceptedBuy: 0,
+shadowProgramIdOnlyAcceptedSell: 0,
+shadowProgramIdOnlyAcceptedMigrate: 0,
+
+shadowProgramIdOnlyUnsupported: 0,
+shadowProgramIdOnlyUnresolvedMint: 0,
+shadowProgramIdOnlyOtherRejected: 0,
+
+  // ==========================================
   // ENRICHMENT
   // ==========================================
 
@@ -3170,7 +3198,8 @@ function drainStaleQueueItems() {
 function enqueueSignature(
   signature,
   slot = null,
-  blockTime = null
+  blockTime = null,
+  prefilterMatchType = null
 ) {
   if (!signature) {
     return;
@@ -3211,6 +3240,22 @@ function enqueueSignature(
     signature,
     slot,
     blockTime,
+
+    // ----------------------------------------------
+    // SHADOW WEBSOCKET PREFILTER EXPERIMENT
+    //
+    // Records WHY this signature passed the
+    // websocket prefilter:
+    //
+    // • "explicit"
+    // • "program_id_only"
+    //
+    // Observation only. This does not affect queue
+    // admission or production processing behavior.
+    // ----------------------------------------------
+
+    prefilterMatchType,
+
     enqueuedAt: Date.now(),
   });
 
@@ -4010,33 +4055,105 @@ function txTouchesLaunchpadProgram(tx) {
   return false;
 }
 
-function looksRelevantFromLogs(value) {
-  const logs = Array.isArray(value?.logs)
-    ? value.logs
-    : [];
+// ==================================================
+// 10B-1. WEBSOCKET PREFILTER SHADOW CLASSIFICATION
+//
+// Determines WHY a websocket notification passes the
+// existing pre-RPC relevance filter.
+//
+// Match types:
+//
+// • explicit
+//     Contains a recognized event marker such as
+//     buy / sell / create / migrate.
+//
+// • program_id_only
+//     Contains the Pump program ID but NONE of the
+//     explicit event markers.
+//
+// • irrelevant
+//     Matches neither condition.
+//
+// IMPORTANT:
+//
+// This is observation only.
+// Production admission behavior remains unchanged.
+// ==================================================
+
+function classifyWebsocketPrefilterMatch(
+  value
+) {
+  const logs =
+    Array.isArray(value?.logs)
+      ? value.logs
+      : [];
 
   if (!logs.length) {
-    return false;
+    return "irrelevant";
   }
 
-  return logs.some((line) => {
-    const text = String(line);
-    const lower = text.toLowerCase();
+  let hasProgramId = false;
+  let hasExplicitEvent = false;
 
-    return (
+  for (const line of logs) {
+    const text =
+      String(line);
+
+    const lower =
+      text.toLowerCase();
+
+    if (
       text.includes(
         PUMP_LAUNCHPAD_PROGRAM_ID
-      ) ||
+      )
+    ) {
+      hasProgramId = true;
+    }
+
+    if (
       lower.includes("instruction: buy") ||
       lower.includes("instruction: sell") ||
       lower.includes("instruction: create") ||
       lower.includes("create_v2") ||
       lower.includes("migrate") ||
       lower.includes("graduate")
-    );
-  });
+    ) {
+      hasExplicitEvent = true;
+    }
+
+    if (
+      hasProgramId &&
+      hasExplicitEvent
+    ) {
+      break;
+    }
+  }
+
+  if (hasExplicitEvent) {
+    return "explicit";
+  }
+
+  if (hasProgramId) {
+    return "program_id_only";
+  }
+
+  return "irrelevant";
 }
 
+
+// ==================================================
+// EXISTING PRODUCTION RELEVANCE CHECK
+//
+// Preserve original admission behavior exactly.
+// ==================================================
+
+function looksRelevantFromLogs(value) {
+  return (
+    classifyWebsocketPrefilterMatch(
+      value
+    ) !== "irrelevant"
+  );
+}
 
 // ==================================================
 // 10C. EVENT TYPE
@@ -12042,11 +12159,92 @@ async function processQueuedSignature(item) {
     // CLASSIFY PUMP.FUN EVENT
     // ----------------------------------------------
 
-    const classified =
-      classifyPregradEvent(
-        tx,
-        signature
-      );
+     const classified =
+  classifyPregradEvent(
+    tx,
+    signature
+  );
+
+   // ----------------------------------------------
+// SHADOW WEBSOCKET PREFILTER OUTCOME
+//
+// Study transactions admitted ONLY because their
+// websocket logs contained the Pump program ID.
+//
+// IMPORTANT:
+//
+// Count classification outcome BEFORE the minimum
+// SOL threshold.
+//
+// A small valid buy/sell still proves that removing
+// the program-ID fallback would have caused a false
+// negative, even if production later rejects that
+// trade for being below MIN_SOL_AMOUNT.
+// ----------------------------------------------
+
+if (
+  item.prefilterMatchType ===
+  "program_id_only"
+) {
+  stats.shadowProgramIdOnlyFetched +=
+    1;
+
+  if (classified.ok) {
+    const shadowEventType =
+      classified.event?.event_type;
+
+    if (
+      shadowEventType ===
+      "create"
+    ) {
+      stats.shadowProgramIdOnlyAcceptedCreate +=
+        1;
+
+    } else if (
+      shadowEventType ===
+      "buy"
+    ) {
+      stats.shadowProgramIdOnlyAcceptedBuy +=
+        1;
+
+    } else if (
+      shadowEventType ===
+      "sell"
+    ) {
+      stats.shadowProgramIdOnlyAcceptedSell +=
+        1;
+
+    } else if (
+      shadowEventType ===
+      "migrate"
+    ) {
+      stats.shadowProgramIdOnlyAcceptedMigrate +=
+        1;
+
+    } else {
+      stats.shadowProgramIdOnlyOtherRejected +=
+        1;
+    }
+
+  } else if (
+    classified.reason ===
+    "unsupported_pump_instruction"
+  ) {
+    stats.shadowProgramIdOnlyUnsupported +=
+      1;
+
+  } else if (
+    classified.reason ===
+    "unresolved_token_mint"
+  ) {
+    stats.shadowProgramIdOnlyUnresolvedMint +=
+      1;
+
+  } else {
+    stats.shadowProgramIdOnlyOtherRejected +=
+      1;
+  }
+}
 
     if (!classified.ok) {
       if (
@@ -12627,20 +12825,40 @@ function connect() {
         return;
       }
 
-      if (
-        !looksRelevantFromLogs(
-          value
-        )
-      ) {
-        stats.skippedIrrelevantLog += 1;
-        return;
-      }
+  const prefilterMatchType =
+  classifyWebsocketPrefilterMatch(
+    value
+  );
 
-      enqueueSignature(
-        value.signature,
-        context?.slot || null,
-        value.blockTime || null
-      );
+if (
+  prefilterMatchType ===
+  "irrelevant"
+) {
+  stats.skippedIrrelevantLog += 1;
+  return;
+}
+
+if (
+  prefilterMatchType ===
+  "explicit"
+) {
+  stats.shadowPrefilterExplicitMatches +=
+    1;
+
+} else if (
+  prefilterMatchType ===
+  "program_id_only"
+) {
+  stats.shadowPrefilterProgramIdOnlyMatches +=
+    1;
+}
+
+enqueueSignature(
+  value.signature,
+  context?.slot || null,
+  value.blockTime || null,
+  prefilterMatchType
+);
     } catch (error) {
       logError(
         "WebSocket message parse error",
@@ -14766,11 +14984,53 @@ slowDbQueries,
             postgresPool,
             effectiveConfiguration,
 
-            // --------------------------------------
-            // PRESERVE ALL RAW CUMULATIVE COUNTERS
-            // --------------------------------------
+          // --------------------------------------
+// SHADOW WEBSOCKET PREFILTER EXPERIMENT
+//
+// Groups the shadow pre-RPC filtering
+// diagnostics into one readable object.
+//
+// Observation only.
+// Does not affect ingestion behavior.
+// --------------------------------------
 
-            ...stats,
+shadowWebsocketPrefilter: {
+  explicitMatches:
+    stats.shadowPrefilterExplicitMatches,
+
+  programIdOnlyMatches:
+    stats.shadowPrefilterProgramIdOnlyMatches,
+
+  programIdOnlyFetched:
+    stats.shadowProgramIdOnlyFetched,
+
+  acceptedCreate:
+    stats.shadowProgramIdOnlyAcceptedCreate,
+
+  acceptedBuy:
+    stats.shadowProgramIdOnlyAcceptedBuy,
+
+  acceptedSell:
+    stats.shadowProgramIdOnlyAcceptedSell,
+
+  acceptedMigrate:
+    stats.shadowProgramIdOnlyAcceptedMigrate,
+
+  unsupported:
+    stats.shadowProgramIdOnlyUnsupported,
+
+  unresolvedMint:
+    stats.shadowProgramIdOnlyUnresolvedMint,
+
+  otherRejected:
+    stats.shadowProgramIdOnlyOtherRejected,
+},
+
+// --------------------------------------
+// PRESERVE ALL RAW CUMULATIVE COUNTERS
+// --------------------------------------
+
+...stats,
           }
         );
 

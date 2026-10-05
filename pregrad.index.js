@@ -12825,33 +12825,41 @@ function connect() {
         return;
       }
 
-  const prefilterMatchType =
+// ----------------------------------------------
+// WEBSOCKET PRE-RPC PREFILTER
+//
+// Production admission now requires an explicit
+// Pump.fun event marker.
+//
+// Program-ID-only notifications were shadow-tested
+// and produced no valid create / buy / sell / migrate
+// events, so reject them BEFORE getTransaction.
+// ----------------------------------------------
+
+const prefilterMatchType =
   classifyWebsocketPrefilterMatch(
     value
   );
 
 if (
-  prefilterMatchType ===
-  "irrelevant"
+  prefilterMatchType !==
+  "explicit"
 ) {
   stats.skippedIrrelevantLog += 1;
+
+  if (
+    prefilterMatchType ===
+    "program_id_only"
+  ) {
+    stats.shadowPrefilterProgramIdOnlyMatches +=
+      1;
+  }
+
   return;
 }
 
-if (
-  prefilterMatchType ===
-  "explicit"
-) {
-  stats.shadowPrefilterExplicitMatches +=
-    1;
-
-} else if (
-  prefilterMatchType ===
-  "program_id_only"
-) {
-  stats.shadowPrefilterProgramIdOnlyMatches +=
-    1;
-}
+stats.shadowPrefilterExplicitMatches +=
+  1;
 
 enqueueSignature(
   value.signature,

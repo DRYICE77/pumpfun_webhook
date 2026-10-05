@@ -1518,10 +1518,13 @@ function recordSmallTradeShadowOutcome(
 }
 
 function getSmallTradeShadowSummary() {
-  const rows =
+  const allRows =
     Array.from(
       shadowSmallTradeFingerprints.values()
-    )
+    );
+
+  const rows =
+    allRows
       .filter(
         row =>
           row.samples >= 10
@@ -1562,12 +1565,159 @@ function getSmallTradeShadowSummary() {
         );
       });
 
+  // ----------------------------------------------
+  // ZERO-FALSE-POSITIVE COVERAGE
+  //
+  // Measure how much of the observed SMALL
+  // population could have been rejected using only
+  // fingerprints that have NEVER produced a KEEP.
+  //
+  // Different minimum sample sizes let us compare
+  // aggressive vs conservative confidence levels.
+  // ----------------------------------------------
+
+  function buildZeroFalsePositiveTier(
+    minSamples
+  ) {
+    const matchingRows =
+      allRows.filter(
+        row =>
+          row.samples >= minSamples &&
+          row.small > 0 &&
+          row.keep === 0 &&
+          row.unknown === 0
+      );
+
+    const smallCaptured =
+      matchingRows.reduce(
+        (sum, row) =>
+          sum + row.small,
+        0
+      );
+
+    const keepCaptured =
+      matchingRows.reduce(
+        (sum, row) =>
+          sum + row.keep,
+        0
+      );
+
+    const totalSmall =
+      stats.shadowSmallTradeSmall;
+
+    const totalKeep =
+      stats.shadowSmallTradeKeep;
+
+    return {
+      minSamples,
+
+      patterns:
+        matchingRows.length,
+
+      smallCaptured,
+
+      keepCaptured,
+
+      coverageOfAllSmallPct:
+        totalSmall > 0
+          ? Number(
+              (
+                100 *
+                smallCaptured /
+                totalSmall
+              ).toFixed(3)
+            )
+          : null,
+
+      estimatedRpcSavingsPct:
+        (
+          totalSmall +
+          totalKeep
+        ) > 0
+          ? Number(
+              (
+                100 *
+                smallCaptured /
+                (
+                  totalSmall +
+                  totalKeep
+                )
+              ).toFixed(3)
+            )
+          : null,
+    };
+  }
+
+  const zeroFalsePositiveCoverage = {
+    minSamples10:
+      buildZeroFalsePositiveTier(10),
+
+    minSamples25:
+      buildZeroFalsePositiveTier(25),
+
+    minSamples50:
+      buildZeroFalsePositiveTier(50),
+
+    minSamples100:
+      buildZeroFalsePositiveTier(100),
+  };
+
+  // ----------------------------------------------
+  // KEEP CONTAMINATION
+  //
+  // Shows how many tracked fingerprints have ever
+  // produced at least one transaction production
+  // would KEEP.
+  //
+  // This gives us the opposite side of the test:
+  // how much fingerprint overlap exists between
+  // SMALL and KEEP populations.
+  // ----------------------------------------------
+
+  const fingerprintsWithAnyKeep =
+    allRows.filter(
+      row =>
+        row.keep > 0
+    ).length;
+
+  const fingerprintsWithSmallAndKeep =
+    allRows.filter(
+      row =>
+        row.small > 0 &&
+        row.keep > 0
+    ).length;
+
+  const pureSmallFingerprints =
+    allRows.filter(
+      row =>
+        row.small > 0 &&
+        row.keep === 0 &&
+        row.unknown === 0
+    ).length;
+
+  const pureKeepFingerprints =
+    allRows.filter(
+      row =>
+        row.keep > 0 &&
+        row.small === 0 &&
+        row.unknown === 0
+    ).length;
+
   return {
     thresholdSol:
       effectiveMinSolAmount(),
 
     fingerprintsTracked:
       shadowSmallTradeFingerprints.size,
+
+    zeroFalsePositiveCoverage,
+
+    keepContamination: {
+      fingerprintsWithAnyKeep,
+      fingerprintsWithSmallAndKeep,
+      pureSmallFingerprints,
+      pureKeepFingerprints,
+    },
 
     topSmallFingerprints:
       rows.slice(0, 15),

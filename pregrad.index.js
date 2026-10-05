@@ -3315,62 +3315,334 @@ async function acquireHeliusRpcStartSlot() {
     stats.heliusRpcPacerImmediate += 1;
   }
 }
+
+// ==================================================
+// HELIUS RPC METHOD / HTTP DIAGNOSTICS
+// ==================================================
+
+const heliusRpcMethodDiagnostics =
+  new Map();
+
+function getHeliusRpcMethodDiagnostic(
+  method
+) {
+  const key =
+    method || "unknown";
+
+  let diagnostic =
+    heliusRpcMethodDiagnostics.get(
+      key
+    );
+
+  if (!diagnostic) {
+    diagnostic = {
+      method: key,
+
+      starts: 0,
+
+      pacerSamples: 0,
+      pacerImmediate: 0,
+      pacerWaited: 0,
+      pacerWaitTotalMs: 0,
+      pacerWaitMaxMs: 0,
+
+      httpSamples: 0,
+      httpTotalMs: 0,
+      httpMaxMs: 0,
+
+      http429: 0,
+      httpOtherErrors: 0,
+      jsonRpcErrors: 0,
+
+      successfulResponses: 0,
+    };
+
+    heliusRpcMethodDiagnostics.set(
+      key,
+      diagnostic
+    );
+  }
+
+  return diagnostic;
+}
+
+
 // ==================================================
 // 9. HELIUS RPC
 //
-// Performance diagnostics:
-// • Measure full transaction-fetch duration
-// • Include retries and retry delays
-// • Record successful and failed fetches
-// • Preserve existing RPC and retry behavior
+// Method-level performance diagnostics:
+//
+// • Count request starts by RPC method
+// • Measure global pacer duration
+// • Measure pure HTTP fetch duration
+// • Count HTTP 429 responses
+// • Count other HTTP / network errors
+// • Count JSON-RPC errors
+// • Count successful responses
+//
+// Observation only.
+// No scheduling, pacing, retry, or RPC behavior changes.
+// ==================================================
+
+
+// ==================================================
+// 9A. HELIUS RPC METHOD DIAGNOSTIC SUMMARY
+//
+// Converts the per-method diagnostic Map into a
+// JSON-serializable health summary.
+//
+// Pacer timing:
+// • pacerAvgMs = average pacer duration across all
+//   request starts
+// • pacerMaxWaitMs = maximum observed pacer duration
+//
+// HTTP timing begins only AFTER the pacer slot has
+// been acquired.
+// ==================================================
+
+function summarizeHeliusRpcMethodDiagnostics() {
+  return Object.fromEntries(
+    Array.from(
+      heliusRpcMethodDiagnostics.entries()
+    ).map(([method, diagnostic]) => [
+      method,
+      {
+        starts:
+          diagnostic.starts,
+
+        pacerSamples:
+          diagnostic.pacerSamples,
+
+        pacerImmediate:
+          diagnostic.pacerImmediate,
+
+        pacerWaited:
+          diagnostic.pacerWaited,
+
+        pacerWaitPct:
+          diagnostic.pacerSamples > 0
+            ? Number(
+                (
+                  100 *
+                  diagnostic.pacerWaited /
+                  diagnostic.pacerSamples
+                ).toFixed(2)
+              )
+            : null,
+
+        pacerAvgMs:
+          diagnostic.pacerSamples > 0
+            ? Number(
+                (
+                  diagnostic.pacerWaitTotalMs /
+                  diagnostic.pacerSamples
+                ).toFixed(2)
+              )
+            : null,
+
+        pacerMaxWaitMs:
+          diagnostic.pacerSamples > 0
+            ? Number(
+                diagnostic.pacerWaitMaxMs
+                  .toFixed(2)
+              )
+            : null,
+
+        httpSamples:
+          diagnostic.httpSamples,
+
+        httpAvgMs:
+          diagnostic.httpSamples > 0
+            ? Number(
+                (
+                  diagnostic.httpTotalMs /
+                  diagnostic.httpSamples
+                ).toFixed(2)
+              )
+            : null,
+
+        httpMaxMs:
+          diagnostic.httpSamples > 0
+            ? Number(
+                diagnostic.httpMaxMs
+                  .toFixed(2)
+              )
+            : null,
+
+        http429:
+          diagnostic.http429,
+
+        httpOtherErrors:
+          diagnostic.httpOtherErrors,
+
+        jsonRpcErrors:
+          diagnostic.jsonRpcErrors,
+
+        successfulResponses:
+          diagnostic.successfulResponses,
+      },
+    ])
+  );
+}
+
+
+// ==================================================
+// 9B. HELIUS RPC REQUEST
 // ==================================================
 
 async function heliusRpc(method, params) {
+  const diagnostic =
+    getHeliusRpcMethodDiagnostic(method);
+
+  // ----------------------------------------------
+  // REQUEST START
+  // ----------------------------------------------
+
+  diagnostic.starts += 1;
+
   // ----------------------------------------------
   // GLOBAL HELIUS RPC PACER
   //
   // Every Helius HTTP request must acquire a start
   // slot before it is allowed to begin.
   //
-  // This limits aggregate request STARTS across all
-  // callers without serializing the requests
-  // themselves.
+  // Measure pacer duration separately from HTTP
+  // time so local throttling pressure can be
+  // distinguished from Helius / network latency.
   // ----------------------------------------------
+
+  const pacerStartedAt =
+    performanceNow();
 
   await acquireHeliusRpcStartSlot();
 
+  const pacerWaitMs =
+    performanceNow() -
+    pacerStartedAt;
+
+  diagnostic.pacerSamples += 1;
+
+  diagnostic.pacerWaitTotalMs +=
+    pacerWaitMs;
+
+  diagnostic.pacerWaitMaxMs =
+    Math.max(
+      diagnostic.pacerWaitMaxMs,
+      pacerWaitMs
+    );
+
+  if (pacerWaitMs >= 1) {
+    diagnostic.pacerWaited += 1;
+  } else {
+    diagnostic.pacerImmediate += 1;
+  }
+
   // ----------------------------------------------
   // SEND RPC REQUEST
+  //
+  // HTTP timing begins AFTER the pacer slot has
+  // been acquired.
+  //
+  // This isolates the fetch itself from local
+  // pacer delay.
   // ----------------------------------------------
 
-  const response = await fetch(RPC_URL, {
-    method: "POST",
+  const httpStartedAt =
+    performanceNow();
 
-    headers: {
-      "Content-Type": "application/json",
-    },
+  let response;
 
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: `${method}-${Date.now()}`,
-      method,
-      params,
-    }),
-  });
+  try {
+    response = await fetch(
+      RPC_URL,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id:
+            `${method}-${Date.now()}`,
+          method,
+          params,
+        }),
+      }
+    );
+  } catch (error) {
+    // --------------------------------------------
+    // FETCH / NETWORK ERROR
+    //
+    // No HTTP status exists in this case.
+    //
+    // The failed fetch is still recorded as an
+    // HTTP timing sample.
+    // --------------------------------------------
+
+    const httpMs =
+      performanceNow() -
+      httpStartedAt;
+
+    diagnostic.httpSamples += 1;
+
+    diagnostic.httpTotalMs +=
+      httpMs;
+
+    diagnostic.httpMaxMs =
+      Math.max(
+        diagnostic.httpMaxMs,
+        httpMs
+      );
+
+    diagnostic.httpOtherErrors += 1;
+
+    throw error;
+  }
+
+  // ----------------------------------------------
+  // HTTP TIMING
+  // ----------------------------------------------
+
+  const httpMs =
+    performanceNow() -
+    httpStartedAt;
+
+  diagnostic.httpSamples += 1;
+
+  diagnostic.httpTotalMs +=
+    httpMs;
+
+  diagnostic.httpMaxMs =
+    Math.max(
+      diagnostic.httpMaxMs,
+      httpMs
+    );
 
   // ----------------------------------------------
   // HTTP ERROR
   //
-  // Preserve status on the error so the existing
-  // retry logic can specifically identify 429s.
+  // Preserve status on the thrown error so the
+  // existing retry logic can continue identifying
+  // HTTP 429 responses.
   // ----------------------------------------------
 
   if (!response.ok) {
-    const error = new Error(
-      `RPC HTTP error ${response.status}`
-    );
+    if (response.status === 429) {
+      diagnostic.http429 += 1;
+    } else {
+      diagnostic.httpOtherErrors += 1;
+    }
 
-    error.status = response.status;
+    const error =
+      new Error(
+        `RPC HTTP error ${response.status}`
+      );
+
+    error.status =
+      response.status;
 
     throw error;
   }
@@ -3387,6 +3659,8 @@ async function heliusRpc(method, params) {
   // ----------------------------------------------
 
   if (json.error) {
+    diagnostic.jsonRpcErrors += 1;
+
     throw new Error(
       `RPC error: ${JSON.stringify(
         json.error
@@ -3398,10 +3672,10 @@ async function heliusRpc(method, params) {
   // SUCCESS
   // ----------------------------------------------
 
+  diagnostic.successfulResponses += 1;
+
   return json.result;
 }
-
-
 // ==================================================
 // 9A. FETCH FULL TRANSACTION
 //
@@ -13366,6 +13640,22 @@ function startQueueLogger() {
 };
 
         // ==========================================
+        // HELIUS RPC METHOD-LEVEL HEALTH
+        //
+        // Converts the per-method diagnostic Map into
+        // a JSON-serializable health summary.
+        //
+        // Separates:
+        // • Global pacer pressure
+        // • Method-specific pacer pressure
+        // • Pure HTTP latency
+        // • HTTP / JSON-RPC failures
+        // ==========================================
+
+        const heliusRpcMethodHealth =
+          summarizeHeliusRpcMethodDiagnostics();
+
+        // ==========================================
         // DATABASE DIAGNOSTIC SUMMARIES
         //
         // These diagnostics use their dedicated
@@ -14183,6 +14473,7 @@ const dbRttProbeHealth = {
             // --------------------------------------
 
             heliusRpcPacerHealth,
+            heliusRpcMethodHealth,
             rpcFetchPerformance,
             rpcAttemptPerformance,
 

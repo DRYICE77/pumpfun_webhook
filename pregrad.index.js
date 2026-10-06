@@ -1499,13 +1499,34 @@ function recordSmallTradeShadowOutcome(
       return;
     }
 
-    row = {
-      key: fingerprint.key,
-      samples: 0,
-      small: 0,
-      keep: 0,
-      unknown: 0,
-    };
+ row = {
+  key: fingerprint.key,
+
+  samples: 0,
+  small: 0,
+  keep: 0,
+  unknown: 0,
+
+  // --------------------------------------------
+  // TEMPORAL CONFIDENCE
+  //
+  // Track how long this fingerprint has existed
+  // and exactly when KEEP contamination first
+  // appears.
+  // --------------------------------------------
+
+  firstSeenAt:
+    Date.now(),
+
+  lastSeenAt:
+    null,
+
+  firstKeepAtSample:
+    null,
+
+  firstKeepAt:
+    null,
+};
 
     shadowSmallTradeFingerprints.set(
       fingerprint.key,
@@ -1513,8 +1534,30 @@ function recordSmallTradeShadowOutcome(
     );
   }
 
-  row.samples += 1;
-  row[outcome] += 1;
+row.samples += 1;
+row[outcome] += 1;
+
+const now =
+  Date.now();
+
+row.lastSeenAt =
+  now;
+
+// Record the FIRST time this fingerprint ever
+// produces a transaction production would KEEP.
+//
+// Once set, these values never change.
+
+if (
+  outcome === "keep" &&
+  row.firstKeepAtSample === null
+) {
+  row.firstKeepAtSample =
+    row.samples;
+
+  row.firstKeepAt =
+    now;
+}
 }
 
 function getSmallTradeShadowSummary() {
@@ -1522,6 +1565,10 @@ function getSmallTradeShadowSummary() {
     Array.from(
       shadowSmallTradeFingerprints.values()
     );
+
+  // ----------------------------------------------
+  // TOP SMALL FINGERPRINTS
+  // ----------------------------------------------
 
   const rows =
     allRows
@@ -1572,8 +1619,9 @@ function getSmallTradeShadowSummary() {
   // population could have been rejected using only
   // fingerprints that have NEVER produced a KEEP.
   //
-  // Different minimum sample sizes let us compare
-  // aggressive vs conservative confidence levels.
+  // Temporal fields tell us how long the clean
+  // fingerprints in each confidence tier have
+  // survived without contamination.
   // ----------------------------------------------
 
   function buildZeroFalsePositiveTier(
@@ -1608,6 +1656,63 @@ function getSmallTradeShadowSummary() {
     const totalKeep =
       stats.shadowSmallTradeKeep;
 
+    const now =
+      Date.now();
+
+    const rowsWithFirstSeen =
+      matchingRows.filter(
+        row =>
+          Number.isFinite(
+            row.firstSeenAt
+          )
+      );
+
+    const oldestFirstSeenAt =
+      rowsWithFirstSeen.length > 0
+        ? Math.min(
+            ...rowsWithFirstSeen.map(
+              row =>
+                row.firstSeenAt
+            )
+          )
+        : null;
+
+    const newestFirstSeenAt =
+      rowsWithFirstSeen.length > 0
+        ? Math.max(
+            ...rowsWithFirstSeen.map(
+              row =>
+                row.firstSeenAt
+            )
+          )
+        : null;
+
+    const oldestCleanAgeMinutes =
+      oldestFirstSeenAt !== null
+        ? Number(
+            (
+              (
+                now -
+                oldestFirstSeenAt
+              ) /
+              60000
+            ).toFixed(2)
+          )
+        : null;
+
+    const newestCleanAgeMinutes =
+      newestFirstSeenAt !== null
+        ? Number(
+            (
+              (
+                now -
+                newestFirstSeenAt
+              ) /
+              60000
+            ).toFixed(2)
+          )
+        : null;
+
     return {
       minSamples,
 
@@ -1617,6 +1722,10 @@ function getSmallTradeShadowSummary() {
       smallCaptured,
 
       keepCaptured,
+
+      oldestCleanAgeMinutes,
+
+      newestCleanAgeMinutes,
 
       coverageOfAllSmallPct:
         totalSmall > 0
@@ -1665,13 +1774,8 @@ function getSmallTradeShadowSummary() {
   // ----------------------------------------------
   // KEEP CONTAMINATION
   //
-  // Shows how many tracked fingerprints have ever
-  // produced at least one transaction production
-  // would KEEP.
-  //
-  // This gives us the opposite side of the test:
-  // how much fingerprint overlap exists between
-  // SMALL and KEEP populations.
+  // Measure overlap between SMALL and KEEP
+  // fingerprint populations.
   // ----------------------------------------------
 
   const fingerprintsWithAnyKeep =
@@ -1703,6 +1807,85 @@ function getSmallTradeShadowSummary() {
         row.unknown === 0
     ).length;
 
+  // ----------------------------------------------
+  // CONTAMINATION TIMING
+  //
+  // Find fingerprints that eventually produced a
+  // KEEP and measure how long they remained clean
+  // before the first contamination.
+  //
+  // Sorting by firstKeepAtSample descending shows
+  // the most dangerous cases first: fingerprints
+  // that looked clean for a long time before
+  // finally producing a KEEP.
+  // ----------------------------------------------
+
+  const contaminatedFingerprints =
+    allRows
+      .filter(
+        row =>
+          row.firstKeepAtSample !== null &&
+          row.firstKeepAtSample !== undefined
+      )
+      .sort(
+        (a, b) =>
+          b.firstKeepAtSample -
+          a.firstKeepAtSample
+      );
+
+  const latestContaminationSamples =
+    contaminatedFingerprints
+      .slice(0, 15)
+      .map(row => {
+        const hasTiming =
+          Number.isFinite(
+            row.firstKeepAt
+          ) &&
+          Number.isFinite(
+            row.firstSeenAt
+          );
+
+        return {
+          key:
+            row.key,
+
+          samples:
+            row.samples,
+
+          small:
+            row.small,
+
+          keep:
+            row.keep,
+
+          firstKeepAtSample:
+            row.firstKeepAtSample,
+
+          cleanSamplesBeforeFirstKeep:
+            Math.max(
+              0,
+              row.firstKeepAtSample - 1
+            ),
+
+          minutesUntilFirstKeep:
+            hasTiming
+              ? Number(
+                  (
+                    (
+                      row.firstKeepAt -
+                      row.firstSeenAt
+                    ) /
+                    60000
+                  ).toFixed(2)
+                )
+              : null,
+        };
+      });
+
+  // ----------------------------------------------
+  // FINAL SUMMARY
+  // ----------------------------------------------
+
   return {
     thresholdSol:
       effectiveMinSolAmount(),
@@ -1719,10 +1902,18 @@ function getSmallTradeShadowSummary() {
       pureKeepFingerprints,
     },
 
+    contaminationTiming: {
+      fingerprintsEverContaminated:
+        contaminatedFingerprints.length,
+
+      latestContaminationSamples,
+    },
+
     topSmallFingerprints:
       rows.slice(0, 15),
   };
 }
+
 // ==================================================
 // 6A. PERFORMANCE DIAGNOSTICS
 //

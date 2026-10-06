@@ -1107,6 +1107,15 @@ smallTradePreRpcBypassedDisabled: 0,
 smallTradePreRpcBypassedThreshold: 0,
 
   // ==========================================
+// PRODUCTION CLEAN COHORT #2
+// ==========================================
+
+cleanCohort2PreRpcCandidates: 0,
+cleanCohort2PreRpcSkipped: 0,
+cleanCohort2PreRpcBypassedDisabled: 0,
+cleanCohort2PreRpcBypassedThreshold: 0,
+
+  // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
 
@@ -14209,25 +14218,78 @@ const shadowCohort2NearClean =
 // so the transaction never reaches getTransaction.
 // ----------------------------------------------
 
+// ----------------------------------------------
+// PRODUCTION SMALL-TRADE PRE-RPC FILTER
+//
+// Production cohorts:
+//
+// • Cohort #1 — original frozen mature cohort
+// • Cohort #2 CLEAN — promoted after independent
+//   forward holdout validation
+//
+// NEAR-CLEAN Cohort #2 remains SHADOW ONLY.
+//
+// Safety:
+// • Exact frozen fingerprint membership only.
+// • Active production threshold must equal 0.05 SOL.
+// • Existing kill switch controls both production
+//   cohorts.
+// ----------------------------------------------
+
+const currentThreshold =
+  effectiveMinSolAmount();
+
+const cohort1ThresholdMatches =
+  Number.isFinite(currentThreshold) &&
+  Math.abs(
+    currentThreshold -
+    SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL
+  ) <= 1e-12;
+
+const cleanCohort2ThresholdMatches =
+  Number.isFinite(currentThreshold) &&
+  Math.abs(
+    currentThreshold -
+    SHADOW_COHORT_2_THRESHOLD_SOL
+  ) <= 1e-12;
+
+
+// ----------------------------------------------
+// COHORT #1 — EXISTING PRODUCTION FILTER
+// ----------------------------------------------
+
 if (matureSmallTradeWouldSkip) {
   stats.smallTradePreRpcCandidates += 1;
 
-  const currentThreshold =
-    effectiveMinSolAmount();
-
-  const thresholdMatches =
-    Number.isFinite(currentThreshold) &&
-    Math.abs(
-      currentThreshold -
-      SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL
-    ) <= 1e-12;
-
   if (!SMALL_TRADE_PRE_RPC_FILTER_ENABLED) {
     stats.smallTradePreRpcBypassedDisabled += 1;
-  } else if (!thresholdMatches) {
+  } else if (!cohort1ThresholdMatches) {
     stats.smallTradePreRpcBypassedThreshold += 1;
   } else {
     stats.smallTradePreRpcSkipped += 1;
+    return;
+  }
+}
+
+
+// ----------------------------------------------
+// COHORT #2 CLEAN — PRODUCTION FILTER
+//
+// ONLY the frozen CLEAN set is promoted.
+//
+// NEAR-CLEAN is intentionally excluded and
+// continues through normal hydration.
+// ----------------------------------------------
+
+if (shadowCohort2Clean) {
+  stats.cleanCohort2PreRpcCandidates += 1;
+
+  if (!SMALL_TRADE_PRE_RPC_FILTER_ENABLED) {
+    stats.cleanCohort2PreRpcBypassedDisabled += 1;
+  } else if (!cleanCohort2ThresholdMatches) {
+    stats.cleanCohort2PreRpcBypassedThreshold += 1;
+  } else {
+    stats.cleanCohort2PreRpcSkipped += 1;
     return;
   }
 }
@@ -16673,9 +16735,39 @@ productionSmallTradePreRpcFilter: {
         )
       : 0,
 },
+
+// --------------------------------------
+// PRODUCTION CLEAN COHORT #2
+// --------------------------------------
+
+cleanCohort2Production: {
+  enabled:
+    SMALL_TRADE_PRE_RPC_FILTER_ENABLED,
+
+  thresholdSol:
+    SHADOW_COHORT_2_THRESHOLD_SOL,
+
+  activeMinSolThreshold:
+    effectiveMinSolAmount(),
+
+  frozenFingerprints:
+    SHADOW_COHORT_2_CLEAN_KEYS.size,
+
+  candidates:
+    stats.cleanCohort2PreRpcCandidates,
+
+  skippedBeforeRpc:
+    stats.cleanCohort2PreRpcSkipped,
+
+  bypassedDisabled:
+    stats.cleanCohort2PreRpcBypassedDisabled,
+
+  bypassedThresholdMismatch:
+    stats.cleanCohort2PreRpcBypassedThreshold,
+},
+
 shadowMatureSmallTradePrefilter:
   getMatureSmallTradeShadowSummary(),
-
 
 // --------------------------------------
 // PRESERVE ALL RAW CUMULATIVE COUNTERS

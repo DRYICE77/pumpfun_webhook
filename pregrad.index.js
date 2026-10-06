@@ -1056,6 +1056,47 @@ shadowMatureSellSamples: 0,
 shadowMatureThresholdMismatch: 0,
 shadowMatureEventTypeMismatch: 0,
 
+  // ==========================================
+// SHADOW SMALL-TRADE COHORT #2
+//
+// Two frozen categories:
+//
+// • CLEAN
+//   Zero KEEP observations at freeze time.
+//
+// • NEAR CLEAN
+//   Extremely low KEEP contamination at
+//   freeze time.
+//
+// Observation only.
+// Nothing in Cohort #2 is filtered pre-RPC.
+// ==========================================
+
+shadowCohort2CleanSamples: 0,
+shadowCohort2CleanSmall: 0,
+shadowCohort2CleanKeep: 0,
+shadowCohort2CleanUnknown: 0,
+shadowCohort2CleanEventTypeMismatch: 0,
+shadowCohort2CleanThresholdMismatch: 0,
+
+shadowCohort2NearCleanSamples: 0,
+shadowCohort2NearCleanSmall: 0,
+shadowCohort2NearCleanKeep: 0,
+shadowCohort2NearCleanUnknown: 0,
+shadowCohort2NearCleanEventTypeMismatch: 0,
+shadowCohort2NearCleanThresholdMismatch: 0,
+
+// Actual SOL carried by false positives.
+shadowCohort2NearCleanKeepSolTotal: 0,
+shadowCohort2NearCleanKeepSolMax: 0,
+
+shadowCohort2NearCleanKeep005To0075: 0,
+shadowCohort2NearCleanKeep0075To010: 0,
+shadowCohort2NearCleanKeep010To025: 0,
+shadowCohort2NearCleanKeep025To050: 0,
+shadowCohort2NearCleanKeep050To100: 0,
+shadowCohort2NearCleanKeep100Plus: 0,
+
 // ==========================================
 // PRODUCTION SMALL-TRADE PRE-RPC FILTER
 // ==========================================
@@ -1363,6 +1404,59 @@ const SHADOW_MATURE_HOLDOUT_KEYS =
     "event=sell|logs=25|chars=2500|cu=120000|invoke=8|data=2|plog=4|success=8",
     "event=sell|logs=30|chars=2000|cu=90000|invoke=8|data=1|plog=6|success=8",
     "event=sell|logs=25|chars=2000|cu=50000|invoke=8|data=1|plog=4|success=8",
+  ]);
+
+// ==================================================
+// FROZEN SMALL-TRADE COHORT #2
+//
+// Forward holdout only.
+//
+// Discovery observations before this deployment
+// DO NOT count toward these results.
+//
+// Neither category affects production filtering.
+// ==================================================
+
+const SHADOW_COHORT_2_THRESHOLD_SOL =
+  0.05;
+
+
+// --------------------------------------------------
+// CATEGORY A — CLEAN
+//
+// Zero KEEP / zero UNKNOWN at freeze time.
+// --------------------------------------------------
+
+const SHADOW_COHORT_2_CLEAN_KEYS =
+  new Set([
+    "event=sell|logs=25|chars=2000|cu=50000|invoke=7|data=1|plog=4|success=7",
+    "event=sell|logs=20|chars=1500|cu=50000|invoke=6|data=1|plog=2|success=6",
+    "event=sell|logs=30|chars=2000|cu=105000|invoke=8|data=1|plog=6|success=8",
+    "event=sell|logs=25|chars=2500|cu=125000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=20|chars=1500|cu=45000|invoke=6|data=1|plog=3|success=6",
+    "event=sell|logs=20|chars=1500|cu=70000|invoke=7|data=1|plog=3|success=7",
+    "event=sell|logs=20|chars=1500|cu=75000|invoke=7|data=1|plog=3|success=7",
+    "event=sell|logs=25|chars=2500|cu=100000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=20|chars=1500|cu=75000|invoke=6|data=1|plog=3|success=6",
+    "event=sell|logs=25|chars=2000|cu=70000|invoke=7|data=1|plog=4|success=7",
+  ]);
+
+
+// --------------------------------------------------
+// CATEGORY B — NEAR CLEAN
+//
+// Tiny observed KEEP contamination, but potentially
+// still economically worthwhile to filter.
+//
+// These remain SHADOW ONLY.
+// --------------------------------------------------
+
+const SHADOW_COHORT_2_NEAR_CLEAN_KEYS =
+  new Set([
+    "event=sell|logs=20|chars=1500|cu=55000|invoke=7|data=1|plog=3|success=7",
+    "event=sell|logs=25|chars=2000|cu=55000|invoke=8|data=1|plog=4|success=8",
+    "event=sell|logs=20|chars=1500|cu=50000|invoke=6|data=1|plog=3|success=6",
+    "event=sell|logs=25|chars=2000|cu=50000|invoke=9|data=1|plog=4|success=9",
   ]);
 
 function isMatureSmallTradeFingerprint(
@@ -1753,6 +1847,98 @@ function recordMatureSmallTradeShadowOutcome(
   } else {
     stats.shadowMatureWouldSkipKeep +=
       1;
+  }
+}
+
+function recordShadowCohort2Outcome(
+  category,
+  event
+) {
+  if (
+    category !== "clean" &&
+    category !== "near_clean"
+  ) {
+    return;
+  }
+
+  const prefix =
+    category === "clean"
+      ? "shadowCohort2Clean"
+      : "shadowCohort2NearClean";
+
+  if (
+    !event ||
+    event.event_type !== "sell"
+  ) {
+    stats[
+      `${prefix}EventTypeMismatch`
+    ] += 1;
+
+    return;
+  }
+
+  const currentThreshold =
+    effectiveMinSolAmount();
+
+  if (
+    !Number.isFinite(currentThreshold) ||
+    Math.abs(
+      currentThreshold -
+      SHADOW_COHORT_2_THRESHOLD_SOL
+    ) > 1e-12
+  ) {
+    stats[
+      `${prefix}ThresholdMismatch`
+    ] += 1;
+
+    return;
+  }
+
+  stats[`${prefix}Samples`] += 1;
+
+  const solAmount =
+    Number(event.sol_amount);
+
+  if (!Number.isFinite(solAmount)) {
+    stats[`${prefix}Unknown`] += 1;
+    return;
+  }
+
+  if (
+    solAmount <
+    SHADOW_COHORT_2_THRESHOLD_SOL
+  ) {
+    stats[`${prefix}Small`] += 1;
+    return;
+  }
+
+  stats[`${prefix}Keep`] += 1;
+
+  if (category !== "near_clean") {
+    return;
+  }
+
+  stats.shadowCohort2NearCleanKeepSolTotal +=
+    solAmount;
+
+  stats.shadowCohort2NearCleanKeepSolMax =
+    Math.max(
+      stats.shadowCohort2NearCleanKeepSolMax,
+      solAmount
+    );
+
+  if (solAmount < 0.075) {
+    stats.shadowCohort2NearCleanKeep005To0075 += 1;
+  } else if (solAmount < 0.10) {
+    stats.shadowCohort2NearCleanKeep0075To010 += 1;
+  } else if (solAmount < 0.25) {
+    stats.shadowCohort2NearCleanKeep010To025 += 1;
+  } else if (solAmount < 0.50) {
+    stats.shadowCohort2NearCleanKeep025To050 += 1;
+  } else if (solAmount < 1.0) {
+    stats.shadowCohort2NearCleanKeep050To100 += 1;
+  } else {
+    stats.shadowCohort2NearCleanKeep100Plus += 1;
   }
 }
 
@@ -4179,7 +4365,9 @@ function enqueueSignature(
   blockTime = null,
   prefilterMatchType = null,
   smallTradeShadowFingerprint = null,
-  matureSmallTradeWouldSkip = false
+  matureSmallTradeWouldSkip = false,
+  shadowCohort2Clean = false,
+  shadowCohort2NearClean = false
 ) {
   if (!signature) {
     return;
@@ -4230,8 +4418,7 @@ function enqueueSignature(
     // • "explicit"
     // • "program_id_only"
     //
-    // Observation only. This does not affect queue
-    // admission or production processing behavior.
+    // Observation only.
     // ----------------------------------------------
 
     prefilterMatchType,
@@ -4248,33 +4435,85 @@ function enqueueSignature(
     smallTradeShadowFingerprint,
 
     // ----------------------------------------------
-    // SHADOW MATURE SMALL-TRADE ALLOWLIST
+    // COHORT #1 — PRODUCTION SMALL-TRADE FILTER
     //
     // Frozen BEFORE getTransaction.
     //
-    // true means:
+    // This records whether the websocket fingerprint
+    // belongs to the original frozen Cohort #1.
     //
-    // • This websocket fingerprint had already
-    //   reached the mature-shadow requirements.
-    // • A future production pre-RPC filter WOULD
-    //   have skipped this transaction.
+    // Production filtering itself happens BEFORE
+    // enqueueSignature() is called. Therefore any
+    // Cohort #1 transaction reaching this queue was
+    // intentionally allowed through because:
     //
-    // IMPORTANT:
-    //
-    // This value is diagnostic only.
-    // The signature is STILL queued and hydrated
-    // normally so we can verify the real outcome.
+    // • Production filtering is disabled, or
+    // • The active threshold does not match.
     // ----------------------------------------------
 
     matureSmallTradeWouldSkip:
       matureSmallTradeWouldSkip === true,
+
+    // ----------------------------------------------
+    // COHORT #2 — CLEAN SHADOW HOLDOUT
+    //
+    // Frozen BEFORE getTransaction.
+    //
+    // true means the websocket fingerprint belongs
+    // to the frozen CLEAN Cohort #2 category.
+    //
+    // CLEAN fingerprints had:
+    //
+    // • Zero observed KEEP outcomes at freeze time.
+    // • Zero observed UNKNOWN outcomes.
+    //
+    // IMPORTANT:
+    //
+    // Cohort #2 is SHADOW ONLY.
+    // These signatures remain queued and hydrated
+    // normally so their forward outcomes can be
+    // independently measured.
+    // ----------------------------------------------
+
+    shadowCohort2Clean:
+      shadowCohort2Clean === true,
+
+    // ----------------------------------------------
+    // COHORT #2 — NEAR-CLEAN SHADOW HOLDOUT
+    //
+    // Frozen BEFORE getTransaction.
+    //
+    // true means the websocket fingerprint belongs
+    // to the frozen NEAR-CLEAN Cohort #2 category.
+    //
+    // NEAR-CLEAN fingerprints may have produced a
+    // very small number of KEEP outcomes during
+    // discovery but may still provide worthwhile
+    // RPC savings.
+    //
+    // IMPORTANT:
+    //
+    // Cohort #2 is SHADOW ONLY.
+    // These signatures remain queued and hydrated
+    // normally so we can measure:
+    //
+    // • SMALL outcomes
+    // • KEEP outcomes
+    // • UNKNOWN outcomes
+    // • False-positive rate
+    // • Actual SOL size of KEEP transactions
+    //
+    // No production filtering occurs here.
+    // ----------------------------------------------
+
+    shadowCohort2NearClean:
+      shadowCohort2NearClean === true,
 
     enqueuedAt: Date.now(),
   });
 
   stats.queued += 1;
 }
-
 // ==================================================
 // GLOBAL HELIUS RPC PACER
 //
@@ -13316,6 +13555,19 @@ if (
   item.smallTradeShadowFingerprint,
   event
 );
+    if (item.shadowCohort2Clean) {
+  recordShadowCohort2Outcome(
+    "clean",
+    event
+  );
+}
+
+if (item.shadowCohort2NearClean) {
+  recordShadowCohort2Outcome(
+    "near_clean",
+    event
+  );
+}
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
@@ -13930,6 +14182,22 @@ const matureSmallTradeWouldSkip =
   isMatureSmallTradeFingerprint(
     smallTradeShadowFingerprint
   );
+
+      const shadowCohort2Clean =
+  Boolean(
+    smallTradeShadowFingerprint?.key &&
+    SHADOW_COHORT_2_CLEAN_KEYS.has(
+      smallTradeShadowFingerprint.key
+    )
+  );
+
+const shadowCohort2NearClean =
+  Boolean(
+    smallTradeShadowFingerprint?.key &&
+    SHADOW_COHORT_2_NEAR_CLEAN_KEYS.has(
+      smallTradeShadowFingerprint.key
+    )
+  );
       // ----------------------------------------------
 // PRODUCTION SMALL-TRADE PRE-RPC FILTER
 //
@@ -13970,7 +14238,9 @@ enqueueSignature(
   value.blockTime || null,
   prefilterMatchType,
   smallTradeShadowFingerprint,
-  matureSmallTradeWouldSkip
+  matureSmallTradeWouldSkip,
+  shadowCohort2Clean,
+  shadowCohort2NearClean
 );
     } catch (error) {
       logError(
@@ -16175,6 +16445,181 @@ shadowSmallTradePrefilter: {
   },
 
   ...getSmallTradeShadowSummary(),
+},
+
+// --------------------------------------
+// SHADOW SMALL-TRADE COHORT #2
+//
+// Independent forward holdout for:
+//
+// • CLEAN fingerprints
+// • NEAR-CLEAN fingerprints
+//
+// Observation only.
+// Cohort #2 does NOT filter pre-RPC.
+// --------------------------------------
+
+shadowSmallTradeCohort2: {
+  thresholdSol:
+    SHADOW_COHORT_2_THRESHOLD_SOL,
+
+  clean: {
+    frozenFingerprints:
+      SHADOW_COHORT_2_CLEAN_KEYS.size,
+
+    samples:
+      stats.shadowCohort2CleanSamples,
+
+    small:
+      stats.shadowCohort2CleanSmall,
+
+    keep:
+      stats.shadowCohort2CleanKeep,
+
+    unknown:
+      stats.shadowCohort2CleanUnknown,
+
+    precisionPct:
+      (
+        stats.shadowCohort2CleanSmall +
+        stats.shadowCohort2CleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort2CleanSmall /
+              (
+                stats.shadowCohort2CleanSmall +
+                stats.shadowCohort2CleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    falsePositivePct:
+      (
+        stats.shadowCohort2CleanSmall +
+        stats.shadowCohort2CleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort2CleanKeep /
+              (
+                stats.shadowCohort2CleanSmall +
+                stats.shadowCohort2CleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    thresholdMismatch:
+      stats.shadowCohort2CleanThresholdMismatch,
+
+    eventTypeMismatch:
+      stats.shadowCohort2CleanEventTypeMismatch,
+  },
+
+  nearClean: {
+    frozenFingerprints:
+      SHADOW_COHORT_2_NEAR_CLEAN_KEYS.size,
+
+    samples:
+      stats.shadowCohort2NearCleanSamples,
+
+    small:
+      stats.shadowCohort2NearCleanSmall,
+
+    keep:
+      stats.shadowCohort2NearCleanKeep,
+
+    unknown:
+      stats.shadowCohort2NearCleanUnknown,
+
+    precisionPct:
+      (
+        stats.shadowCohort2NearCleanSmall +
+        stats.shadowCohort2NearCleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort2NearCleanSmall /
+              (
+                stats.shadowCohort2NearCleanSmall +
+                stats.shadowCohort2NearCleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    falsePositivePct:
+      (
+        stats.shadowCohort2NearCleanSmall +
+        stats.shadowCohort2NearCleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort2NearCleanKeep /
+              (
+                stats.shadowCohort2NearCleanSmall +
+                stats.shadowCohort2NearCleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    thresholdMismatch:
+      stats.shadowCohort2NearCleanThresholdMismatch,
+
+    eventTypeMismatch:
+      stats.shadowCohort2NearCleanEventTypeMismatch,
+
+    keepSol: {
+      total:
+        Number(
+          stats.shadowCohort2NearCleanKeepSolTotal
+            .toFixed(6)
+        ),
+
+      average:
+        stats.shadowCohort2NearCleanKeep > 0
+          ? Number(
+              (
+                stats.shadowCohort2NearCleanKeepSolTotal /
+                stats.shadowCohort2NearCleanKeep
+              ).toFixed(6)
+            )
+          : null,
+
+      max:
+        stats.shadowCohort2NearCleanKeep > 0
+          ? Number(
+              stats.shadowCohort2NearCleanKeepSolMax
+                .toFixed(6)
+            )
+          : null,
+
+      "0.05To0.075":
+        stats.shadowCohort2NearCleanKeep005To0075,
+
+      "0.075To0.10":
+        stats.shadowCohort2NearCleanKeep0075To010,
+
+      "0.10To0.25":
+        stats.shadowCohort2NearCleanKeep010To025,
+
+      "0.25To0.50":
+        stats.shadowCohort2NearCleanKeep025To050,
+
+      "0.50To1.00":
+        stats.shadowCohort2NearCleanKeep050To100,
+
+      "1.00Plus":
+        stats.shadowCohort2NearCleanKeep100Plus,
+    },
+  },
 },
 
 // --------------------------------------

@@ -1056,6 +1056,15 @@ shadowMatureSellSamples: 0,
 shadowMatureThresholdMismatch: 0,
 shadowMatureEventTypeMismatch: 0,
 
+// ==========================================
+// PRODUCTION SMALL-TRADE PRE-RPC FILTER
+// ==========================================
+
+smallTradePreRpcCandidates: 0,
+smallTradePreRpcSkipped: 0,
+smallTradePreRpcBypassedDisabled: 0,
+smallTradePreRpcBypassedThreshold: 0,
+
   // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
@@ -1324,6 +1333,23 @@ const SHADOW_SMALL_TRADE_MAX_FINGERPRINTS =
 
 const SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL =
   0.05;
+
+// ==================================================
+// PRODUCTION SMALL-TRADE PRE-RPC FILTER
+//
+// Kill switch for the frozen fingerprint cohort.
+//
+// Safety rules:
+// • Exact frozen fingerprint match only.
+// • Active minimum SOL threshold must still be 0.05.
+// • If either condition fails, hydrate normally.
+// ==================================================
+
+const SMALL_TRADE_PRE_RPC_FILTER_ENABLED =
+  String(
+    process.env.SMALL_TRADE_PRE_RPC_FILTER_ENABLED ||
+    "false"
+  ) === "true";
 
 const SHADOW_MATURE_HOLDOUT_KEYS =
   new Set([
@@ -13904,6 +13930,39 @@ const matureSmallTradeWouldSkip =
   isMatureSmallTradeFingerprint(
     smallTradeShadowFingerprint
   );
+      // ----------------------------------------------
+// PRODUCTION SMALL-TRADE PRE-RPC FILTER
+//
+// Reject ONLY the exact frozen cohort, and ONLY
+// while the active production threshold remains
+// exactly the threshold used to validate it.
+//
+// This return happens before enqueueSignature(),
+// so the transaction never reaches getTransaction.
+// ----------------------------------------------
+
+if (matureSmallTradeWouldSkip) {
+  stats.smallTradePreRpcCandidates += 1;
+
+  const currentThreshold =
+    effectiveMinSolAmount();
+
+  const thresholdMatches =
+    Number.isFinite(currentThreshold) &&
+    Math.abs(
+      currentThreshold -
+      SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL
+    ) <= 1e-12;
+
+  if (!SMALL_TRADE_PRE_RPC_FILTER_ENABLED) {
+    stats.smallTradePreRpcBypassedDisabled += 1;
+  } else if (!thresholdMatches) {
+    stats.smallTradePreRpcBypassedThreshold += 1;
+  } else {
+    stats.smallTradePreRpcSkipped += 1;
+    return;
+  }
+}
 
 enqueueSignature(
   value.signature,
@@ -16127,7 +16186,48 @@ shadowSmallTradePrefilter: {
 // Observation only.
 // Transactions are still hydrated normally.
 // --------------------------------------
+productionSmallTradePreRpcFilter: {
+  enabled:
+    SMALL_TRADE_PRE_RPC_FILTER_ENABLED,
 
+  thresholdSol:
+    SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL,
+
+  activeMinSolThreshold:
+    effectiveMinSolAmount(),
+
+  frozenFingerprints:
+    SHADOW_MATURE_HOLDOUT_KEYS.size,
+
+  candidates:
+    stats.smallTradePreRpcCandidates,
+
+  skippedBeforeRpc:
+    stats.smallTradePreRpcSkipped,
+
+  bypassedDisabled:
+    stats.smallTradePreRpcBypassedDisabled,
+
+  bypassedThresholdMismatch:
+    stats.smallTradePreRpcBypassedThreshold,
+
+  observedRpcSavingsPct:
+    (
+      stats.rpcFetchSamples +
+      stats.smallTradePreRpcSkipped
+    ) > 0
+      ? Number(
+          (
+            100 *
+            stats.smallTradePreRpcSkipped /
+            (
+              stats.rpcFetchSamples +
+              stats.smallTradePreRpcSkipped
+            )
+          ).toFixed(3)
+        )
+      : 0,
+},
 shadowMatureSmallTradePrefilter:
   getMatureSmallTradeShadowSummary(),
 

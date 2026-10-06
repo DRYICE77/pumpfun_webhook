@@ -1033,6 +1033,29 @@ slowTokenUpsertWithDepth3Plus: 0,
 slowTokenUpsertDurationTotalMs: 0,
 slowTokenUpsertDurationMaxMs: 0,
 
+    // ==========================================
+  // SHADOW MATURE SMALL-TRADE ALLOWLIST
+  //
+  // Measures transactions that WOULD have been
+  // skipped pre-RPC if a mature fingerprint
+  // filter were enabled.
+  //
+  // Observation only:
+  // • Does NOT reject signatures.
+  // • Transactions are still hydrated normally.
+  // ==========================================
+
+shadowMatureWouldSkipSamples: 0,
+shadowMatureWouldSkipSmall: 0,
+shadowMatureWouldSkipKeep: 0,
+shadowMatureWouldSkipUnknown: 0,
+
+shadowMatureBuySamples: 0,
+shadowMatureSellSamples: 0,
+
+shadowMatureThresholdMismatch: 0,
+shadowMatureEventTypeMismatch: 0,
+
   // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
@@ -1262,6 +1285,70 @@ const shadowSmallTradeFingerprints =
 
 const SHADOW_SMALL_TRADE_MAX_FINGERPRINTS =
   2500;
+
+// ==================================================
+// SHADOW MATURE SMALL-TRADE ALLOWLIST
+//
+// A fingerprint becomes shadow-eligible only after:
+//
+// • At least 1,000 hydrated observations
+// • ZERO observed KEEP transactions
+// • ZERO unknown outcomes
+// • At least 60 minutes of observation
+//
+// IMPORTANT:
+//
+// This does NOT filter anything.
+// It only marks transactions that WOULD have been
+// skipped if the mature pre-RPC filter were live.
+// ==================================================
+
+// ==================================================
+// FROZEN MATURE SMALL-TRADE HOLDOUT
+//
+// These fingerprints were selected from the PRIOR
+// discovery run only.
+//
+// From this deployment forward they form a FIXED
+// cohort.
+//
+// IMPORTANT:
+//
+// • Membership NEVER changes during this run.
+// • A later KEEP does NOT remove a fingerprint.
+// • Current discovery statistics do NOT affect
+//   membership.
+// • Observation only — transactions are still
+//   hydrated normally.
+// ==================================================
+
+const SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL =
+  0.05;
+
+const SHADOW_MATURE_HOLDOUT_KEYS =
+  new Set([
+    "event=sell|logs=25|chars=2500|cu=110000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=25|chars=2500|cu=105000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=25|chars=2500|cu=115000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=20|chars=1500|cu=50000|invoke=7|data=1|plog=3|success=7",
+    "event=sell|logs=30|chars=2000|cu=95000|invoke=8|data=1|plog=6|success=8",
+    "event=sell|logs=25|chars=2000|cu=50000|invoke=8|data=1|plog=3|success=8",
+    "event=sell|logs=30|chars=2000|cu=100000|invoke=8|data=1|plog=6|success=8",
+    "event=sell|logs=25|chars=2500|cu=120000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=30|chars=2000|cu=90000|invoke=8|data=1|plog=6|success=8",
+    "event=sell|logs=25|chars=2000|cu=50000|invoke=8|data=1|plog=4|success=8",
+  ]);
+
+function isMatureSmallTradeFingerprint(
+  fingerprint
+) {
+  return Boolean(
+    fingerprint?.key &&
+    SHADOW_MATURE_HOLDOUT_KEYS.has(
+      fingerprint.key
+    )
+  );
+}
 
 function buildSmallTradeShadowFingerprint(
   value
@@ -1560,6 +1647,89 @@ if (
 }
 }
 
+function recordMatureSmallTradeShadowOutcome(
+  wouldSkip,
+  fingerprint,
+  event
+) {
+  if (!wouldSkip) {
+    return;
+  }
+
+  // ----------------------------------------------
+  // EVENT-TYPE SAFETY CHECK
+  //
+  // Every frozen candidate was selected as a SELL
+  // fingerprint. If hydration says otherwise, make
+  // that discrepancy visible.
+  // ----------------------------------------------
+
+  if (
+    !event ||
+    event.event_type !== "sell"
+  ) {
+    stats.shadowMatureEventTypeMismatch +=
+      1;
+
+    return;
+  }
+
+  // ----------------------------------------------
+  // THRESHOLD CONSISTENCY CHECK
+  //
+  // The frozen cohort was discovered against a
+  // 0.05 SOL production threshold.
+  //
+  // Do not mix observations from another threshold
+  // into this holdout experiment.
+  // ----------------------------------------------
+
+  const currentThreshold =
+    effectiveMinSolAmount();
+
+  if (
+    !Number.isFinite(currentThreshold) ||
+    Math.abs(
+      currentThreshold -
+      SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL
+    ) > 1e-12
+  ) {
+    stats.shadowMatureThresholdMismatch +=
+      1;
+
+    return;
+  }
+
+  stats.shadowMatureWouldSkipSamples +=
+    1;
+
+  stats.shadowMatureSellSamples +=
+    1;
+
+  const solAmount =
+    Number(
+      event.sol_amount
+    );
+
+  if (!Number.isFinite(solAmount)) {
+    stats.shadowMatureWouldSkipUnknown +=
+      1;
+
+    return;
+  }
+
+  if (
+    solAmount <
+    SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL
+  ) {
+    stats.shadowMatureWouldSkipSmall +=
+      1;
+  } else {
+    stats.shadowMatureWouldSkipKeep +=
+      1;
+  }
+}
+
 function getSmallTradeShadowSummary() {
   const allRows =
     Array.from(
@@ -1611,6 +1781,9 @@ function getSmallTradeShadowSummary() {
           a.samples
         );
       });
+
+
+
 
   // ----------------------------------------------
   // ZERO-FALSE-POSITIVE COVERAGE
@@ -1913,6 +2086,89 @@ function getSmallTradeShadowSummary() {
       rows.slice(0, 15),
   };
 }
+
+function getMatureSmallTradeShadowSummary() {
+  const samples =
+    stats.shadowMatureWouldSkipSamples;
+
+  const small =
+    stats.shadowMatureWouldSkipSmall;
+
+  const keep =
+    stats.shadowMatureWouldSkipKeep;
+
+  const unknown =
+    stats.shadowMatureWouldSkipUnknown;
+
+  return {
+    mode:
+      "frozen_holdout",
+
+    thresholdSol:
+      SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL,
+
+    frozenFingerprints:
+      SHADOW_MATURE_HOLDOUT_KEYS.size,
+
+    wouldSkipSamples:
+      samples,
+
+    wouldSkipSmall:
+      small,
+
+    wouldSkipKeep:
+      keep,
+
+    wouldSkipUnknown:
+      unknown,
+
+    buySamples:
+      stats.shadowMatureBuySamples,
+
+    sellSamples:
+      stats.shadowMatureSellSamples,
+
+    thresholdMismatch:
+      stats.shadowMatureThresholdMismatch,
+
+    eventTypeMismatch:
+      stats.shadowMatureEventTypeMismatch,
+
+    precisionPct:
+      samples > 0
+        ? Number(
+            (
+              100 *
+              small /
+              samples
+            ).toFixed(5)
+          )
+        : null,
+
+    falsePositivePct:
+      samples > 0
+        ? Number(
+            (
+              100 *
+              keep /
+              samples
+            ).toFixed(5)
+          )
+        : null,
+
+    observedTotalRpcSavingsPct:
+      stats.rpcFetchSamples > 0
+        ? Number(
+            (
+              100 *
+              samples /
+              stats.rpcFetchSamples
+            ).toFixed(3)
+          )
+        : null,
+  };
+}
+
 
 // ==================================================
 // 6A. PERFORMANCE DIAGNOSTICS
@@ -3896,7 +4152,8 @@ function enqueueSignature(
   slot = null,
   blockTime = null,
   prefilterMatchType = null,
-  smallTradeShadowFingerprint = null
+  smallTradeShadowFingerprint = null,
+  matureSmallTradeWouldSkip = false
 ) {
   if (!signature) {
     return;
@@ -3953,7 +4210,7 @@ function enqueueSignature(
 
     prefilterMatchType,
 
-        // ----------------------------------------------
+    // ----------------------------------------------
     // SHADOW SMALL-TRADE PREFILTER EXPERIMENT
     //
     // Compact websocket-only metadata captured
@@ -3963,6 +4220,28 @@ function enqueueSignature(
     // ----------------------------------------------
 
     smallTradeShadowFingerprint,
+
+    // ----------------------------------------------
+    // SHADOW MATURE SMALL-TRADE ALLOWLIST
+    //
+    // Frozen BEFORE getTransaction.
+    //
+    // true means:
+    //
+    // • This websocket fingerprint had already
+    //   reached the mature-shadow requirements.
+    // • A future production pre-RPC filter WOULD
+    //   have skipped this transaction.
+    //
+    // IMPORTANT:
+    //
+    // This value is diagnostic only.
+    // The signature is STILL queued and hydrated
+    // normally so we can verify the real outcome.
+    // ----------------------------------------------
+
+    matureSmallTradeWouldSkip:
+      matureSmallTradeWouldSkip === true,
 
     enqueuedAt: Date.now(),
   });
@@ -13005,6 +13284,12 @@ if (
       item.smallTradeShadowFingerprint,
       event
     );
+
+  recordMatureSmallTradeShadowOutcome(
+  item.matureSmallTradeWouldSkip,
+  item.smallTradeShadowFingerprint,
+  event
+);
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
@@ -13602,12 +13887,31 @@ const smallTradeShadowFingerprint =
     value
   );
 
+// ----------------------------------------------
+// SHADOW MATURE SMALL-TRADE ALLOWLIST
+//
+// Determine, using ONLY pre-RPC websocket data,
+// whether this fingerprint is mature enough that
+// a future production filter WOULD skip it.
+//
+// IMPORTANT:
+// • Observation only.
+// • Does NOT reject the signature.
+// • Transaction is still hydrated normally.
+// ----------------------------------------------
+
+const matureSmallTradeWouldSkip =
+  isMatureSmallTradeFingerprint(
+    smallTradeShadowFingerprint
+  );
+
 enqueueSignature(
   value.signature,
   context?.slot || null,
   value.blockTime || null,
   prefilterMatchType,
-  smallTradeShadowFingerprint
+  smallTradeShadowFingerprint,
+  matureSmallTradeWouldSkip
 );
     } catch (error) {
       logError(
@@ -15776,7 +16080,7 @@ shadowWebsocketPrefilter: {
     stats.shadowProgramIdOnlyOtherRejected,
 },
 
-            shadowSmallTradePrefilter: {
+shadowSmallTradePrefilter: {
   samples:
     stats.shadowSmallTradeSamples,
 
@@ -15815,13 +16119,26 @@ shadowWebsocketPrefilter: {
 },
 
 // --------------------------------------
+// SHADOW MATURE SMALL-TRADE ALLOWLIST
+//
+// Measures transactions that a future
+// mature pre-RPC filter WOULD have skipped.
+//
+// Observation only.
+// Transactions are still hydrated normally.
+// --------------------------------------
+
+shadowMatureSmallTradePrefilter:
+  getMatureSmallTradeShadowSummary(),
+
+
+// --------------------------------------
 // PRESERVE ALL RAW CUMULATIVE COUNTERS
 // --------------------------------------
 
 ...stats,
           }
         );
-
         // ==========================================
         // UPDATE INTERVAL BASELINE
         //

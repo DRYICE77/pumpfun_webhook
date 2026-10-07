@@ -1434,7 +1434,7 @@ const SHADOW_MATURE_HOLDOUT_KEYS =
 // Discovery observations before this deployment
 // DO NOT count toward these results.
 //
-// // CLEAN may participate in production pre-RPC filtering
+// CLEAN may participate in production pre-RPC filtering
 // through the shared production kill switch.
 //
 // NEAR CLEAN remains shadow only.
@@ -1514,6 +1514,93 @@ const SHADOW_COHORT_3_CLEAN_KEYS =
     "event=sell|logs=25|chars=2500|cu=135000|invoke=8|data=2|plog=4|success=8",
     "event=sell|logs=35|chars=2500|cu=55000|invoke=11|data=1|plog=4|success=11",
   ]);
+
+// ==================================================
+// FROZEN SMALL-TRADE COHORT OVERLAP ASSERTION
+//
+// Safety invariant:
+//
+// Every frozen experimental cohort must contain
+// unique fingerprints.
+//
+// If a fingerprint is accidentally assigned to more
+// than one cohort, fail immediately at startup rather
+// than silently contaminating forward validation.
+//
+// Startup-only check:
+// • No hot-path cost.
+// • No RPC calls.
+// • No database work.
+// • No production filtering changes.
+// ==================================================
+
+function findSmallTradeCohortOverlap(
+  cohortA,
+  cohortB
+) {
+  return [...cohortA].filter(
+    key => cohortB.has(key)
+  );
+}
+
+const SMALL_TRADE_FROZEN_COHORTS = [
+  [
+    "Cohort #1",
+    SHADOW_MATURE_HOLDOUT_KEYS,
+  ],
+  [
+    "Cohort #2 CLEAN",
+    SHADOW_COHORT_2_CLEAN_KEYS,
+  ],
+  [
+    "Cohort #2 NEAR CLEAN",
+    SHADOW_COHORT_2_NEAR_CLEAN_KEYS,
+  ],
+  [
+    "Cohort #3 CLEAN",
+    SHADOW_COHORT_3_CLEAN_KEYS,
+  ],
+];
+
+for (
+  let i = 0;
+  i < SMALL_TRADE_FROZEN_COHORTS.length;
+  i += 1
+) {
+  for (
+    let j = i + 1;
+    j < SMALL_TRADE_FROZEN_COHORTS.length;
+    j += 1
+  ) {
+    const [
+      cohortAName,
+      cohortAKeys,
+    ] =
+      SMALL_TRADE_FROZEN_COHORTS[i];
+
+    const [
+      cohortBName,
+      cohortBKeys,
+    ] =
+      SMALL_TRADE_FROZEN_COHORTS[j];
+
+    const overlap =
+      findSmallTradeCohortOverlap(
+        cohortAKeys,
+        cohortBKeys
+      );
+
+    if (overlap.length > 0) {
+      throw new Error(
+        [
+          "Frozen small-trade cohort overlap detected.",
+          `${cohortAName} <-> ${cohortBName}`,
+          `Overlapping fingerprints: ${overlap.join(", ")}`,
+        ].join(" ")
+      );
+    }
+  }
+}
 
 // ==================================================
 // PER-FINGERPRINT FORWARD OUTCOME DIAGNOSTICS
@@ -2223,6 +2310,48 @@ function recordShadowCohort3Outcome(
 }
 
 
+
+
+
+// ==================================================
+// SHADOW SMALL-TRADE SUMMARY
+//
+// Summarizes websocket-only fingerprint performance
+// against hydrated SMALL / KEEP outcomes.
+//
+// Diagnostic only:
+// • No filtering changes.
+// • No RPC calls.
+// • No database work.
+// ==================================================
+
+function getSmallTradeShadowSummary() {
+  const allRows =
+    Array.from(
+      shadowSmallTradeFingerprints.values()
+    );
+
+  // ----------------------------------------------
+  // TOP SMALL FINGERPRINTS
+  //
+  // Rank primarily by observed SMALL volume.
+  // KEEP count breaks ties toward cleaner patterns.
+  // ----------------------------------------------
+
+  const rows =
+    [...allRows].sort(
+      (a, b) => {
+        if (b.small !== a.small) {
+          return b.small - a.small;
+        }
+
+        if (a.keep !== b.keep) {
+          return a.keep - b.keep;
+        }
+
+        return b.samples - a.samples;
+      }
+    );
 
   // ----------------------------------------------
   // ZERO-FALSE-POSITIVE COVERAGE

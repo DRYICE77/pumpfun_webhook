@@ -1434,7 +1434,10 @@ const SHADOW_MATURE_HOLDOUT_KEYS =
 // Discovery observations before this deployment
 // DO NOT count toward these results.
 //
-// Neither category affects production filtering.
+// // CLEAN may participate in production pre-RPC filtering
+// through the shared production kill switch.
+//
+// NEAR CLEAN remains shadow only.
 // ==================================================
 
 const SHADOW_COHORT_2_THRESHOLD_SOL =
@@ -1499,7 +1502,7 @@ const SHADOW_COHORT_3_THRESHOLD_SOL =
 
 const SHADOW_COHORT_3_CLEAN_KEYS =
   new Set([
-    "event=sell|logs=25|chars=2000|cu=50000|invoke=9|data=1|plog=4|success=9",
+
     "event=sell|logs=25|chars=2500|cu=130000|invoke=8|data=2|plog=4|success=8",
     "event=sell|logs=25|chars=2000|cu=55000|invoke=9|data=1|plog=4|success=9",
     "event=sell|logs=15|chars=1500|cu=50000|invoke=4|data=1|plog=3|success=4",
@@ -1509,7 +1512,65 @@ const SHADOW_COHORT_3_CLEAN_KEYS =
     "event=sell|logs=35|chars=2500|cu=60000|invoke=11|data=1|plog=4|success=11",
     "event=sell|logs=15|chars=1500|cu=50000|invoke=5|data=1|plog=3|success=5",
     "event=sell|logs=25|chars=2500|cu=135000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=35|chars=2500|cu=55000|invoke=11|data=1|plog=4|success=11",
   ]);
+
+// ==================================================
+// PER-FINGERPRINT FORWARD OUTCOME DIAGNOSTICS
+//
+// Attribution only.
+//
+// Tracks each frozen fingerprint independently so
+// aggregate KEEP contamination can be traced back to
+// the exact fingerprint that produced it.
+//
+// IMPORTANT:
+// • Counters begin at zero on every deployment.
+// • No production filtering behavior is changed.
+// • No RPC calls are added.
+// • No database work is added.
+// ==================================================
+
+function makeSmallTradeFingerprintOutcomeRow(key) {
+  return {
+    key,
+
+    samples: 0,
+    small: 0,
+    keep: 0,
+    unknown: 0,
+
+    keepSolTotal: 0,
+    keepSolMax: 0,
+
+    keep005To0075: 0,
+    keep0075To010: 0,
+    keep010To025: 0,
+    keep025To050: 0,
+    keep050To100: 0,
+    keep100Plus: 0,
+  };
+}
+
+const shadowCohort2NearCleanByFingerprint =
+  new Map(
+    [...SHADOW_COHORT_2_NEAR_CLEAN_KEYS].map(
+      key => [
+        key,
+        makeSmallTradeFingerprintOutcomeRow(key),
+      ]
+    )
+  );
+
+const shadowCohort3CleanByFingerprint =
+  new Map(
+    [...SHADOW_COHORT_3_CLEAN_KEYS].map(
+      key => [
+        key,
+        makeSmallTradeFingerprintOutcomeRow(key),
+      ]
+    )
+  );
 
 function isMatureSmallTradeFingerprint(
   fingerprint
@@ -1904,6 +1965,7 @@ function recordMatureSmallTradeShadowOutcome(
 
 function recordShadowCohort2Outcome(
   category,
+  fingerprint,
   event
 ) {
   if (
@@ -1948,11 +2010,38 @@ function recordShadowCohort2Outcome(
 
   stats[`${prefix}Samples`] += 1;
 
+  // ----------------------------------------------
+  // PER-FINGERPRINT ATTRIBUTION
+  //
+  // NearClean only.
+  // Aggregate counters above remain unchanged.
+  // ----------------------------------------------
+
+  const fingerprintKey =
+    fingerprint?.key || null;
+
+  const fingerprintRow =
+    category === "near_clean" &&
+    fingerprintKey
+      ? shadowCohort2NearCleanByFingerprint.get(
+          fingerprintKey
+        )
+      : null;
+
+  if (fingerprintRow) {
+    fingerprintRow.samples += 1;
+  }
+
   const solAmount =
     Number(event.sol_amount);
 
   if (!Number.isFinite(solAmount)) {
     stats[`${prefix}Unknown`] += 1;
+
+    if (fingerprintRow) {
+      fingerprintRow.unknown += 1;
+    }
+
     return;
   }
 
@@ -1961,10 +2050,42 @@ function recordShadowCohort2Outcome(
     SHADOW_COHORT_2_THRESHOLD_SOL
   ) {
     stats[`${prefix}Small`] += 1;
+
+    if (fingerprintRow) {
+      fingerprintRow.small += 1;
+    }
+
     return;
   }
 
   stats[`${prefix}Keep`] += 1;
+
+  if (fingerprintRow) {
+    fingerprintRow.keep += 1;
+
+    fingerprintRow.keepSolTotal +=
+      solAmount;
+
+    fingerprintRow.keepSolMax =
+      Math.max(
+        fingerprintRow.keepSolMax,
+        solAmount
+      );
+
+    if (solAmount < 0.075) {
+      fingerprintRow.keep005To0075 += 1;
+    } else if (solAmount < 0.10) {
+      fingerprintRow.keep0075To010 += 1;
+    } else if (solAmount < 0.25) {
+      fingerprintRow.keep010To025 += 1;
+    } else if (solAmount < 0.50) {
+      fingerprintRow.keep025To050 += 1;
+    } else if (solAmount < 1.0) {
+      fingerprintRow.keep050To100 += 1;
+    } else {
+      fingerprintRow.keep100Plus += 1;
+    }
+  }
 
   if (category !== "near_clean") {
     return;
@@ -1996,9 +2117,15 @@ function recordShadowCohort2Outcome(
 
 // ==================================================
 // SHADOW COHORT #3 OUTCOME RECORDER
+//
+// Aggregate counters remain unchanged.
+// Per-fingerprint counters provide attribution only.
 // ==================================================
 
-function recordShadowCohort3Outcome(event) {
+function recordShadowCohort3Outcome(
+  fingerprint,
+  event
+) {
   if (
     !event ||
     event.event_type !== "sell"
@@ -2023,11 +2150,30 @@ function recordShadowCohort3Outcome(event) {
 
   stats.shadowCohort3CleanSamples += 1;
 
+  const fingerprintKey =
+    fingerprint?.key || null;
+
+  const fingerprintRow =
+    fingerprintKey
+      ? shadowCohort3CleanByFingerprint.get(
+          fingerprintKey
+        )
+      : null;
+
+  if (fingerprintRow) {
+    fingerprintRow.samples += 1;
+  }
+
   const solAmount =
     Number(event.sol_amount);
 
   if (!Number.isFinite(solAmount)) {
     stats.shadowCohort3CleanUnknown += 1;
+
+    if (fingerprintRow) {
+      fingerprintRow.unknown += 1;
+    }
+
     return;
   }
 
@@ -2036,63 +2182,45 @@ function recordShadowCohort3Outcome(event) {
     SHADOW_COHORT_3_THRESHOLD_SOL
   ) {
     stats.shadowCohort3CleanSmall += 1;
-  } else {
-    stats.shadowCohort3CleanKeep += 1;
-  }
-}
 
-function getSmallTradeShadowSummary() {
-  const allRows =
-    Array.from(
-      shadowSmallTradeFingerprints.values()
+    if (fingerprintRow) {
+      fingerprintRow.small += 1;
+    }
+
+    return;
+  }
+
+  stats.shadowCohort3CleanKeep += 1;
+
+  if (!fingerprintRow) {
+    return;
+  }
+
+  fingerprintRow.keep += 1;
+
+  fingerprintRow.keepSolTotal +=
+    solAmount;
+
+  fingerprintRow.keepSolMax =
+    Math.max(
+      fingerprintRow.keepSolMax,
+      solAmount
     );
 
-  // ----------------------------------------------
-  // TOP SMALL FINGERPRINTS
-  // ----------------------------------------------
-
-  const rows =
-    allRows
-      .filter(
-        row =>
-          row.samples >= 10
-      )
-      .map(row => {
-        const known =
-          row.small + row.keep;
-
-        return {
-          ...row,
-
-          smallPct:
-            known > 0
-              ? Number(
-                  (
-                    100 *
-                    row.small /
-                    known
-                  ).toFixed(3)
-                )
-              : null,
-        };
-      })
-      .sort((a, b) => {
-        if (
-          b.smallPct !==
-          a.smallPct
-        ) {
-          return (
-            (b.smallPct || 0) -
-            (a.smallPct || 0)
-          );
-        }
-
-        return (
-          b.samples -
-          a.samples
-        );
-      });
-
+  if (solAmount < 0.075) {
+    fingerprintRow.keep005To0075 += 1;
+  } else if (solAmount < 0.10) {
+    fingerprintRow.keep0075To010 += 1;
+  } else if (solAmount < 0.25) {
+    fingerprintRow.keep010To025 += 1;
+  } else if (solAmount < 0.50) {
+    fingerprintRow.keep025To050 += 1;
+  } else if (solAmount < 1.0) {
+    fingerprintRow.keep050To100 += 1;
+  } else {
+    fingerprintRow.keep100Plus += 1;
+  }
+}
 
 
 
@@ -13639,35 +13767,37 @@ if (
 
     const token =
       classified.tokenUpsert;
-    // ==============================================
-    // SHADOW SMALL-TRADE PREFILTER OUTCOME
-    //
-    // Compare the PRE-RPC websocket fingerprint
-    // against the hydrated transaction's actual
-    // event type and SOL amount.
-    //
-    // IMPORTANT:
-    //
-    // This happens BEFORE production's minimum-SOL
-    // rejection so both SMALL and KEEP populations
-    // are measured.
-    //
-    // Observation only.
-    // ==============================================
+// ==============================================
+// SHADOW SMALL-TRADE PREFILTER OUTCOME
+//
+// Compare the PRE-RPC websocket fingerprint
+// against the hydrated transaction's actual
+// event type and SOL amount.
+//
+// IMPORTANT:
+//
+// This happens BEFORE production's minimum-SOL
+// rejection so both SMALL and KEEP populations
+// are measured.
+//
+// Observation only.
+// ==============================================
 
-    recordSmallTradeShadowOutcome(
-      item.smallTradeShadowFingerprint,
-      event
-    );
+recordSmallTradeShadowOutcome(
+  item.smallTradeShadowFingerprint,
+  event
+);
 
-  recordMatureSmallTradeShadowOutcome(
+recordMatureSmallTradeShadowOutcome(
   item.matureSmallTradeWouldSkip,
   item.smallTradeShadowFingerprint,
   event
 );
-    if (item.shadowCohort2Clean) {
+
+if (item.shadowCohort2Clean) {
   recordShadowCohort2Outcome(
     "clean",
+    item.smallTradeShadowFingerprint,
     event
   );
 }
@@ -13675,12 +13805,14 @@ if (
 if (item.shadowCohort2NearClean) {
   recordShadowCohort2Outcome(
     "near_clean",
+    item.smallTradeShadowFingerprint,
     event
   );
 }
 
 if (item.shadowCohort3Clean) {
   recordShadowCohort3Outcome(
+    item.smallTradeShadowFingerprint,
     event
   );
 }
@@ -16628,13 +16760,16 @@ shadowSmallTradePrefilter: {
 // --------------------------------------
 // SHADOW SMALL-TRADE COHORT #2
 //
-// Independent forward holdout for:
+// Forward validation for:
 //
 // • CLEAN fingerprints
 // • NEAR-CLEAN fingerprints
 //
-// Observation only.
-// Cohort #2 does NOT filter pre-RPC.
+// CLEAN is now eligible for production
+// pre-RPC filtering through the shared
+// production kill switch.
+//
+// NEAR-CLEAN remains shadow only.
 // --------------------------------------
 
 shadowSmallTradeCohort2: {
@@ -16797,14 +16932,102 @@ shadowSmallTradeCohort2: {
       "1.00Plus":
         stats.shadowCohort2NearCleanKeep100Plus,
     },
+
+    byFingerprint:
+      Array.from(
+        shadowCohort2NearCleanByFingerprint.values()
+      ).map(row => {
+        const known =
+          row.small + row.keep;
+
+        return {
+          key: row.key,
+          samples: row.samples,
+          small: row.small,
+          keep: row.keep,
+          unknown: row.unknown,
+
+          precisionPct:
+            known > 0
+              ? Number(
+                  (
+                    100 *
+                    row.small /
+                    known
+                  ).toFixed(4)
+                )
+              : null,
+
+          falsePositivePct:
+            known > 0
+              ? Number(
+                  (
+                    100 *
+                    row.keep /
+                    known
+                  ).toFixed(4)
+                )
+              : null,
+
+          keepSol: {
+            total:
+              Number(
+                row.keepSolTotal.toFixed(6)
+              ),
+
+            average:
+              row.keep > 0
+                ? Number(
+                    (
+                      row.keepSolTotal /
+                      row.keep
+                    ).toFixed(6)
+                  )
+                : null,
+
+            max:
+              row.keep > 0
+                ? Number(
+                    row.keepSolMax.toFixed(6)
+                  )
+                : null,
+
+            "0.05To0.075":
+              row.keep005To0075,
+
+            "0.075To0.10":
+              row.keep0075To010,
+
+            "0.10To0.25":
+              row.keep010To025,
+
+            "0.25To0.50":
+              row.keep025To050,
+
+            "0.50To1.00":
+              row.keep050To100,
+
+            "1.00Plus":
+              row.keep100Plus,
+          },
+        };
+      }),
   },
 },
 
 // --------------------------------------
 // SHADOW SMALL-TRADE COHORT #3 — CLEAN
 //
-// Independent forward holdout.
-// Selection/discovery observations are excluded.
+// Forward shadow validation.
+//
+// NOTE:
+// Cohort #3 currently contains one fingerprint
+// that also belongs to Cohort #2 NearClean.
+// Therefore this aggregate should NOT be treated
+// as a strictly independent holdout.
+//
+// Per-fingerprint diagnostics below allow exact
+// forward attribution of SMALL / KEEP outcomes.
 // --------------------------------------
 
 shadowSmallTradeCohort3: {
@@ -16866,6 +17089,86 @@ shadowSmallTradeCohort3: {
 
     eventTypeMismatch:
       stats.shadowCohort3CleanEventTypeMismatch,
+
+    byFingerprint:
+      Array.from(
+        shadowCohort3CleanByFingerprint.values()
+      ).map(row => {
+        const known =
+          row.small + row.keep;
+
+        return {
+          key: row.key,
+          samples: row.samples,
+          small: row.small,
+          keep: row.keep,
+          unknown: row.unknown,
+
+          precisionPct:
+            known > 0
+              ? Number(
+                  (
+                    100 *
+                    row.small /
+                    known
+                  ).toFixed(4)
+                )
+              : null,
+
+          falsePositivePct:
+            known > 0
+              ? Number(
+                  (
+                    100 *
+                    row.keep /
+                    known
+                  ).toFixed(4)
+                )
+              : null,
+
+          keepSol: {
+            total:
+              Number(
+                row.keepSolTotal.toFixed(6)
+              ),
+
+            average:
+              row.keep > 0
+                ? Number(
+                    (
+                      row.keepSolTotal /
+                      row.keep
+                    ).toFixed(6)
+                  )
+                : null,
+
+            max:
+              row.keep > 0
+                ? Number(
+                    row.keepSolMax.toFixed(6)
+                  )
+                : null,
+
+            "0.05To0.075":
+              row.keep005To0075,
+
+            "0.075To0.10":
+              row.keep0075To010,
+
+            "0.10To0.25":
+              row.keep010To025,
+
+            "0.25To0.50":
+              row.keep025To050,
+
+            "0.50To1.00":
+              row.keep050To100,
+
+            "1.00Plus":
+              row.keep100Plus,
+          },
+        };
+      }),
   },
 },
 

@@ -1116,6 +1116,17 @@ cleanCohort2PreRpcBypassedDisabled: 0,
 cleanCohort2PreRpcBypassedThreshold: 0,
 
   // ==========================================
+  // SHADOW SMALL-TRADE COHORT #3 — CLEAN
+  // ==========================================
+
+  shadowCohort3CleanSamples: 0,
+  shadowCohort3CleanSmall: 0,
+  shadowCohort3CleanKeep: 0,
+  shadowCohort3CleanUnknown: 0,
+  shadowCohort3CleanEventTypeMismatch: 0,
+  shadowCohort3CleanThresholdMismatch: 0,
+
+  // ==========================================
   // TOTAL SIGNATURE PROCESSING PERFORMANCE
   // ==========================================
 
@@ -1466,6 +1477,38 @@ const SHADOW_COHORT_2_NEAR_CLEAN_KEYS =
     "event=sell|logs=25|chars=2000|cu=55000|invoke=8|data=1|plog=4|success=8",
     "event=sell|logs=20|chars=1500|cu=50000|invoke=6|data=1|plog=3|success=6",
     "event=sell|logs=25|chars=2000|cu=50000|invoke=9|data=1|plog=4|success=9",
+  ]);
+
+// ==================================================
+// FROZEN SMALL-TRADE COHORT #3 — CLEAN
+//
+// Selected from the completed discovery run.
+//
+// Selection data DOES NOT count toward this holdout.
+// From this deployment forward, counters begin at zero.
+//
+// SHADOW ONLY:
+// • Exact frozen fingerprint membership.
+// • 0.05 SOL validation threshold.
+// • No pre-RPC rejection.
+// • Every match is hydrated normally.
+// ==================================================
+
+const SHADOW_COHORT_3_THRESHOLD_SOL =
+  0.05;
+
+const SHADOW_COHORT_3_CLEAN_KEYS =
+  new Set([
+    "event=sell|logs=25|chars=2000|cu=50000|invoke=9|data=1|plog=4|success=9",
+    "event=sell|logs=25|chars=2500|cu=130000|invoke=8|data=2|plog=4|success=8",
+    "event=sell|logs=25|chars=2000|cu=55000|invoke=9|data=1|plog=4|success=9",
+    "event=sell|logs=15|chars=1500|cu=50000|invoke=4|data=1|plog=3|success=4",
+    "event=sell|logs=30|chars=2000|cu=110000|invoke=8|data=1|plog=6|success=8",
+    "event=sell|logs=20|chars=1500|cu=80000|invoke=7|data=1|plog=3|success=7",
+    "event=sell|logs=25|chars=2000|cu=75000|invoke=7|data=1|plog=4|success=7",
+    "event=sell|logs=35|chars=2500|cu=60000|invoke=11|data=1|plog=4|success=11",
+    "event=sell|logs=15|chars=1500|cu=50000|invoke=5|data=1|plog=3|success=5",
+    "event=sell|logs=25|chars=2500|cu=135000|invoke=8|data=2|plog=4|success=8",
   ]);
 
 function isMatureSmallTradeFingerprint(
@@ -1948,6 +1991,53 @@ function recordShadowCohort2Outcome(
     stats.shadowCohort2NearCleanKeep050To100 += 1;
   } else {
     stats.shadowCohort2NearCleanKeep100Plus += 1;
+  }
+}
+
+// ==================================================
+// SHADOW COHORT #3 OUTCOME RECORDER
+// ==================================================
+
+function recordShadowCohort3Outcome(event) {
+  if (
+    !event ||
+    event.event_type !== "sell"
+  ) {
+    stats.shadowCohort3CleanEventTypeMismatch += 1;
+    return;
+  }
+
+  const currentThreshold =
+    effectiveMinSolAmount();
+
+  if (
+    !Number.isFinite(currentThreshold) ||
+    Math.abs(
+      currentThreshold -
+      SHADOW_COHORT_3_THRESHOLD_SOL
+    ) > 1e-12
+  ) {
+    stats.shadowCohort3CleanThresholdMismatch += 1;
+    return;
+  }
+
+  stats.shadowCohort3CleanSamples += 1;
+
+  const solAmount =
+    Number(event.sol_amount);
+
+  if (!Number.isFinite(solAmount)) {
+    stats.shadowCohort3CleanUnknown += 1;
+    return;
+  }
+
+  if (
+    solAmount <
+    SHADOW_COHORT_3_THRESHOLD_SOL
+  ) {
+    stats.shadowCohort3CleanSmall += 1;
+  } else {
+    stats.shadowCohort3CleanKeep += 1;
   }
 }
 
@@ -4376,7 +4466,8 @@ function enqueueSignature(
   smallTradeShadowFingerprint = null,
   matureSmallTradeWouldSkip = false,
   shadowCohort2Clean = false,
-  shadowCohort2NearClean = false
+  shadowCohort2NearClean = false,
+  shadowCohort3Clean = false
 ) {
   if (!signature) {
     return;
@@ -4517,6 +4608,16 @@ function enqueueSignature(
 
     shadowCohort2NearClean:
       shadowCohort2NearClean === true,
+
+    // ----------------------------------------------
+    // COHORT #3 — CLEAN SHADOW HOLDOUT
+    //
+    // Frozen before getTransaction. Shadow only.
+    // Matches remain queued and hydrated normally.
+    // ----------------------------------------------
+
+    shadowCohort3Clean:
+      shadowCohort3Clean === true,
 
     enqueuedAt: Date.now(),
   });
@@ -12482,7 +12583,7 @@ async function enrichTokenHolderConcentration(
         // The retry helper retries ONLY the known:
         //
         //   -32602 / could not find account
-        //
+                //
         // condition.
         // ----------------------------------------
 
@@ -13577,6 +13678,12 @@ if (item.shadowCohort2NearClean) {
     event
   );
 }
+
+if (item.shadowCohort3Clean) {
+  recordShadowCohort3Outcome(
+    event
+  );
+}
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
@@ -14207,6 +14314,14 @@ const shadowCohort2NearClean =
       smallTradeShadowFingerprint.key
     )
   );
+
+const shadowCohort3Clean =
+  Boolean(
+    smallTradeShadowFingerprint?.key &&
+    SHADOW_COHORT_3_CLEAN_KEYS.has(
+      smallTradeShadowFingerprint.key
+    )
+  );
       // ----------------------------------------------
 // PRODUCTION SMALL-TRADE PRE-RPC FILTER
 //
@@ -14302,7 +14417,8 @@ enqueueSignature(
   smallTradeShadowFingerprint,
   matureSmallTradeWouldSkip,
   shadowCohort2Clean,
-  shadowCohort2NearClean
+  shadowCohort2NearClean,
+  shadowCohort3Clean
 );
     } catch (error) {
       logError(
@@ -16681,6 +16797,75 @@ shadowSmallTradeCohort2: {
       "1.00Plus":
         stats.shadowCohort2NearCleanKeep100Plus,
     },
+  },
+},
+
+// --------------------------------------
+// SHADOW SMALL-TRADE COHORT #3 — CLEAN
+//
+// Independent forward holdout.
+// Selection/discovery observations are excluded.
+// --------------------------------------
+
+shadowSmallTradeCohort3: {
+  thresholdSol:
+    SHADOW_COHORT_3_THRESHOLD_SOL,
+
+  clean: {
+    frozenFingerprints:
+      SHADOW_COHORT_3_CLEAN_KEYS.size,
+
+    samples:
+      stats.shadowCohort3CleanSamples,
+
+    small:
+      stats.shadowCohort3CleanSmall,
+
+    keep:
+      stats.shadowCohort3CleanKeep,
+
+    unknown:
+      stats.shadowCohort3CleanUnknown,
+
+    precisionPct:
+      (
+        stats.shadowCohort3CleanSmall +
+        stats.shadowCohort3CleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort3CleanSmall /
+              (
+                stats.shadowCohort3CleanSmall +
+                stats.shadowCohort3CleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    falsePositivePct:
+      (
+        stats.shadowCohort3CleanSmall +
+        stats.shadowCohort3CleanKeep
+      ) > 0
+        ? Number(
+            (
+              100 *
+              stats.shadowCohort3CleanKeep /
+              (
+                stats.shadowCohort3CleanSmall +
+                stats.shadowCohort3CleanKeep
+              )
+            ).toFixed(4)
+          )
+        : null,
+
+    thresholdMismatch:
+      stats.shadowCohort3CleanThresholdMismatch,
+
+    eventTypeMismatch:
+      stats.shadowCohort3CleanEventTypeMismatch,
   },
 },
 

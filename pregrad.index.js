@@ -1181,6 +1181,32 @@ const SHADOW_PROGRAM_DATA_MAX_SHAPES = 100;
 
 const shadowProgramDataShapes =
   new Map();
+
+// ==================================================
+// SHADOW PROGRAM-DATA BYTE-LAYOUT EXPERIMENT
+//
+// Phase 2:
+//
+// For one targeted Program Data discriminator, retain
+// a SMALL bounded sample of decoded payloads so the
+// byte layout can be compared with hydrated trade
+// outcomes.
+//
+// SHADOW ONLY:
+// • No filtering.
+// • No additional RPC.
+// • No database writes.
+// • Does not alter production behavior.
+// ==================================================
+
+const SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR =
+  "bddb7fd34ee661ee";
+
+const SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES =
+  100;
+
+const shadowProgramDataLayoutSamples =
+  new Map();
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -1729,7 +1755,8 @@ function isMatureSmallTradeFingerprint(
 // ==================================================
 
 function samplePumpProgramDataPayloads(
-  value
+  value,
+  signature = null
 ) {
   const logs =
     Array.isArray(value?.logs)
@@ -1852,42 +1879,94 @@ function samplePumpProgramDataPayloads(
 
       if (!row) {
         if (
-          shadowProgramDataShapes.size >=
+          shadowProgramDataShapes.size <
           SHADOW_PROGRAM_DATA_MAX_SHAPES
         ) {
-          continue;
+          row = {
+            key,
+
+            eventHint,
+
+            decodedBytes:
+              decoded.length,
+
+            discriminatorHex,
+
+            discriminatorDecimal,
+
+            samples: 0,
+
+            firstSeenAt:
+              Date.now(),
+
+            lastSeenAt:
+              null,
+          };
+
+          shadowProgramDataShapes.set(
+            key,
+            row
+          );
         }
-
-        row = {
-          key,
-
-          eventHint,
-
-          decodedBytes:
-            decoded.length,
-
-          discriminatorHex,
-
-          discriminatorDecimal,
-
-          samples: 0,
-
-          firstSeenAt:
-            Date.now(),
-
-          lastSeenAt:
-            null,
-        };
-
-        shadowProgramDataShapes.set(
-          key,
-          row
-        );
       }
 
-      row.samples += 1;
-      row.lastSeenAt =
-        Date.now();
+      if (row) {
+        row.samples += 1;
+        row.lastSeenAt =
+          Date.now();
+      }
+
+        // ------------------------------------------
+      // PHASE 2 — TARGETED BYTE-LAYOUT SAMPLE
+      //
+      // Capture only the target discriminator and
+      // only until the bounded sample is full.
+      //
+      // SHADOW ONLY:
+      // • No filtering.
+      // • No additional RPC.
+      // • No database writes.
+      // ------------------------------------------
+
+      if (
+        discriminatorHex ===
+          SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR &&
+        signature &&
+        !shadowProgramDataLayoutSamples.has(
+          signature
+        ) &&
+        shadowProgramDataLayoutSamples.size <
+          SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES
+      ) {
+        shadowProgramDataLayoutSamples.set(
+          signature,
+          {
+            signature,
+
+            eventHint,
+
+            decodedBytes:
+              decoded.length,
+
+            discriminatorHex,
+
+            payloadHex:
+              decoded.toString("hex"),
+
+            payloadBase64:
+              payload,
+
+            capturedAt:
+              Date.now(),
+
+            hydratedEventType:
+              null,
+
+            hydratedSolAmount:
+              null,
+          }
+        );
+      }
 
     } catch (error) {
       stats.shadowProgramDataDecodeErrors +=
@@ -1895,6 +1974,11 @@ function samplePumpProgramDataPayloads(
     }
   }
 }
+
+
+// ==================================================
+// SHADOW SMALL-TRADE WEBSOCKET FINGERPRINT
+// ==================================================
 
 function buildSmallTradeShadowFingerprint(
   value
@@ -2053,6 +2137,70 @@ function buildSmallTradeShadowFingerprint(
   };
 }
 
+
+// ==================================================
+// SHADOW PROGRAM-DATA HYDRATED OUTCOME
+//
+// Correlates the bounded pre-RPC Program Data sample
+// with the eventual hydrated transaction result.
+//
+// Observation only.
+// ==================================================
+
+// ==================================================
+// SHADOW PROGRAM-DATA HYDRATED OUTCOME
+//
+// Correlates the bounded pre-RPC Program Data sample
+// with the eventual hydrated transaction result.
+//
+// Observation only.
+// ==================================================
+
+function recordProgramDataHydratedOutcome(
+  signature,
+  event
+) {
+  if (
+    !signature ||
+    !event
+  ) {
+    return;
+  }
+
+  const row =
+    shadowProgramDataLayoutSamples.get(
+      signature
+    );
+
+  if (!row) {
+    return;
+  }
+
+  row.hydratedEventType =
+    event.event_type ?? null;
+
+  const solAmount =
+    Number(
+      event.sol_amount
+    );
+
+  row.hydratedSolAmount =
+    Number.isFinite(solAmount)
+      ? solAmount
+      : null;
+}
+
+
+// ==================================================
+// SHADOW SMALL-TRADE PREFILTER OUTCOME
+//
+// Compares the pre-RPC websocket fingerprint with
+// the hydrated transaction's actual event type and
+// SOL amount.
+//
+// Observation only.
+// ==================================================
+
 function recordSmallTradeShadowOutcome(
   fingerprint,
   event
@@ -2132,34 +2280,28 @@ function recordSmallTradeShadowOutcome(
       return;
     }
 
- row = {
-  key: fingerprint.key,
+    row = {
+      key: fingerprint.key,
 
-  samples: 0,
-  small: 0,
-  keep: 0,
-  unknown: 0,
+      samples: 0,
+      small: 0,
+      keep: 0,
+      unknown: 0,
 
-  // --------------------------------------------
-  // TEMPORAL CONFIDENCE
-  //
-  // Track how long this fingerprint has existed
-  // and exactly when KEEP contamination first
-  // appears.
-  // --------------------------------------------
+      buySamples: 0,
+      buySmall: 0,
+      buyKeep: 0,
 
-  firstSeenAt:
-    Date.now(),
+      sellSamples: 0,
+      sellSmall: 0,
+      sellKeep: 0,
 
-  lastSeenAt:
-    null,
+      firstSeenAt:
+        Date.now(),
 
-  firstKeepAtSample:
-    null,
-
-  firstKeepAt:
-    null,
-};
+      lastSeenAt:
+        null,
+    };
 
     shadowSmallTradeFingerprints.set(
       fingerprint.key,
@@ -2167,30 +2309,35 @@ function recordSmallTradeShadowOutcome(
     );
   }
 
-row.samples += 1;
-row[outcome] += 1;
+  row.samples += 1;
+  row.lastSeenAt =
+    Date.now();
 
-const now =
-  Date.now();
+  if (outcome === "small") {
+    row.small += 1;
+  } else if (outcome === "keep") {
+    row.keep += 1;
+  } else {
+    row.unknown += 1;
+  }
 
-row.lastSeenAt =
-  now;
+  if (isBuy) {
+    row.buySamples += 1;
 
-// Record the FIRST time this fingerprint ever
-// produces a transaction production would KEEP.
-//
-// Once set, these values never change.
+    if (outcome === "small") {
+      row.buySmall += 1;
+    } else if (outcome === "keep") {
+      row.buyKeep += 1;
+    }
+  } else {
+    row.sellSamples += 1;
 
-if (
-  outcome === "keep" &&
-  row.firstKeepAtSample === null
-) {
-  row.firstKeepAtSample =
-    row.samples;
-
-  row.firstKeepAt =
-    now;
-}
+    if (outcome === "small") {
+      row.sellSmall += 1;
+    } else if (outcome === "keep") {
+      row.sellKeep += 1;
+    }
+  }
 }
 
 function recordMatureSmallTradeShadowOutcome(
@@ -14138,6 +14285,11 @@ if (
 // Observation only.
 // ==============================================
 
+recordProgramDataHydratedOutcome(
+  item.signature,
+  event
+);
+
 recordSmallTradeShadowOutcome(
   item.smallTradeShadowFingerprint,
   event
@@ -14772,15 +14924,16 @@ stats.shadowPrefilterExplicitMatches +=
 // ----------------------------------------------
 
 samplePumpProgramDataPayloads(
-  value
+  value,
+  signature
 );
 
-const smallTradeShadowFingerprint =
+  const smallTradeShadowFingerprint =
   buildSmallTradeShadowFingerprint(
     value
   );
 
-// ----------------------------------------------
+      // ----------------------------------------------
 // SHADOW MATURE SMALL-TRADE ALLOWLIST
 //
 // Determine, using ONLY pre-RPC websocket data,
@@ -14919,6 +15072,7 @@ enqueueSignature(
   shadowCohort2NearClean,
   shadowCohort3Clean
 );
+
     } catch (error) {
       logError(
         "WebSocket message parse error",
@@ -14988,6 +15142,8 @@ enqueueSignature(
     }
   );
 }
+
+
 
 // ==================================================
 // 16. MAINTENANCE / STATS
@@ -17141,6 +17297,49 @@ shadowPumpProgramData: {
 
   shapesTracked:
     shadowProgramDataShapes.size,
+
+  layoutExperiment: {
+  targetDiscriminator:
+    SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
+
+  maxSamples:
+    SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES,
+
+  captured:
+    shadowProgramDataLayoutSamples.size,
+
+  hydrated:
+    [...shadowProgramDataLayoutSamples.values()]
+      .filter(
+        row =>
+          row.hydratedSolAmount !== null
+      ).length,
+
+  samples:
+    [...shadowProgramDataLayoutSamples.values()]
+      .slice(0, 10)
+      .map(
+        row => ({
+          signature:
+            row.signature,
+
+          eventHint:
+            row.eventHint,
+
+          decodedBytes:
+            row.decodedBytes,
+
+          hydratedEventType:
+            row.hydratedEventType,
+
+          hydratedSolAmount:
+            row.hydratedSolAmount,
+
+          payloadHex:
+            row.payloadHex,
+        })
+      ),
+},
 
   topShapes:
     [...shadowProgramDataShapes.values()]

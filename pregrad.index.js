@@ -14925,7 +14925,7 @@ stats.shadowPrefilterExplicitMatches +=
 
 samplePumpProgramDataPayloads(
   value,
-  signature
+  value.signature
 );
 
   const smallTradeShadowFingerprint =

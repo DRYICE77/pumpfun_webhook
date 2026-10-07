@@ -766,6 +766,27 @@ shadowProgramIdOnlyUnsupported: 0,
 shadowProgramIdOnlyUnresolvedMint: 0,
 shadowProgramIdOnlyOtherRejected: 0,
 
+  // ==========================================
+// SHADOW PUMP PROGRAM-DATA PAYLOAD SAMPLER
+//
+// Inspects websocket "Program data:" payloads
+// BEFORE getTransaction.
+//
+// Diagnostic only:
+// • No RPC calls.
+// • No database work.
+// • No filtering.
+// • No production behavior changes.
+// ==========================================
+
+shadowProgramDataNotifications: 0,
+shadowProgramDataPayloads: 0,
+shadowProgramDataBase64Decoded: 0,
+shadowProgramDataDecodeErrors: 0,
+shadowProgramDataEmptyPayloads: 0,
+
+  
+
     // ==========================================
   // SHADOW SMALL-TRADE PREFILTER EXPERIMENT
   //
@@ -1143,6 +1164,23 @@ cleanCohort2PreRpcBypassedThreshold: 0,
   intakePauseMaxMs: 0,
 };
 
+// ==================================================
+// SHADOW PUMP PROGRAM-DATA PAYLOAD SAMPLER
+//
+// Aggregate payload shapes only.
+//
+// We intentionally do NOT retain full payloads.
+// Each discriminator/length combination becomes one
+// aggregate row.
+//
+// This keeps memory bounded and avoids noisy
+// per-transaction logging.
+// ==================================================
+
+const SHADOW_PROGRAM_DATA_MAX_SHAPES = 100;
+
+const shadowProgramDataShapes =
+  new Map();
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -1668,6 +1706,194 @@ function isMatureSmallTradeFingerprint(
       fingerprint.key
     )
   );
+}
+// ==================================================
+// SHADOW PUMP PROGRAM-DATA PAYLOAD SAMPLER
+//
+// Reads websocket "Program data:" lines BEFORE RPC.
+//
+// For every valid base64 payload, record:
+//
+// • decoded byte length
+// • first 8 bytes as hex
+// • first 8 bytes as decimal
+// • websocket event hint
+// • observation count
+//
+// IMPORTANT:
+//
+// • Does NOT call RPC.
+// • Does NOT write to PostgreSQL.
+// • Does NOT filter anything.
+// • Does NOT retain complete payloads.
+// ==================================================
+
+function samplePumpProgramDataPayloads(
+  value
+) {
+  const logs =
+    Array.isArray(value?.logs)
+      ? value.logs.map(
+          line => String(line)
+        )
+      : [];
+
+  const lowerLogs =
+    logs.map(
+      line => line.toLowerCase()
+    );
+
+  const hasBuy =
+    lowerLogs.some(
+      line =>
+        line.includes(
+          "instruction: buy"
+        )
+    );
+
+  const hasSell =
+    lowerLogs.some(
+      line =>
+        line.includes(
+          "instruction: sell"
+        )
+    );
+
+  const eventHint =
+    hasBuy && !hasSell
+      ? "buy"
+      : hasSell && !hasBuy
+        ? "sell"
+        : hasBuy && hasSell
+          ? "buy_sell"
+          : "other";
+
+  const programDataLines =
+    logs.filter(
+      line =>
+        line
+          .toLowerCase()
+          .startsWith(
+            "program data:"
+          )
+    );
+
+  if (programDataLines.length === 0) {
+    return;
+  }
+
+  stats.shadowProgramDataNotifications +=
+    1;
+
+  for (const line of programDataLines) {
+    stats.shadowProgramDataPayloads +=
+      1;
+
+    const payload =
+      line
+        .slice(
+          line.indexOf(":") + 1
+        )
+        .trim();
+
+    if (!payload) {
+      stats.shadowProgramDataEmptyPayloads +=
+        1;
+
+      continue;
+    }
+
+    try {
+      const decoded =
+        Buffer.from(
+          payload,
+          "base64"
+        );
+
+      if (decoded.length === 0) {
+        stats.shadowProgramDataEmptyPayloads +=
+          1;
+
+        continue;
+      }
+
+      stats.shadowProgramDataBase64Decoded +=
+        1;
+
+      const discriminatorBytes =
+        decoded.subarray(
+          0,
+          Math.min(
+            8,
+            decoded.length
+          )
+        );
+
+      const discriminatorHex =
+        discriminatorBytes.toString(
+          "hex"
+        );
+
+      const discriminatorDecimal =
+        Array.from(
+          discriminatorBytes
+        ).join(",");
+
+      const key = [
+        `event=${eventHint}`,
+        `bytes=${decoded.length}`,
+        `disc=${discriminatorHex}`,
+      ].join("|");
+
+      let row =
+        shadowProgramDataShapes.get(
+          key
+        );
+
+      if (!row) {
+        if (
+          shadowProgramDataShapes.size >=
+          SHADOW_PROGRAM_DATA_MAX_SHAPES
+        ) {
+          continue;
+        }
+
+        row = {
+          key,
+
+          eventHint,
+
+          decodedBytes:
+            decoded.length,
+
+          discriminatorHex,
+
+          discriminatorDecimal,
+
+          samples: 0,
+
+          firstSeenAt:
+            Date.now(),
+
+          lastSeenAt:
+            null,
+        };
+
+        shadowProgramDataShapes.set(
+          key,
+          row
+        );
+      }
+
+      row.samples += 1;
+      row.lastSeenAt =
+        Date.now();
+
+    } catch (error) {
+      stats.shadowProgramDataDecodeErrors +=
+        1;
+    }
+  }
 }
 
 function buildSmallTradeShadowFingerprint(
@@ -14537,6 +14763,18 @@ stats.shadowPrefilterExplicitMatches +=
 // This fingerprint does NOT affect admission.
 // ----------------------------------------------
 
+// ----------------------------------------------
+// SHADOW PUMP PROGRAM-DATA PAYLOAD SAMPLER
+//
+// Inspect websocket payloads BEFORE getTransaction.
+//
+// Diagnostic only.
+// ----------------------------------------------
+
+samplePumpProgramDataPayloads(
+  value
+);
+
 const smallTradeShadowFingerprint =
   buildSmallTradeShadowFingerprint(
     value
@@ -16885,7 +17123,51 @@ shadowSmallTradePrefilter: {
 
   ...getSmallTradeShadowSummary(),
 },
+shadowPumpProgramData: {
+  notifications:
+    stats.shadowProgramDataNotifications,
 
+  payloads:
+    stats.shadowProgramDataPayloads,
+
+  base64Decoded:
+    stats.shadowProgramDataBase64Decoded,
+
+  decodeErrors:
+    stats.shadowProgramDataDecodeErrors,
+
+  emptyPayloads:
+    stats.shadowProgramDataEmptyPayloads,
+
+  shapesTracked:
+    shadowProgramDataShapes.size,
+
+  topShapes:
+    [...shadowProgramDataShapes.values()]
+      .sort(
+        (a, b) =>
+          b.samples - a.samples
+      )
+      .slice(0, 20)
+      .map(
+        row => ({
+          eventHint:
+            row.eventHint,
+
+          decodedBytes:
+            row.decodedBytes,
+
+          discriminatorHex:
+            row.discriminatorHex,
+
+          discriminatorDecimal:
+            row.discriminatorDecimal,
+
+          samples:
+            row.samples,
+        })
+      ),
+},
 // --------------------------------------
 // SHADOW SMALL-TRADE COHORT #2
 //
@@ -17382,6 +17664,7 @@ cleanCohort2Production: {
   bypassedThresholdMismatch:
     stats.cleanCohort2PreRpcBypassedThreshold,
 },
+            
 
 shadowMatureSmallTradePrefilter:
   getMatureSmallTradeShadowSummary(),

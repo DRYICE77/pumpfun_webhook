@@ -1561,6 +1561,151 @@ function phase2eSummary() {
 }
 
 // ==================================================
+// PHASE 2F — SELL FLOW RECONCILIATION (SHADOW ONLY)
+// Existing hydrated transactions only. No RPC, SQL,
+// filtering, subscriptions, or production decisions.
+// Account-balance deltas are NET transaction deltas,
+// not proof of trade proceeds; WSOL owner is uncertain.
+// ==================================================
+const SHADOW_2F_EXAMPLE_LIMIT = 24;
+const SHADOW_2F_MAX_TRANSFERS_PER_EXAMPLE = 20;
+const shadow2f = {
+  eligible:0, skippedMulti:0, skippedMissing:0,
+  parseErrors:0, lengthCounts:new Map(), categories:new Map(),
+  examples:[], transferMatch:0, netDeltaMatch:0,
+  feeAdjustedMatch:0, noParsedTransfers:0, noBalanceData:0,
+  offset40Zero:0, offset40VsHydrated:{exact:0,withinOnePct:0,
+    falseSmall:0,falseKeep:0,correct:0},
+};
+function phase2fRecord(signature,event,tx) {
+  const row=shadowProgramData2cPending.get(signature);
+  if (!row || !row.payloadHex || event?.event_type!=="sell") return;
+  if (row.targetEventCount!==1 || row.truncated) {shadow2f.skippedMulti++;return;}
+  const hydrated=Number(event?.sol_amount);
+  if (event?.sol_amount==null || !Number.isFinite(hydrated) || hydrated<0) {
+    shadow2f.skippedMissing++;return;
+  }
+  try {
+    const bytes=Buffer.from(row.payloadHex,"hex");
+    if (bytes.length<48) return;
+    const candidate=bytes.readBigUInt64LE(40);
+    const hydratedLamports=BigInt(Math.round(hydrated*1e9));
+    const feeRaw=tx?.meta?.fee;
+    const fee=(Number.isSafeInteger(Number(feeRaw)) && Number(feeRaw)>=0)
+      ? BigInt(feeRaw):null;
+    const threshold=effectiveMinSolAmount();
+    const limit=Number.isFinite(threshold)&&threshold>0
+      ? BigInt(Math.round(threshold*1e9)):null;
+    const difference=candidate>hydratedLamports
+      ? candidate-hydratedLamports:hydratedLamports-candidate;
+    const near=hydratedLamports>0n && difference*100n<=hydratedLamports;
+    const exact=candidate===hydratedLamports;
+    const length=bytes.length;
+    const key=String(length);
+    const cat=shadow2f.categories.get(key)||{
+      samples:0,exact:0,near:0,transferMatch:0,netMatch:0,
+      feeMatch:0,hydratedSmaller:0,hydratedLarger:0};
+    cat.samples++;
+    shadow2f.lengthCounts.set(length,(shadow2f.lengthCounts.get(length)||0)+1);
+    shadow2f.eligible++;
+    if(candidate===0n) shadow2f.offset40Zero++;
+    if(exact){cat.exact++;shadow2f.offset40VsHydrated.exact++;}
+    if(near){cat.near++;shadow2f.offset40VsHydrated.withinOnePct++;}
+    if(candidate>hydratedLamports)cat.hydratedSmaller++;
+    if(candidate<hydratedLamports)cat.hydratedLarger++;
+    let classification="no_threshold";
+    if(limit!==null){
+      const predictedSmall=candidate<limit,actualSmall=hydratedLamports<limit;
+      classification=predictedSmall===actualSmall?"correct":predictedSmall?"false_SMALL":"false_KEEP";
+      if(classification==="correct")shadow2f.offset40VsHydrated.correct++;
+      else if(classification==="false_SMALL")shadow2f.offset40VsHydrated.falseSmall++;
+      else shadow2f.offset40VsHydrated.falseKeep++;
+    }
+    const accountKeys=getAccountKeys(tx).map(x=>String(x||""));
+    const pre=tx?.meta?.preBalances||[],post=tx?.meta?.postBalances||[];
+    const deltas=[];
+    if(pre.length && pre.length===post.length){
+      for(let i=0;i<pre.length;i++){
+        const a=Number(pre[i]),b=Number(post[i]);
+        if(Number.isSafeInteger(a)&&Number.isSafeInteger(b)&&a!==b){
+          deltas.push({account:accountKeys[i]||String(i),index:i,
+            deltaLamports:String(BigInt(b)-BigInt(a))});
+        }
+      }
+    }else shadow2f.noBalanceData++;
+    const flows=[];
+    const scan=(ins,origin,outerIndex)=>{
+      const info=ins?.parsed?.info||{};
+      const type=String(ins?.parsed?.type||"");
+      const program=String(ins?.program||"");
+      let amount=null,kind=null;
+      if(info.lamports!=null && type==="transfer"){
+        const n=Number(info.lamports);
+        if(Number.isSafeInteger(n)&&n>=0){amount=BigInt(n);kind="native";}
+      } else if((type==="transfer"||type==="transferChecked") &&
+          (program==="spl-token"||program==="spl-token-2022")){
+        // SPL transfers do not always identify their mint in parsed info.
+        // Do not label as WSOL unless the mint is explicit.
+        const mint=info.mint||null;
+        const raw=info.tokenAmount?.amount??info.amount;
+        if(mint==="So11111111111111111111111111111111111111112" &&
+           raw!=null && /^\d+$/.test(String(raw))){amount=BigInt(raw);kind="wsol";}
+      }
+      if(amount!==null)flows.push({origin,outerIndex,kind,
+        source:String(info.source||""),destination:String(info.destination||""),
+        lamports:amount.toString()});
+    };
+    getInstructions(tx).forEach((ins,i)=>scan(ins,"outer",i));
+    for(const group of getInnerInstructions(tx)){
+      for(const ins of group?.instructions||[])scan(ins,"inner",group.index??null);
+    }
+    if(!flows.length)shadow2f.noParsedTransfers++;
+    const transferMatch=flows.some(f=>BigInt(f.lamports)===candidate);
+    const netMatch=deltas.some(d=>BigInt(d.deltaLamports)===candidate ||
+      BigInt(d.deltaLamports)===-candidate);
+    const feeMatch=fee!==null && deltas.some(d=>{
+      const n=BigInt(d.deltaLamports);
+      return n===candidate-fee || n===candidate+fee ||
+        n===-candidate-fee || n===-candidate+fee;
+    });
+    if(transferMatch){shadow2f.transferMatch++;cat.transferMatch++;}
+    if(netMatch){shadow2f.netDeltaMatch++;cat.netMatch++;}
+    if(feeMatch){shadow2f.feeAdjustedMatch++;cat.feeMatch++;}
+    shadow2f.categories.set(key,cat);
+    // Keep a bounded mix of mismatches and matching controls.
+    const category=exact?"exact":near?"near":classification;
+    const already=shadow2f.examples.filter(e=>e.category===category).length;
+    if(shadow2f.examples.length<SHADOW_2F_EXAMPLE_LIMIT && already<6){
+      const sortedDeltas=deltas.sort((a,b)=>{
+        const aa=BigInt(a.deltaLamports),bb=BigInt(b.deltaLamports);
+        const da=aa<0n?-aa:aa,db=bb<0n?-bb:bb;
+        return da===db?0:da>db?-1:1;
+      });
+      shadow2f.examples.push({signature,category,payloadBytes:length,
+        candidateOffset40Sol:Number(candidate)/1e9,hydratedSol:hydrated,
+        differenceSol:Number(candidate-hydratedLamports)/1e9,
+        feeSol:fee===null?null:Number(fee)/1e9,
+        transferMatch,netDeltaMatch:netMatch,feeAdjustedMatch:feeMatch,
+        transferCount:flows.length,transfers:flows.slice(0,SHADOW_2F_MAX_TRANSFERS_PER_EXAMPLE),
+        netBalanceChanges:sortedDeltas.slice(0,12),
+        amountInLogRaw:getLogMessages(tx).join("\n").match(/amount_in:\s*(\d+)/i)?.[1]||null});
+    }
+  }catch(err){shadow2f.parseErrors++;}
+}
+function phase2fSummary(){
+  return {eligible:shadow2f.eligible,skippedMulti:shadow2f.skippedMulti,
+    skippedMissing:shadow2f.skippedMissing,parseErrors:shadow2f.parseErrors,
+    offset40Zero:shadow2f.offset40Zero,
+    offset40VsHydrated:shadow2f.offset40VsHydrated,
+    transferMatch:shadow2f.transferMatch,netDeltaMatch:shadow2f.netDeltaMatch,
+    feeAdjustedMatch:shadow2f.feeAdjustedMatch,
+    noParsedTransfers:shadow2f.noParsedTransfers,
+    noBalanceData:shadow2f.noBalanceData,
+    byPayloadLength:[...shadow2f.categories.entries()].map(([bytes,counts])=>({bytes:Number(bytes),...counts})).sort((a,b)=>b.samples-a.samples).slice(0,12),
+    examples:shadow2f.examples};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -14659,6 +14804,7 @@ recordProgramDataHydratedOutcome(
 
 phase2dRecord(item.signature, event, tx);
 phase2eRecord(item.signature, event, tx);
+phase2fRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17671,6 +17817,7 @@ shadowPumpProgramData: {
 
   phase2d: phase2dSummary(),
   phase2e: phase2eSummary(),
+  phase2f: phase2fSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

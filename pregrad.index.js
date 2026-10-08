@@ -1441,6 +1441,126 @@ function phase2dSummary() {
 }
 
 // ==================================================
+// PHASE 2E — SELL PAYLOAD LAYOUT FORENSICS (SHADOW)
+// Scan every byte offset for u64 LE values; compare
+// against hydrated SOL and all parsed SOL transfers.
+// Diagnose candidate relationships without filtering.
+// No new RPC, SQL, or websocket subscriptions.
+// ==================================================
+const SHADOW_2E_SCAN_MAX_OFFSET = 192;
+const SHADOW_2E_EXAMPLE_LIMIT = 12;
+const shadow2e = {
+  eligible: 0, skippedMulti: 0, skippedMissing: 0,
+  lengthCounts: new Map(), candidates: new Map(),
+  examples: [], ratioExamples: []
+};
+
+function phase2eRecord(signature, event, tx) {
+  const row = shadowProgramData2cPending.get(signature);
+  if (!row || !row.payloadHex) return;
+  if (row.targetEventCount !== 1 || row.truncated) {
+    shadow2e.skippedMulti++;
+    return;
+  }
+  if (event?.event_type !== "sell") return;
+  const amount = Number(event?.sol_amount);
+  if (event?.sol_amount == null || !Number.isFinite(amount) || amount < 0) {
+    shadow2e.skippedMissing++;
+    return;
+  }
+  const bytes = Buffer.from(row.payloadHex, "hex");
+  if (bytes.length < 16) return;
+  const threshold = effectiveMinSolAmount();
+  if (!Number.isFinite(threshold) || threshold <= 0) return;
+  const truth = BigInt(Math.round(amount * 1e9));
+  const limit = BigInt(Math.round(threshold * 1e9));
+  const actualSmall = truth < limit;
+  const evidence = getProgramData2cTransferEvidence(tx);
+  const transfers = (evidence.transfers || [])
+    .filter(t => Number.isFinite(t.sol) && t.sol > 0)
+    .map(t => BigInt(Math.round(t.sol * 1e9)));
+  const length = bytes.length;
+  shadow2e.lengthCounts.set(length, (shadow2e.lengthCounts.get(length) || 0) + 1);
+  shadow2e.eligible++;
+  const exactOffsets = [], transferOffsets = [], nearOffsets = [];
+  const limitOffset = Math.min(length - 8, SHADOW_2E_SCAN_MAX_OFFSET);
+  for (let offset = 8; offset <= limitOffset; offset++) {
+    const value = bytes.readBigUInt64LE(offset);
+    let stat = shadow2e.candidates.get(offset);
+    if (!stat) {
+      stat = {offset, samples:0, exact:0, withinOnePct:0,
+        transferExact:0, thresholdCorrect:0, falseSmall:0,
+        falseKeep:0, zero:0, nonzero:0, ratioSum:0, ratioSamples:0};
+      shadow2e.candidates.set(offset, stat);
+    }
+    stat.samples++;
+    if (value === 0n) stat.zero++; else stat.nonzero++;
+    if (value === truth) {stat.exact++; exactOffsets.push(offset);}
+    if (transfers.some(t => t === value)) {
+      stat.transferExact++; transferOffsets.push(offset);
+    }
+    if (truth > 0n && (value > truth ? value-truth : truth-value)*100n <= truth) {
+      stat.withinOnePct++; nearOffsets.push(offset);
+    }
+    const predictedSmall = value < limit;
+    if (predictedSmall === actualSmall) stat.thresholdCorrect++;
+    else if (predictedSmall) stat.falseSmall++;
+    else stat.falseKeep++;
+    // Only ratios near plausible scale are summarized.
+    if (truth > 0n && value > 0n && value < truth*10000n) {
+      const ratio = Number(value) / Number(truth);
+      if (Number.isFinite(ratio)) {
+        stat.ratioSum += ratio; stat.ratioSamples++;
+      }
+    }
+  }
+  // Bounded representative cases, biased toward mismatches and layout clues.
+  if (shadow2e.examples.length < SHADOW_2E_EXAMPLE_LIMIT) {
+    const offset40 = bytes.length >= 48 ? bytes.readBigUInt64LE(40) : null;
+    shadow2e.examples.push({
+      signature, payloadBytes:length, hydratedSol:amount,
+      offset40Sol:offset40 == null ? null : Number(offset40)/1e9,
+      offset40ToHydratedRatio:offset40 != null && truth > 0n
+        ? Number((Number(offset40)/Number(truth)).toFixed(6)) : null,
+      exactOffsets, transferExactOffsets:transferOffsets,
+      withinOnePctOffsets:nearOffsets.slice(0,20),
+      transfers:evidence.transfers.slice(0,6),
+      amountInLogRaw:evidence.amountInLogRaw,
+      feeLamports:tx?.meta?.fee ?? null,
+      // Hex is retained only for the small example set.
+      payloadHex:row.payloadHex
+    });
+  }
+}
+
+function phase2eSummary() {
+  const ranked = [...shadow2e.candidates.values()].map(s => ({
+    offset:s.offset, samples:s.samples, exact:s.exact,
+    withinOnePct:s.withinOnePct, transferExact:s.transferExact,
+    falseSmall:s.falseSmall, falseKeep:s.falseKeep,
+    thresholdCorrect:s.thresholdCorrect,
+    exactPct:s.samples ? Number((100*s.exact/s.samples).toFixed(3)) : 0,
+    nearPct:s.samples ? Number((100*s.withinOnePct/s.samples).toFixed(3)) : 0,
+    meanRatio:s.ratioSamples ? Number((s.ratioSum/s.ratioSamples).toFixed(6)) : null,
+    ratioSamples:s.ratioSamples, zero:s.zero
+  }));
+  const by = (fn) => [...ranked].sort(fn).slice(0,12);
+  return {
+    eligible:shadow2e.eligible, skippedMulti:shadow2e.skippedMulti,
+    skippedMissing:shadow2e.skippedMissing,
+    payloadLengths:[...shadow2e.lengthCounts.entries()]
+      .sort((a,b)=>b[1]-a[1]).slice(0,8)
+      .map(([bytes,count])=>({bytes,count})),
+    bestExact:by((a,b)=>b.exact-a.exact || b.withinOnePct-a.withinOnePct),
+    bestNear:by((a,b)=>b.withinOnePct-a.withinOnePct || b.exact-a.exact),
+    bestTransfer:by((a,b)=>b.transferExact-a.transferExact || b.exact-a.exact),
+    // Offset 40 always visible even when not in a leaderboard.
+    offset40:ranked.find(s=>s.offset===40) || null,
+    examples:shadow2e.examples
+  };
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -14538,6 +14658,7 @@ recordProgramDataHydratedOutcome(
 );
 
 phase2dRecord(item.signature, event, tx);
+phase2eRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17549,6 +17670,7 @@ shadowPumpProgramData: {
     shadowProgramDataShapes.size,
 
   phase2d: phase2dSummary(),
+  phase2e: phase2eSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

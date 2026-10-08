@@ -1211,6 +1211,132 @@ const shadowProgramDataLayoutSamples =
 // Phase 2B: only bounded signatures are retained.
 // Capture ALL target events within each selected signature.
 const SHADOW_PROGRAM_DATA_LAYOUT_MAX_EVENTS_PER_SIGNATURE = 16;
+
+// Phase 2C — rolling, bounded shadow mismatch forensics.
+// Does not affect the frozen Phase 2B sample or production filtering.
+const SHADOW_PROGRAM_DATA_2C_PENDING_LIMIT = 1500;
+const SHADOW_PROGRAM_DATA_2C_MISMATCH_LIMIT = 50;
+const shadowProgramData2cPending = new Map();
+const shadowProgramData2cMismatches = [];
+const shadowProgramData2cStats = {
+  captured: 0, hydrated: 0, exact: 0, correct: 0,
+  wrong: 0, falseSmall: 0, falseKeep: 0,
+  multiTarget: 0, missingAmount: 0, evicted: 0,
+  byType: { buy: {correct:0, wrong:0}, sell: {correct:0, wrong:0}, other: {correct:0, wrong:0} },
+};
+
+function getProgramData2cTransferEvidence(tx) {
+  // Mirror the existing extractSolAmount() transfer scan, without modifying it.
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const amounts = [];
+  const scan = (instruction, origin) => {
+    const info = instruction?.parsed?.info || {};
+    if (info.mint === SOL_MINT) {
+      const raw = info?.tokenAmount?.uiAmount ?? info?.uiAmount ??
+        (info?.amount != null && info?.decimals === 9 ? Number(info.amount)/1e9 : null);
+      const n = raw == null ? NaN : Number(raw);
+      if (Number.isFinite(n) && n > 0) amounts.push({origin, kind:"wsol", sol:n});
+    }
+    if (info.lamports != null) {
+      const n = Number(info.lamports)/1e9;
+      if (Number.isFinite(n) && n > 0) amounts.push({origin, kind:"native", sol:n});
+    }
+  };
+  for (const i of getInstructions(tx)) scan(i, "outer");
+  for (const group of getInnerInstructions(tx)) {
+    for (const i of group?.instructions || []) scan(i, "inner");
+  }
+  const match = getLogMessages(tx)
+  .join("\n")
+  .match(/amount_in:\s*([0-9]+)/i);
+
+const raw = match ? Number(match[1]) : null;
+
+const largestTransferSol = amounts.length
+  ? Math.max(...amounts.map(a => a.sol))
+  : null;
+
+return {
+  source: amounts.length
+    ? "largest_transfer"
+    : match
+      ? "amount_in_log_fallback"
+      : "none",
+
+  transferCount: amounts.length,
+
+  transfers: amounts
+    .sort((a, b) => b.sol - a.sol)
+    .slice(0, 12),
+
+  largestTransferSol,
+
+  amountInLogRaw: match ? match[1] : null,
+
+  // Reproduce the existing parser's fallback
+  // conversions for diagnostic comparison only.
+  fallbackBuySol:
+    raw !== null && Number.isFinite(raw) && raw > 0
+      ? raw / 1e9
+      : null,
+
+  fallbackSellSol:
+    raw !== null && Number.isFinite(raw) && raw > 0
+      ? raw / 1e6
+      : null,
+};
+}
+function recordProgramData2cHydratedOutcome(signature, event, tx) {
+  const row = shadowProgramData2cPending.get(signature);
+  if (!row) return;
+  shadowProgramData2cPending.delete(signature);
+  shadowProgramData2cStats.hydrated++;
+  const amount = event?.sol_amount == null ? NaN : Number(event.sol_amount);
+  if (!Number.isFinite(amount) || amount < 0) {
+    shadowProgramData2cStats.missingAmount++;
+    return;
+  }
+  if (row.targetEventCount !== 1 || row.truncated || row.offset40Lamports == null) {
+    shadowProgramData2cStats.multiTarget++;
+    return;
+  }
+  const thresholdSol = effectiveMinSolAmount();
+  if (!Number.isFinite(thresholdSol) || thresholdSol <= 0) return;
+  const thresholdLamports = BigInt(Math.round(thresholdSol * 1e9));
+  const hydratedLamports = BigInt(Math.round(amount * 1e9));
+  const offsetLamports = BigInt(row.offset40Lamports);
+  const actualSmall = hydratedLamports < thresholdLamports;
+  const predictedSmall = offsetLamports < thresholdLamports;
+  const exact = hydratedLamports === offsetLamports;
+  if (exact) shadowProgramData2cStats.exact++;
+  const kind = event.event_type === "buy" || event.event_type === "sell" ? event.event_type : "other";
+  if (actualSmall === predictedSmall) {
+    shadowProgramData2cStats.correct++;
+    shadowProgramData2cStats.byType[kind].correct++;
+    return;
+  }
+  shadowProgramData2cStats.wrong++;
+  shadowProgramData2cStats.byType[kind].wrong++;
+  if (predictedSmall) shadowProgramData2cStats.falseSmall++;
+  else shadowProgramData2cStats.falseKeep++;
+  const evidence = getProgramData2cTransferEvidence(tx);
+  const diagnostic = {
+    signature, eventHint:row.eventHint, eventType:event.event_type,
+    thresholdSol, hydratedSol:amount,
+    offset40Sol:Number(offsetLamports)/1e9,
+    offset40Lamports:row.offset40Lamports,
+    hydratedLamports:hydratedLamports.toString(),
+    differenceLamports:(offsetLamports-hydratedLamports).toString(),
+    direction:predictedSmall ? "false_SMALL" : "false_KEEP",
+    targetEventCount:row.targetEventCount, payloadBytes:row.payloadBytes,
+    payloadHex:row.payloadHex, feeLamports:tx?.meta?.fee ?? null,
+    evidence, capturedAt:row.capturedAt,
+  };
+  shadowProgramData2cMismatches.push(diagnostic);
+  if (shadowProgramData2cMismatches.length > SHADOW_PROGRAM_DATA_2C_MISMATCH_LIMIT)
+    shadowProgramData2cMismatches.shift();
+}
+
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -1931,6 +2057,33 @@ function samplePumpProgramDataPayloads(
       // • No additional RPC.
       // • No database writes.
       // ------------------------------------------
+
+      // Phase 2C: rolling capture for independently hydrated signatures.
+      if (discriminatorHex === SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR && signature) {
+        let forensic = shadowProgramData2cPending.get(signature);
+        if (!forensic) {
+          if (shadowProgramData2cPending.size >= SHADOW_PROGRAM_DATA_2C_PENDING_LIMIT) {
+            const oldest = shadowProgramData2cPending.keys().next().value;
+            shadowProgramData2cPending.delete(oldest);
+            shadowProgramData2cStats.evicted++;
+          }
+          forensic = {signature, eventHint, capturedAt:Date.now(),
+            targetEventCount:0, offset40Lamports:null, payloadBytes:null,
+            payloadHex:null, truncated:false};
+          shadowProgramData2cPending.set(signature, forensic);
+          shadowProgramData2cStats.captured++;
+        }
+        forensic.targetEventCount++;
+        if (forensic.targetEventCount === 1) {
+          forensic.offset40Lamports = decoded.length >= 48 ?
+            decoded.readBigUInt64LE(40).toString() : null;
+          forensic.payloadBytes = decoded.length;
+          forensic.payloadHex = decoded.toString("hex");
+        } else {
+          forensic.truncated = true;
+          forensic.payloadHex = null; // ambiguous multiple events
+        }
+      }
 
       // Phase 2B: count every target event in a selected signature.
       if (
@@ -14279,6 +14432,8 @@ recordProgramDataHydratedOutcome(
   event
 );
 
+recordProgramData2cHydratedOutcome(item.signature, event, tx);
+
 recordSmallTradeShadowOutcome(
   item.smallTradeShadowFingerprint,
   event
@@ -17286,6 +17441,16 @@ shadowPumpProgramData: {
 
   shapesTracked:
     shadowProgramDataShapes.size,
+
+  phase2c: {
+    ...shadowProgramData2cStats,
+    pending: shadowProgramData2cPending.size,
+    mismatchRetained: shadowProgramData2cMismatches.length,
+    // Latest 20 mismatches, with payloads for offline byte-layout analysis.
+ // Keep 50 mismatches in memory.
+// Report only the latest 5 to limit Railway log volume.
+mismatches: shadowProgramData2cMismatches.slice(-5),
+  },
 
   layoutExperiment: (() => {
     const rows = [...shadowProgramDataLayoutSamples.values()];

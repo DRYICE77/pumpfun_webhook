@@ -1338,6 +1338,109 @@ function recordProgramData2cHydratedOutcome(signature, event, tx) {
 }
 
 // ==================================================
+// PHASE 2D — SHADOW BYTE-OFFSET FIELD DISCOVERY
+// Candidate u64 fields are scanned at 8-byte boundaries
+// after the 8-byte discriminator. No production decisions.
+// No new RPC, SQL, or websocket subscriptions.
+// ==================================================
+const SHADOW_2D_MAX_OFFSET = 192;
+const SHADOW_2D_TOP_OFFSETS = 12;
+const SHADOW_2D_EXAMPLES_LIMIT = 12;
+const shadow2dStats = {
+  captured:0, hydrated:0, eligible:0, multiTarget:0,
+  missingAmount:0, unmatchedEventType:0,
+  byType:{buy:{eligible:0},sell:{eligible:0}},
+  candidates:{buy:new Map(),sell:new Map()},
+  examples:[],
+};
+function phase2dCaptureOffsets(decoded) {
+  const fields = [];
+  const end = Math.min(decoded.length - 8, SHADOW_2D_MAX_OFFSET);
+  for (let offset=8; offset<=end; offset+=8) {
+    fields.push([offset,decoded.readBigUInt64LE(offset).toString()]);
+  }
+  return fields;
+}
+function phase2dRecord(signature,event,tx) {
+  const row = shadowProgramData2cPending.get(signature);
+  // Called before Phase 2C deletes its pending record.
+  if (!row || !row.phase2d) return;
+  shadow2dStats.hydrated++;
+  if (row.targetEventCount!==1 || row.truncated) {
+    shadow2dStats.multiTarget++;
+    return;
+  }
+  const kind=event?.event_type;
+  if (kind!=="buy" && kind!=="sell") {
+    shadow2dStats.unmatchedEventType++;
+    return;
+  }
+  const amount=Number(event?.sol_amount);
+  if (event?.sol_amount==null || !Number.isFinite(amount) || amount<0) {
+    shadow2dStats.missingAmount++;
+    return;
+  }
+  const threshold=effectiveMinSolAmount();
+  if (!Number.isFinite(threshold) || threshold<=0) return;
+  const truth=BigInt(Math.round(amount*1e9));
+  const limit=BigInt(Math.round(threshold*1e9));
+  const actualSmall=truth<limit;
+  const evidence=getProgramData2cTransferEvidence(tx);
+  const transferLamports=evidence.largestTransferSol==null ? null :
+    BigInt(Math.round(evidence.largestTransferSol*1e9));
+  const rows=shadow2dStats.candidates[kind];
+  const matching=[];
+  for (const [offset,raw] of row.phase2d) {
+    const decoded=BigInt(raw);
+    let item=rows.get(offset);
+    if (!item) {
+      item={offset,samples:0,exact:0,thresholdCorrect:0,
+        falseSmall:0,falseKeep:0,transferExact:0,transferSamples:0,
+        zero:0,withinOnePct:0};
+      rows.set(offset,item);
+    }
+    item.samples++;
+    if (decoded===0n) item.zero++;
+    if (decoded===truth) item.exact++;
+    if (truth>0n && (decoded>truth?decoded-truth:truth-decoded)*100n<=truth)
+      item.withinOnePct++;
+    const predictedSmall=decoded<limit;
+    if (predictedSmall===actualSmall) item.thresholdCorrect++;
+    else if (predictedSmall) item.falseSmall++;
+    else item.falseKeep++;
+    if (transferLamports!==null) {
+      item.transferSamples++;
+      if (decoded===transferLamports) item.transferExact++;
+    }
+    if (decoded===truth) matching.push(offset);
+  }
+  shadow2dStats.eligible++;
+  shadow2dStats.byType[kind].eligible++;
+  // Retain only a small sample to explain exact field alignment.
+  if (shadow2dStats.examples.length<SHADOW_2D_EXAMPLES_LIMIT &&
+      (matching.length || shadow2dStats.examples.length<4)) {
+    shadow2dStats.examples.push({signature,eventType:kind,hydratedSol:amount,
+      exactOffsets:matching,transferSource:evidence.source,
+      largestTransferSol:evidence.largestTransferSol,
+      payloadBytes:row.payloadBytes,
+      offsets:row.phase2d.slice(0,16).map(([offset,raw])=>({offset,sol:Number(raw)/1e9}))});
+  }
+}
+function phase2dSummary() {
+  const summarize=(kind)=>[...shadow2dStats.candidates[kind].values()]
+    .map(r=>({...r,accuracyPct:r.samples?Number((100*r.thresholdCorrect/r.samples).toFixed(2)):null}))
+    .sort((a,b)=>a.falseSmall-b.falseSmall || b.exact-a.exact || b.thresholdCorrect-a.thresholdCorrect)
+    .slice(0,SHADOW_2D_TOP_OFFSETS);
+  return {captured:shadow2dStats.captured,hydrated:shadow2dStats.hydrated,
+    eligible:shadow2dStats.eligible,multiTarget:shadow2dStats.multiTarget,
+    missingAmount:shadow2dStats.missingAmount,
+    unmatchedEventType:shadow2dStats.unmatchedEventType,
+    byType:{buy:{...shadow2dStats.byType.buy,topOffsets:summarize("buy")},
+      sell:{...shadow2dStats.byType.sell,topOffsets:summarize("sell")}},
+    examples:shadow2dStats.examples};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -2079,6 +2182,8 @@ function samplePumpProgramDataPayloads(
             decoded.readBigUInt64LE(40).toString() : null;
           forensic.payloadBytes = decoded.length;
           forensic.payloadHex = decoded.toString("hex");
+          forensic.phase2d = phase2dCaptureOffsets(decoded);
+          shadow2dStats.captured++;
         } else {
           forensic.truncated = true;
           forensic.payloadHex = null; // ambiguous multiple events
@@ -14432,6 +14537,7 @@ recordProgramDataHydratedOutcome(
   event
 );
 
+phase2dRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17442,6 +17548,7 @@ shadowPumpProgramData: {
   shapesTracked:
     shadowProgramDataShapes.size,
 
+  phase2d: phase2dSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

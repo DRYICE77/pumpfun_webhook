@@ -1207,6 +1207,10 @@ const SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES =
 
 const shadowProgramDataLayoutSamples =
   new Map();
+
+// Phase 2B: only bounded signatures are retained.
+// Capture ALL target events within each selected signature.
+const SHADOW_PROGRAM_DATA_LAYOUT_MAX_EVENTS_PER_SIGNATURE = 16;
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -1928,44 +1932,49 @@ function samplePumpProgramDataPayloads(
       // • No database writes.
       // ------------------------------------------
 
+      // Phase 2B: count every target event in a selected signature.
       if (
-        discriminatorHex ===
-          SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR &&
-        signature &&
-        !shadowProgramDataLayoutSamples.has(
-          signature
-        ) &&
-        shadowProgramDataLayoutSamples.size <
-          SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES
+        discriminatorHex === SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR &&
+        signature
       ) {
-        shadowProgramDataLayoutSamples.set(
-          signature,
-          {
+        let sample = shadowProgramDataLayoutSamples.get(signature);
+        if (
+          !sample &&
+          shadowProgramDataLayoutSamples.size < SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES
+        ) {
+          sample = {
             signature,
-
             eventHint,
-
-            decodedBytes:
-              decoded.length,
-
-            discriminatorHex,
-
-            payloadHex:
-              decoded.toString("hex"),
-
-            payloadBase64:
-              payload,
-
-            capturedAt:
-              Date.now(),
-
-            hydratedEventType:
-              null,
-
-            hydratedSolAmount:
-              null,
+            capturedAt: Date.now(),
+            targetEventCount: 0,
+            truncated: false,
+            events: [],
+            hydratedEventType: null,
+            hydratedSolAmount: null,
+            hydrated: false,
+          };
+          shadowProgramDataLayoutSamples.set(signature, sample);
+        }
+        if (sample) {
+          sample.targetEventCount += 1;
+          if (
+            sample.events.length <
+            SHADOW_PROGRAM_DATA_LAYOUT_MAX_EVENTS_PER_SIGNATURE
+          ) {
+            const lamports =
+              decoded.length >= 48
+                ? decoded.readBigUInt64LE(40)
+                : null;
+            sample.events.push({
+              decodedBytes: decoded.length,
+              offset40Lamports: lamports === null
+                ? null : lamports.toString(),
+              payloadHex: decoded.toString("hex"),
+            });
+          } else {
+            sample.truncated = true;
           }
-        );
+        }
       }
 
     } catch (error) {
@@ -2156,40 +2165,20 @@ function buildSmallTradeShadowFingerprint(
 // Observation only.
 // ==================================================
 
-function recordProgramDataHydratedOutcome(
-  signature,
-  event
-) {
-  if (
-    !signature ||
-    !event
-  ) {
-    return;
-  }
+function recordProgramDataHydratedOutcome(signature, event) {
+  if (!signature || !event) return;
+  const row = shadowProgramDataLayoutSamples.get(signature);
+  if (!row) return;
 
-  const row =
-    shadowProgramDataLayoutSamples.get(
-      signature
-    );
-
-  if (!row) {
-    return;
-  }
-
-  row.hydratedEventType =
-    event.event_type ?? null;
-
-  const solAmount =
-    Number(
-      event.sol_amount
-    );
-
-  row.hydratedSolAmount =
-    Number.isFinite(solAmount)
-      ? solAmount
-      : null;
+  row.hydrated = true;
+  row.hydratedEventType = event.event_type ?? null;
+  // Missing amounts must NOT be converted to zero.
+  const raw = event.sol_amount;
+  const amount = raw === null || raw === undefined || raw === ""
+    ? NaN : Number(raw);
+  row.hydratedSolAmount = Number.isFinite(amount) && amount >= 0
+    ? amount : null;
 }
-
 
 // ==================================================
 // SHADOW SMALL-TRADE PREFILTER OUTCOME
@@ -17298,48 +17287,60 @@ shadowPumpProgramData: {
   shapesTracked:
     shadowProgramDataShapes.size,
 
-  layoutExperiment: {
-  targetDiscriminator:
-    SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
-
-  maxSamples:
-    SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES,
-
-  captured:
-    shadowProgramDataLayoutSamples.size,
-
-  hydrated:
-    [...shadowProgramDataLayoutSamples.values()]
-      .filter(
-        row =>
-          row.hydratedSolAmount !== null
-      ).length,
-
-  samples:
-    [...shadowProgramDataLayoutSamples.values()]
-      .slice(0, 10)
-      .map(
-        row => ({
-          signature:
-            row.signature,
-
-          eventHint:
-            row.eventHint,
-
-          decodedBytes:
-            row.decodedBytes,
-
-          hydratedEventType:
-            row.hydratedEventType,
-
-          hydratedSolAmount:
-            row.hydratedSolAmount,
-
-          payloadHex:
-            row.payloadHex,
-        })
-      ),
-},
+  layoutExperiment: (() => {
+    const rows = [...shadowProgramDataLayoutSamples.values()];
+    const threshold = effectiveMinSolAmount();
+    const evaluated = rows.map(row => {
+      const truth = row.hydratedSolAmount;
+      const truthLamports = truth === null
+        ? null : BigInt(Math.round(truth * 1e9)).toString();
+      const decoded = row.events.map(e => ({
+        ...e,
+        exactMatch: truthLamports !== null &&
+          e.offset40Lamports === truthLamports,
+        // Threshold comparisons use integer lamports, not floats.
+        thresholdSmall: e.offset40Lamports === null
+          ? null : BigInt(e.offset40Lamports) <
+            BigInt(Math.round(threshold * 1e9)),
+      }));
+      const single = row.targetEventCount === 1 && !row.truncated;
+      const matched = decoded.some(e => e.exactMatch);
+      const predictedSmall = single ? decoded[0]?.thresholdSmall : null;
+      const actualSmall = truth === null ? null :
+        BigInt(truthLamports) < BigInt(Math.round(threshold * 1e9));
+      return {
+        signature: row.signature,
+        eventHint: row.eventHint,
+        hydratedEventType: row.hydratedEventType,
+        hydratedSolAmount: truth,
+        targetEventCount: row.targetEventCount,
+        truncated: row.truncated,
+        single,
+        matched,
+        thresholdCorrect: predictedSmall === null || actualSmall === null
+          ? null : predictedSmall === actualSmall,
+        events: decoded,
+      };
+    });
+    const valid = evaluated.filter(r => r.hydratedSolAmount !== null);
+    const single = valid.filter(r => r.single);
+    const multi = valid.filter(r => !r.single);
+    return {
+      targetDiscriminator: SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
+      maxSamples: SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES,
+      captured: rows.length,
+      hydrated: valid.length,
+      singleHydrated: single.length,
+      singleExactMatches: single.filter(r => r.matched).length,
+      singleThresholdCorrect: single.filter(r => r.thresholdCorrect === true).length,
+      singleThresholdWrong: single.filter(r => r.thresholdCorrect === false).length,
+      multiHydrated: multi.length,
+      multiAnyExactMatch: multi.filter(r => r.matched).length,
+      truncated: rows.filter(r => r.truncated).length,
+      // Bound health-log output; no additional RPC or DB writes.
+      samples: evaluated.slice(0, 10),
+    };
+  })(),
 
   topShapes:
     [...shadowProgramDataShapes.values()]

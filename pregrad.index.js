@@ -1819,6 +1819,111 @@ function phase2gSummary(){return {
   examples:shadow2g.examples};}
 
 // ==================================================
+// PHASE 2H — SELL OFFSET40 ROLE / ZERO / UNMATCHED AUDIT
+// Shadow only. Reuses hydrated tx and Phase 2C payload.
+// No new RPC, SQL, websocket, filtering or queue changes.
+// IMPORTANT: a net account delta is not a trade amount.
+// ==================================================
+const SHADOW_2H_EXAMPLES_PER_CLASS=4;
+const SHADOW_2H_MAX_EXAMPLES=28;
+const shadow2h={eligible:0,skippedMulti:0,skippedMissing:0,errors:0,
+  zero:0,nonzero:0,exactDebit:0,exactCredit:0,unmatched:0,
+  failed:0,zeroNoDelta:0,zeroWithNonzeroDelta:0,
+  byLength:new Map(),byClass:new Map(),byPumpPosition:new Map(),
+  byProgramAndPosition:new Map(),examples:[]};
+function phase2hBump(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2hRecord(signature,event,tx){
+  const row=shadowProgramData2cPending.get(signature);
+  if(!row||!row.payloadHex||event?.event_type!=="sell")return;
+  if(row.targetEventCount!==1||row.truncated){shadow2h.skippedMulti++;return;}
+  if(event?.sol_amount==null||!Number.isFinite(Number(event.sol_amount))){shadow2h.skippedMissing++;return;}
+  try{
+    const bytes=Buffer.from(row.payloadHex,"hex");if(bytes.length<48)return;
+    const candidate=bytes.readBigUInt64LE(40);
+    const keys=getAccountKeyRows(tx);
+    const names=keys.map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const signers=new Set(keys.filter(k=>typeof k!=="string"&&k?.signer===true).map(k=>String(k.pubkey)));
+    const pumpPositions=new Map();
+    const pumpInstructions=[];
+    const addPump=(ins,origin,index)=>{
+      if(String(ins?.programId||"")!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const accounts=(ins?.accounts||[]).map(a=>typeof a==="number"?names[a]:String(a?.pubkey||a||""));
+      pumpInstructions.push({origin,index,accounts:accounts.length});
+      accounts.forEach((name,pos)=>{
+        if(!name)return;
+        if(!pumpPositions.has(name))pumpPositions.set(name,new Set());
+        pumpPositions.get(name).add(pos);
+      });
+    };
+    getInstructions(tx).forEach((ins,i)=>addPump(ins,"outer",i));
+    for(const group of getInnerInstructions(tx))
+      for(const [i,ins] of (group?.instructions||[]).entries())addPump(ins,"inner",i);
+    const pre=tx?.meta?.preBalances||[],post=tx?.meta?.postBalances||[];
+    const hasBalances=pre.length>0&&pre.length===post.length;
+    const changes=[];
+    if(hasBalances)for(let i=0;i<pre.length;i++){
+      if(!Number.isSafeInteger(pre[i])||!Number.isSafeInteger(post[i]))continue;
+      const delta=BigInt(post[i])-BigInt(pre[i]);if(delta===0n)continue;
+      const name=names[i]||String(i);
+      changes.push({index:i,account:name,delta,role:signers.has(name)?"signer":pumpPositions.has(name)?"pumpAccount":"other",
+        positions:[...(pumpPositions.get(name)||[])]});
+    }
+    const exactDebits=changes.filter(c=>c.delta===-candidate&&candidate>0n);
+    const exactCredits=changes.filter(c=>c.delta===candidate&&candidate>0n);
+    const failed=tx?.meta?.err!=null;
+    const cls=candidate===0n?(changes.length?"zero_with_changes":"zero_no_changes"):
+      exactDebits.length?"exact_debit":exactCredits.length?"credit_only":
+      !hasBalances?"no_balance_data":failed?"failed_transaction":
+      !pumpInstructions.length?"no_pump_instruction":"unmatched";
+    shadow2h.eligible++;phase2hBump(shadow2h.byClass,cls);
+    phase2hBump(shadow2h.byLength,String(bytes.length)+":"+cls);
+    if(candidate===0n){shadow2h.zero++;if(changes.length)shadow2h.zeroWithNonzeroDelta++;else shadow2h.zeroNoDelta++;}
+    else shadow2h.nonzero++;
+    if(exactDebits.length)shadow2h.exactDebit++;
+    if(exactCredits.length)shadow2h.exactCredit++;
+    if(candidate>0n&&!exactDebits.length)shadow2h.unmatched++;
+    if(failed)shadow2h.failed++;
+    for(const match of exactDebits){
+      for(const pos of match.positions){
+        phase2hBump(shadow2h.byPumpPosition,String(pos));
+        phase2hBump(shadow2h.byProgramAndPosition,bytes.length+":"+pos);
+      }
+    }
+    const exampleCount=shadow2h.examples.filter(x=>x.class===cls).length;
+    if(exampleCount<SHADOW_2H_EXAMPLES_PER_CLASS&&shadow2h.examples.length<SHADOW_2H_MAX_EXAMPLES){
+      const fee=tx?.meta?.fee;
+      const largest=changes.slice().sort((a,b)=>{
+        const x=a.delta<0n?-a.delta:a.delta,y=b.delta<0n?-b.delta:b.delta;
+        return x===y?0:x>y?-1:1;
+      }).slice(0,10);
+      const flow=getProgramData2cTransferEvidence(tx);
+      shadow2h.examples.push({signature,class:cls,payloadBytes:bytes.length,
+        offset40Lamports:candidate.toString(),offset40Sol:Number(candidate)/1e9,
+        hydratedSol:Number(event.sol_amount),failed,feeLamports:fee??null,
+        pumpInstructionCount:pumpInstructions.length,pumpInstructions,
+        exactDebitAccounts:exactDebits.slice(0,4).map(c=>({index:c.index,role:c.role,positions:c.positions})),
+        exactCreditAccounts:exactCredits.slice(0,4).map(c=>({index:c.index,role:c.role,positions:c.positions})),
+        largestChanges:largest.map(c=>({index:c.index,role:c.role,positions:c.positions,deltaLamports:c.delta.toString()})),
+        largestParsedTransferSol:flow.largestTransferSol,parsedTransferCount:flow.transferCount,
+        amountInLogRaw:flow.amountInLogRaw});
+    }
+  }catch(_err){shadow2h.errors++;}
+}
+function phase2hSummary(){
+  const top=(map,limit=20)=>[...map].sort((a,b)=>b[1]-a[1]).slice(0,limit).map(([key,count])=>({key,count}));
+  return {eligible:shadow2h.eligible,skippedMulti:shadow2h.skippedMulti,
+    skippedMissing:shadow2h.skippedMissing,errors:shadow2h.errors,
+    zero:shadow2h.zero,nonzero:shadow2h.nonzero,
+    exactDebit:shadow2h.exactDebit,exactCredit:shadow2h.exactCredit,
+    unmatched:shadow2h.unmatched,failed:shadow2h.failed,
+    zeroNoDelta:shadow2h.zeroNoDelta,zeroWithNonzeroDelta:shadow2h.zeroWithNonzeroDelta,
+    classes:top(shadow2h.byClass),byPayloadLengthAndClass:top(shadow2h.byLength),
+    matchedDebitPumpPositions:top(shadow2h.byPumpPosition),
+    matchedDebitLengthPositions:top(shadow2h.byProgramAndPosition),
+    examples:shadow2h.examples};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -14919,6 +15024,7 @@ phase2dRecord(item.signature, event, tx);
 phase2eRecord(item.signature, event, tx);
 phase2fRecord(item.signature, event, tx);
 phase2gRecord(item.signature, event, tx);
+phase2hRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17933,6 +18039,7 @@ shadowPumpProgramData: {
   phase2e: phase2eSummary(),
   phase2f: phase2fSummary(),
   phase2g: phase2gSummary(),
+  phase2h: phase2hSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

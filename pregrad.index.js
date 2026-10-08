@@ -1706,6 +1706,119 @@ function phase2fSummary(){
 }
 
 // ==================================================
+// PHASE 2G — SELL ACCOUNT-ROLE ATTRIBUTION (SHADOW)
+// Existing hydrated transaction only; zero extra RPC/SQL.
+// Compare offset40 to signed net lamport changes by
+// signer, Pump-instruction account, and other accounts.
+// These are role HINTS, not validated bonding-curve roles.
+// Preserve production thresholds, filters, and writes.
+// ==================================================
+const SHADOW_2G_EXAMPLE_LIMIT=24;
+const SHADOW_2G_ACCOUNT_LIMIT=128;
+const shadow2g={eligible:0,skippedMulti:0,missing:0,errors:0,
+  zero:0,nonzero:0,noBalances:0,noSigner:0,noPumpAccounts:0,
+  groups:new Map(),accounts:new Map(),examples:[]};
+function phase2gBucket(){return {samples:0,exactNet:0,exactDebit:0,
+  exactCredit:0,signerDebit:0,signerCredit:0,pumpDebit:0,pumpCredit:0,
+  otherDebit:0,otherCredit:0,feeAdjusted:0,unmatched:0};}
+function phase2gRecord(signature,event,tx){
+  const row=shadowProgramData2cPending.get(signature);
+  if(!row || !row.payloadHex || event?.event_type!=="sell")return;
+  if(row.targetEventCount!==1 || row.truncated){shadow2g.skippedMulti++;return;}
+  try{
+    const payload=Buffer.from(row.payloadHex,"hex");
+    if(payload.length<48)return;
+    const candidate=payload.readBigUInt64LE(40);
+    const keys=getAccountKeyRows(tx);
+    const names=keys.map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const signerSet=new Set(keys.filter(k=>typeof k!=="string"&&k?.signer===true)
+      .map(k=>String(k.pubkey)));
+    if(!signerSet.size)shadow2g.noSigner++;
+    // Account arrays on parsed and partially decoded Pump instructions.
+    // Do not infer fixed account positions or label any account as a pool.
+    const pumpSet=new Set();
+    const collect=ins=>{
+      if(String(ins?.programId||"")!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      for(const a of ins?.accounts||[]){
+        const name=typeof a==="number"?names[a]:String(a?.pubkey||a||"");
+        if(name)pumpSet.add(name);
+      }
+    };
+    getInstructions(tx).forEach(collect);
+    for(const group of getInnerInstructions(tx))
+      for(const ins of group?.instructions||[])collect(ins);
+    if(!pumpSet.size)shadow2g.noPumpAccounts++;
+    const pre=tx?.meta?.preBalances||[],post=tx?.meta?.postBalances||[];
+    if(!pre.length||pre.length!==post.length){shadow2g.noBalances++;return;}
+    const feeRaw=tx?.meta?.fee;
+    const fee=Number.isSafeInteger(Number(feeRaw))&&Number(feeRaw)>=0
+      ?BigInt(feeRaw):null;
+    const deltas=[];
+    for(let i=0;i<pre.length;i++){
+      if(!Number.isSafeInteger(pre[i])||!Number.isSafeInteger(post[i]))continue;
+      const delta=BigInt(post[i])-BigInt(pre[i]);
+      if(delta===0n)continue;
+      const account=names[i]||String(i);
+      const role=signerSet.has(account)?"signer":pumpSet.has(account)?"pumpAccount":"other";
+      const abs=delta<0n?-delta:delta;
+      const exact=abs===candidate;
+      const feeAdjusted=fee!==null&&(abs+fee===candidate||
+        (abs>=fee&&abs-fee===candidate));
+      deltas.push({account,index:i,role,deltaLamports:delta.toString(),
+        exact,feeAdjusted});
+      if(exact && shadow2g.accounts.has(account)){
+        const r=shadow2g.accounts.get(account);r.matches++;r[delta<0n?"debits":"credits"]++;
+      }else if(exact && shadow2g.accounts.size<SHADOW_2G_ACCOUNT_LIMIT){
+        shadow2g.accounts.set(account,{account,role,matches:1,
+          debits:delta<0n?1:0,credits:delta>0n?1:0});
+      }
+    }
+    const kind=candidate===0n?"zero":"nonzero";
+    shadow2g[kind]++;
+    shadow2g.eligible++;
+    const b=shadow2g.groups.get(kind)||phase2gBucket();b.samples++;
+    const matches=deltas.filter(d=>d.exact);
+    if(matches.length){
+      b.exactNet++;
+      if(matches.some(d=>BigInt(d.deltaLamports)<0n))b.exactDebit++;
+      if(matches.some(d=>BigInt(d.deltaLamports)>0n))b.exactCredit++;
+      for(const role of ["signer","pumpAccount","other"]){
+        if(matches.some(d=>d.role===role&&BigInt(d.deltaLamports)<0n))b[role==="pumpAccount"?"pumpDebit":role+"Debit"]++;
+        if(matches.some(d=>d.role===role&&BigInt(d.deltaLamports)>0n))b[role==="pumpAccount"?"pumpCredit":role+"Credit"]++;
+      }
+    }else b.unmatched++;
+    if(deltas.some(d=>d.feeAdjusted))b.feeAdjusted++;
+    shadow2g.groups.set(kind,b);
+    const exampleClass=candidate===0n?"zero":matches.length?
+      matches.some(d=>d.role==="signer")?"signerMatch":
+      matches.some(d=>d.role==="pumpAccount")?"pumpAccountMatch":"otherMatch":"unmatched";
+    if(shadow2g.examples.length<SHADOW_2G_EXAMPLE_LIMIT&&
+      shadow2g.examples.filter(e=>e.class===exampleClass).length<5){
+      shadow2g.examples.push({signature,class:exampleClass,payloadBytes:payload.length,
+        offset40Lamports:candidate.toString(),offset40Sol:Number(candidate)/1e9,
+        hydratedSol:event?.sol_amount??null,feeLamports:fee?.toString()??null,
+        signerAccounts:[...signerSet].slice(0,4),
+        pumpInstructionAccounts:[...pumpSet].slice(0,20),
+        exactMatches:matches.slice(0,8),
+        largestChanges:deltas.sort((a,b)=>{
+          const x=BigInt(a.deltaLamports),y=BigInt(b.deltaLamports);
+          const ax=x<0n?-x:x,ay=y<0n?-y:y;
+          return ax===ay?0:ax>ay?-1:1;
+        }).slice(0,12)});
+    }
+  }catch(_err){shadow2g.errors++;}
+}
+function phase2gSummary(){return {
+  eligible:shadow2g.eligible,skippedMulti:shadow2g.skippedMulti,
+  errors:shadow2g.errors,zero:shadow2g.zero,nonzero:shadow2g.nonzero,
+  noBalances:shadow2g.noBalances,noSigner:shadow2g.noSigner,
+  noPumpAccounts:shadow2g.noPumpAccounts,
+  groups:[...shadow2g.groups].map(([kind,counts])=>({kind,...counts})),
+  frequentMatchedAccounts:[...shadow2g.accounts.values()]
+    .sort((a,b)=>b.matches-a.matches).slice(0,12),
+  examples:shadow2g.examples};}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -14805,6 +14918,7 @@ recordProgramDataHydratedOutcome(
 phase2dRecord(item.signature, event, tx);
 phase2eRecord(item.signature, event, tx);
 phase2fRecord(item.signature, event, tx);
+phase2gRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17818,6 +17932,7 @@ shadowPumpProgramData: {
   phase2d: phase2dSummary(),
   phase2e: phase2eSummary(),
   phase2f: phase2fSummary(),
+  phase2g: phase2gSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

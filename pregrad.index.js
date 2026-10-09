@@ -1924,6 +1924,178 @@ function phase2hSummary(){
 }
 
 // ==================================================
+// PHASE 2I — SELL OFFSET40 TARGETED RECONCILIATION
+// SHADOW ONLY: uses already hydrated tx + captured bytes.
+// No additional RPC, SQL, filtering, queue or WS changes.
+// Transaction net deltas can contain multiple instructions;
+// instruction account positions are hints, not verified roles.
+// ==================================================
+const SHADOW_2I_EXAMPLES_PER_CLASS=3;
+const SHADOW_2I_MAX_EXAMPLES=24;
+const shadow2i={seen:0,eligible:0,missingRow:0,missingPayload:0,
+  skippedMulti:0,skippedTruncated:0,skippedNonSell:0,
+  missingHydratedAmount:0,shortPayload:0,missingBalances:0,
+  balanceLengthMismatch:0,unsafeBalance:0,missingAccountKeys:0,
+  noPumpInstruction:0,missingPumpAccounts:0,failed:0,errors:0,
+  zero:0,nonzero:0,exactAnyDebit:0,exactTargetDebit:0,
+  exactTargetCredit:0,zeroWithBalanceChanges:0,
+  byClass:new Map(),byLengthClass:new Map(),byPosition:new Map(),
+  byPositionDelta:new Map(),byFeeRelation:new Map(),
+  byTransferRelation:new Map(),byZeroLayout:new Map(),
+  byInstructionCount:new Map(),examples:[]};
+function phase2iBump(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2iAbs(v){return v<0n?-v:v;}
+function phase2iTop(map,n=20){return [...map].sort((a,b)=>b[1]-a[1]).slice(0,n)
+  .map(([key,count])=>({key,count}));}
+function phase2iRecord(signature,event,tx){
+  if(event?.event_type!=="sell"){shadow2i.skippedNonSell++;return;}
+  shadow2i.seen++;
+  const row=shadowProgramData2cPending.get(signature);
+  if(!row){shadow2i.missingRow++;return;}
+  if(!row.payloadHex){shadow2i.missingPayload++;return;}
+  if(row.targetEventCount!==1){shadow2i.skippedMulti++;return;}
+  if(row.truncated){shadow2i.skippedTruncated++;return;}
+  if(event.sol_amount==null||!Number.isFinite(Number(event.sol_amount))){
+    shadow2i.missingHydratedAmount++;return;
+  }
+  try{
+    const payload=Buffer.from(row.payloadHex,"hex");
+    if(payload.length<48){shadow2i.shortPayload++;return;}
+    const candidate=payload.readBigUInt64LE(40);
+    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+    if(!Array.isArray(pre)||!Array.isArray(post)||!pre.length||!post.length){
+      shadow2i.missingBalances++;return;
+    }
+    if(pre.length!==post.length){shadow2i.balanceLengthMismatch++;return;}
+    const keys=getAccountKeyRows(tx);
+    if(!Array.isArray(keys)||!keys.length){shadow2i.missingAccountKeys++;return;}
+    const names=keys.map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const deltas=new Map();let unsafe=false;
+    for(let i=0;i<pre.length;i++){
+      if(!Number.isSafeInteger(pre[i])||!Number.isSafeInteger(post[i])){unsafe=true;continue;}
+      const d=BigInt(post[i])-BigInt(pre[i]);
+      if(d!==0n&&names[i])deltas.set(names[i],{index:i,delta:d});
+    }
+    if(unsafe){shadow2i.unsafeBalance++;return;}
+    const pump=[];
+    const add=(ins,origin,idx)=>{
+      if(String(ins?.programId||"")!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const accounts=(ins?.accounts||[]).map(a=>typeof a==="number"?names[a]:String(a?.pubkey||a||""));
+      pump.push({origin,index:idx,accounts});
+    };
+    getInstructions(tx).forEach((ins,i)=>add(ins,"outer",i));
+    for(const group of getInnerInstructions(tx))
+      (group?.instructions||[]).forEach((ins,i)=>add(ins,"inner",i));
+    if(!pump.length)shadow2i.noPumpInstruction++;
+    if(pump.length&&!pump.some(p=>p.accounts.length))shadow2i.missingPumpAccounts++;
+    if(tx?.meta?.err!=null)shadow2i.failed++;
+    shadow2i.eligible++;
+    const feeRaw=tx?.meta?.fee;
+    const fee=Number.isSafeInteger(feeRaw)&&feeRaw>=0?BigInt(feeRaw):null;
+    const targetPositions=[3,5,10];
+    const target=[];
+    for(const ins of pump)for(const pos of targetPositions){
+      const name=ins.accounts[pos];if(!name)continue;
+      const rowDelta=deltas.get(name);
+      const d=rowDelta?.delta??0n;
+      const abs=phase2iAbs(d);
+      const exactDebit=candidate>0n&&d===-candidate;
+      const exactCredit=candidate>0n&&d===candidate;
+      const difference=abs>candidate?abs-candidate:candidate-abs;
+      const feeEqual=fee!==null&&difference===fee;
+      const feeMultiple=fee!==null&&fee>0n&&difference>0n&&difference%fee===0n&&difference/fee<=10n;
+      const close1pct=candidate>0n&&difference*100n<=candidate;
+      const label=exactDebit?"exact_debit":exactCredit?"exact_credit":
+        d===0n?"zero_delta":feeEqual?"fee_equal":feeMultiple?"fee_multiple_2to10":
+        close1pct?"within_1pct":"other";
+      phase2iBump(shadow2i.byPosition,`${pos}:${label}`);
+      if(d<0n)phase2iBump(shadow2i.byPositionDelta,`${pos}:debit`);
+      else if(d>0n)phase2iBump(shadow2i.byPositionDelta,`${pos}:credit`);
+      else phase2iBump(shadow2i.byPositionDelta,`${pos}:zero`);
+      if(d<0n&&candidate>0n){
+        const relation=difference===0n?"exact":feeEqual?"fee_equal":
+          feeMultiple?"fee_multiple":close1pct?"within_1pct":"other";
+        phase2iBump(shadow2i.byFeeRelation,`${pos}:${relation}`);
+      }
+      target.push({origin:ins.origin,instructionIndex:ins.index,position:pos,
+        accountIndex:rowDelta?.index??null,deltaLamports:d.toString(),
+        differenceLamports:difference.toString(),relation:label});
+    }
+    const anyDebit=[...deltas.values()].some(r=>candidate>0n&&r.delta===-candidate);
+    const targetDebit=target.some(r=>r.relation==="exact_debit");
+    const targetCredit=target.some(r=>r.relation==="exact_credit");
+    if(anyDebit)shadow2i.exactAnyDebit++;
+    if(targetDebit)shadow2i.exactTargetDebit++;
+    if(targetCredit)shadow2i.exactTargetCredit++;
+    if(candidate===0n){shadow2i.zero++;if(deltas.size)shadow2i.zeroWithBalanceChanges++;}
+    else shadow2i.nonzero++;
+    const cls=candidate===0n?"zero":targetDebit?"target_exact_debit":
+      anyDebit?"other_exact_debit":targetCredit?"target_credit_only":
+      !pump.length?"no_pump_instruction":"unmatched";
+    phase2iBump(shadow2i.byClass,cls);
+    phase2iBump(shadow2i.byLengthClass,`${payload.length}:${cls}`);
+    phase2iBump(shadow2i.byInstructionCount,String(pump.length));
+    if(candidate===0n){
+      const layout=target.map(t=>`${t.position}:${BigInt(t.deltaLamports)<0n?"debit":BigInt(t.deltaLamports)>0n?"credit":"zero"}`).join(",")||"none";
+      phase2iBump(shadow2i.byZeroLayout,`${payload.length}:${layout.slice(0,100)}`);
+    }
+    // Parsed transfers are supplemental only: no mint inference for SPL transfers.
+    const parsed=[];
+    const scan=(ins,origin)=>{
+      const info=ins?.parsed?.info||{};
+      if(ins?.parsed?.type==="transfer"&&info.lamports!=null){
+        const n=Number(info.lamports);
+        if(Number.isSafeInteger(n)&&n>=0)parsed.push({origin,kind:"native",lamports:BigInt(n)});
+      }else if((ins?.parsed?.type==="transfer"||ins?.parsed?.type==="transferChecked")&&
+        info.mint==="So11111111111111111111111111111111111111112"){
+        const n=info?.tokenAmount?.amount??info.amount;
+        if(typeof n==="string"&&/^\d+$/.test(n))parsed.push({origin,kind:"explicit_wsol",lamports:BigInt(n)});
+      }
+    };
+    getInstructions(tx).forEach(i=>scan(i,"outer"));
+    for(const g of getInnerInstructions(tx))for(const i of g?.instructions||[])scan(i,"inner");
+    if(candidate>0n){
+      phase2iBump(shadow2i.byTransferRelation,parsed.some(t=>t.lamports===candidate)?"exact":
+        parsed.length?"transfers_present_no_exact":"no_recognized_transfers");
+    }
+    const n=shadow2i.examples.filter(e=>e.class===cls).length;
+    if(n<SHADOW_2I_EXAMPLES_PER_CLASS&&shadow2i.examples.length<SHADOW_2I_MAX_EXAMPLES){
+      const biggest=[...deltas.values()].sort((a,b)=>{
+        const x=phase2iAbs(a.delta),y=phase2iAbs(b.delta);return x===y?0:x>y?-1:1;
+      }).slice(0,8).map(r=>({index:r.index,deltaLamports:r.delta.toString()}));
+      shadow2i.examples.push({signature,class:cls,payloadBytes:payload.length,
+        candidateLamports:candidate.toString(),hydratedSol:Number(event.sol_amount),
+        feeLamports:fee?.toString()??null,pumpInstructionCount:pump.length,
+        target:target.slice(0,15),biggest,parsedTransfers:parsed.slice(0,8).map(t=>
+          ({origin:t.origin,kind:t.kind,lamports:t.lamports.toString()}))});
+    }
+  }catch(_err){shadow2i.errors++;}
+}
+function phase2iSummary(){return {
+  seen:shadow2i.seen,eligible:shadow2i.eligible,missingRow:shadow2i.missingRow,
+  missingPayload:shadow2i.missingPayload,skippedMulti:shadow2i.skippedMulti,
+  skippedTruncated:shadow2i.skippedTruncated,skippedNonSell:shadow2i.skippedNonSell,
+  missingHydratedAmount:shadow2i.missingHydratedAmount,
+  shortPayload:shadow2i.shortPayload,missingBalances:shadow2i.missingBalances,
+  balanceLengthMismatch:shadow2i.balanceLengthMismatch,
+  unsafeBalance:shadow2i.unsafeBalance,missingAccountKeys:shadow2i.missingAccountKeys,
+  noPumpInstruction:shadow2i.noPumpInstruction,
+  missingPumpAccounts:shadow2i.missingPumpAccounts,failed:shadow2i.failed,
+  errors:shadow2i.errors,zero:shadow2i.zero,nonzero:shadow2i.nonzero,
+  exactAnyDebit:shadow2i.exactAnyDebit,exactTargetDebit:shadow2i.exactTargetDebit,
+  exactTargetCredit:shadow2i.exactTargetCredit,
+  zeroWithBalanceChanges:shadow2i.zeroWithBalanceChanges,
+  classes:phase2iTop(shadow2i.byClass),byPayloadLengthAndClass:phase2iTop(shadow2i.byLengthClass),
+  targetPositionRelations:phase2iTop(shadow2i.byPosition,24),
+  targetPositionSigns:phase2iTop(shadow2i.byPositionDelta),
+  feeRelations:phase2iTop(shadow2i.byFeeRelation),
+  parsedTransferRelations:phase2iTop(shadow2i.byTransferRelation),
+  zeroLayouts:phase2iTop(shadow2i.byZeroLayout,12),
+  pumpInstructionCounts:phase2iTop(shadow2i.byInstructionCount),
+  examples:shadow2i.examples};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -15025,6 +15197,7 @@ phase2eRecord(item.signature, event, tx);
 phase2fRecord(item.signature, event, tx);
 phase2gRecord(item.signature, event, tx);
 phase2hRecord(item.signature, event, tx);
+phase2iRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -18040,6 +18213,7 @@ shadowPumpProgramData: {
   phase2f: phase2fSummary(),
   phase2g: phase2gSummary(),
   phase2h: phase2hSummary(),
+  phase2i: phase2iSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

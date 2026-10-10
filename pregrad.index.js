@@ -164,6 +164,80 @@ const HELIUS_RPC_BURST_CAPACITY =
   );
 
 // ==================================================
+// HELIUS OPTIMIZATION V1 — ADAPTIVE PACER (OPT-IN)
+//
+// Default SHADOW: learn from 429s without changing starts.
+// Enable only after reviewing shadow measurements.
+// No extra RPC, SQL, subscriptions, or trade filtering.
+// ==================================================
+const HELIUS_ADAPTIVE_PACER_ENABLED =
+  process.env.HELIUS_ADAPTIVE_PACER_ENABLED === "true";
+const HELIUS_ADAPTIVE_FLOOR_RPS = Math.max(1, Math.min(
+  48, Number(process.env.HELIUS_ADAPTIVE_FLOOR_RPS || 15) || 15
+));
+const HELIUS_ADAPTIVE_CEILING_RPS = Math.max(
+  HELIUS_ADAPTIVE_FLOOR_RPS,
+  Math.min(HELIUS_RPC_MAX_STARTS_PER_SECOND,
+    Number(process.env.HELIUS_ADAPTIVE_CEILING_RPS || 48) || 48)
+);
+const HELIUS_ADAPTIVE_RECOVERY_MS = 15000;
+const HELIUS_ADAPTIVE_DECREASE_FACTOR = 0.70;
+const HELIUS_ADAPTIVE_INCREASE_RPS = 1;
+const heliusAdaptive = {
+  suggestedRps: HELIUS_ADAPTIVE_CEILING_RPS,
+  actualRps: HELIUS_ADAPTIVE_PACER_ENABLED
+    ? HELIUS_ADAPTIVE_CEILING_RPS : HELIUS_RPC_MAX_STARTS_PER_SECOND,
+  last429At: 0, lastAdjustmentAt: Date.now(),
+  rateLimitEvents: 0, decreases: 0, increases: 0,
+  recent429ByMethod: Object.create(null),
+};
+function heliusAdaptiveObserve429(method) {
+  const now = Date.now();
+  heliusAdaptive.rateLimitEvents++;
+  const key = String(method || "unknown");
+  heliusAdaptive.recent429ByMethod[key] =
+    (heliusAdaptive.recent429ByMethod[key] || 0) + 1;
+  heliusAdaptive.last429At = now;
+  // A multiplicative decrease at most once per 1s avoids
+  // hundreds of simultaneous 429s collapsing the rate to zero.
+  if (now - heliusAdaptive.lastAdjustmentAt >= 1000) {
+    heliusAdaptive.suggestedRps = Math.max(
+      HELIUS_ADAPTIVE_FLOOR_RPS,
+      Math.floor(heliusAdaptive.suggestedRps * HELIUS_ADAPTIVE_DECREASE_FACTOR)
+    );
+    heliusAdaptive.lastAdjustmentAt = now;
+    heliusAdaptive.decreases++;
+    if (HELIUS_ADAPTIVE_PACER_ENABLED)
+      heliusAdaptive.actualRps = heliusAdaptive.suggestedRps;
+  }
+}
+function heliusAdaptiveTick() {
+  const now = Date.now();
+  if (now - heliusAdaptive.last429At < HELIUS_ADAPTIVE_RECOVERY_MS) return;
+  if (now - heliusAdaptive.lastAdjustmentAt < HELIUS_ADAPTIVE_RECOVERY_MS) return;
+  heliusAdaptive.suggestedRps = Math.min(
+    HELIUS_ADAPTIVE_CEILING_RPS,
+    heliusAdaptive.suggestedRps + HELIUS_ADAPTIVE_INCREASE_RPS
+  );
+  heliusAdaptive.lastAdjustmentAt = now;
+  heliusAdaptive.increases++;
+  if (HELIUS_ADAPTIVE_PACER_ENABLED)
+    heliusAdaptive.actualRps = heliusAdaptive.suggestedRps;
+}
+function heliusAdaptiveSummary() {
+  return {mode: HELIUS_ADAPTIVE_PACER_ENABLED ? "active" : "shadow",
+    suggestedRps: heliusAdaptive.suggestedRps,
+    actualRps: heliusAdaptive.actualRps,
+    floorRps: HELIUS_ADAPTIVE_FLOOR_RPS,
+    ceilingRps: HELIUS_ADAPTIVE_CEILING_RPS,
+    rateLimitEvents: heliusAdaptive.rateLimitEvents,
+    decreases: heliusAdaptive.decreases, increases: heliusAdaptive.increases,
+    last429AgeMs: heliusAdaptive.last429At
+      ? Date.now() - heliusAdaptive.last429At : null,
+    byMethod: {...heliusAdaptive.recent429ByMethod}};
+}
+
+// ==================================================
 // 2C-2. DATABASE WRITE DISPATCHER
 //
 // Signature workers fetch/classify transactions and
@@ -2096,216 +2170,6 @@ function phase2iSummary(){return {
 }
 
 // ==================================================
-
-// ==================================================
-// PHASE 2J — SELL PAYOUT / FEE / WSOL RECONCILIATION
-// SHADOW ONLY. Existing Phase 2C bytes and hydrated tx.
-// No RPC, DB, WS, queue, or production filter changes.
-// Native account balances are TRANSACTION NET changes;
-// parsed transfers and WSOL deltas are supporting evidence,
-// NOT a verified per-trade payout or a safe skip oracle.
-// ==================================================
-const SHADOW_2J_EXAMPLES_PER_CLASS=3;
-const SHADOW_2J_MAX_EXAMPLES=30;
-const shadow2j={seen:0,eligible:0,missingRow:0,missingPayload:0,
-  multiTarget:0,truncated:0,missingHydrated:0,shortPayload:0,
-  missingBalances:0,unsafeBalances:0,missingKeys:0,failed:0,errors:0,
-  zero:0,nonzero:0,exactNetDebit:0,exactNetCredit:0,
-  exactNativeTransfer:0,exactWsolTransfer:0,exactWsolDelta:0,
-  zeroWithNativeTransfer:0,zeroWithWsolMovement:0,
-  thresholdFalseSmall:0,thresholdFalseKeep:0,
-  byClass:new Map(),byLengthClass:new Map(),byPumpPosition:new Map(),
-  byFeeGap:new Map(),byNativeTransfer:new Map(),byWsolTransfer:new Map(),
-  byWsolDelta:new Map(),byInstructionContext:new Map(),
-  byZeroEvidence:new Map(),examples:[]};
-function phase2jBump(m,k){m.set(k,(m.get(k)||0)+1);}
-function phase2jTop(m,n=18){return [...m].sort((a,b)=>b[1]-a[1]).slice(0,n)
-  .map(([key,count])=>({key,count}));}
-function phase2jAbs(x){return x<0n?-x:x;}
-function phase2jBig(v){
-  if(typeof v==='bigint')return v>=0n?v:null;
-  if(typeof v==='string'&&/^\d+$/.test(v))return BigInt(v);
-  if(typeof v==='number'&&Number.isSafeInteger(v)&&v>=0)return BigInt(v);
-  return null;
-}
-function phase2jRecord(signature,event,tx){
-  if(event?.event_type!=="sell")return;
-  shadow2j.seen++;
-  const row=shadowProgramData2cPending.get(signature);
-  if(!row){shadow2j.missingRow++;return;}
-  if(!row.payloadHex){shadow2j.missingPayload++;return;}
-  if(row.targetEventCount!==1){shadow2j.multiTarget++;return;}
-  if(row.truncated){shadow2j.truncated++;return;}
-  const hydrated=Number(event?.sol_amount);
-  if(event?.sol_amount==null||!Number.isFinite(hydrated)||hydrated<0){shadow2j.missingHydrated++;return;}
-  try{
-    const bytes=Buffer.from(row.payloadHex,'hex');
-    if(bytes.length<48){shadow2j.shortPayload++;return;}
-    const amount=bytes.readBigUInt64LE(40);
-    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
-    if(!Array.isArray(pre)||!Array.isArray(post)||!pre.length||pre.length!==post.length){shadow2j.missingBalances++;return;}
-    const keyRows=getAccountKeyRows(tx);
-    if(!Array.isArray(keyRows)||!keyRows.length){shadow2j.missingKeys++;return;}
-    const keys=keyRows.map(x=>String(typeof x==='string'?x:(x?.pubkey||'')));
-    if(pre.some(x=>!Number.isSafeInteger(x))||post.some(x=>!Number.isSafeInteger(x))){shadow2j.unsafeBalances++;return;}
-    const deltas=new Map();
-    for(let i=0;i<pre.length;i++){
-      if(!keys[i])continue;
-      const delta=BigInt(post[i])-BigInt(pre[i]);
-      if(delta!==0n)deltas.set(keys[i],{index:i,delta});
-    }
-    const pump=[];
-    const addPump=(ins,origin,idx)=>{
-      if(String(ins?.programId||'')!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
-      pump.push({origin,index:idx,accounts:(ins.accounts||[]).map(a=>
-        typeof a==='number'?keys[a]:String(a?.pubkey||a||''))});
-    };
-    getInstructions(tx).forEach((ins,i)=>addPump(ins,'outer',i));
-    for(const group of getInnerInstructions(tx))
-      (group?.instructions||[]).forEach((ins,i)=>addPump(ins,'inner',i));
-    const pumpPositions=new Map();
-    for(const ins of pump)ins.accounts.forEach((key,pos)=>{
-      if(!key)return;
-      if(!pumpPositions.has(key))pumpPositions.set(key,new Set());
-      pumpPositions.get(key).add(pos);
-    });
-    const exactDebits=[...deltas.entries()].filter(([k,v])=>amount>0n&&v.delta===-amount);
-    const exactCredits=[...deltas.entries()].filter(([k,v])=>amount>0n&&v.delta===amount);
-    const fee=phase2jBig(tx?.meta?.fee);
-    const native=[];const wsol=[];
-    const WSOL='So11111111111111111111111111111111111111112';
-    const tokenMints=new Map();
-    const tokenBalances=[...(tx?.meta?.preTokenBalances||[]),...(tx?.meta?.postTokenBalances||[])];
-    for(const b of tokenBalances){
-      if(b?.mint!==WSOL)continue;
-      const key=keys[b.accountIndex];if(key)tokenMints.set(key,WSOL);
-    }
-    const scan=(ins,origin,outerIndex)=>{
-      const info=ins?.parsed?.info||{};
-      const type=String(ins?.parsed?.type||'');
-      const program=String(ins?.program||'');
-      if(type!=='transfer'&&type!=='transferChecked')return;
-      if(info.lamports!=null&&type==='transfer'){
-        const n=phase2jBig(info.lamports);
-        if(n!==null)native.push({origin,outerIndex,amount:n,
-          source:String(info.source||''),destination:String(info.destination||'')});
-      }
-      if(program!=='spl-token'&&program!=='spl-token-2022')return;
-      const mint=String(info.mint||tokenMints.get(String(info.source||''))||tokenMints.get(String(info.destination||''))||'');
-      if(mint!==WSOL)return;
-      const n=phase2jBig(info?.tokenAmount?.amount??info.amount);
-      if(n!==null)wsol.push({origin,outerIndex,amount:n,
-        source:String(info.source||''),destination:String(info.destination||''),
-        mintEvidence:info.mint===WSOL?'explicit':'token_balance_index'});
-    };
-    getInstructions(tx).forEach((ins,i)=>scan(ins,'outer',i));
-    for(const group of getInnerInstructions(tx))
-      (group?.instructions||[]).forEach(ins=>scan(ins,'inner',group.index));
-    const parseToken=(b)=>phase2jBig(b?.uiTokenAmount?.amount);
-    const wsolAccounts=new Map();
-    for(const [side,items] of [['pre',tx?.meta?.preTokenBalances||[]],['post',tx?.meta?.postTokenBalances||[]]]){
-      for(const b of items){
-        if(b?.mint!==WSOL)continue;
-        const key=keys[b.accountIndex]||String(b.accountIndex);
-        const n=parseToken(b);if(n===null)continue;
-        if(!wsolAccounts.has(key))wsolAccounts.set(key,{pre:null,post:null,owner:null,index:b.accountIndex});
-        const item=wsolAccounts.get(key);item[side]=n;
-        if(b.owner)item.owner=String(b.owner);
-      }
-    }
-    const wsolDeltas=[];
-    for(const [key,v] of wsolAccounts){
-      if(v.pre===null||v.post===null)continue; // No fabricated zero for opened/closed accounts.
-      const delta=v.post-v.pre;
-      if(delta!==0n)wsolDeltas.push({key,index:v.index,delta,ownerKnown:!!v.owner});
-    }
-    const exactNative=native.some(t=>amount>0n&&t.amount===amount);
-    const exactWsol=wsol.some(t=>amount>0n&&t.amount===amount);
-    const exactWsolDelta=wsolDeltas.some(t=>amount>0n&&phase2jAbs(t.delta)===amount);
-    const threshold=effectiveMinSolAmount();
-    const limit=Number.isFinite(threshold)&&threshold>0?BigInt(Math.round(threshold*1e9)):null;
-    const hydratedLamports=BigInt(Math.round(hydrated*1e9));
-    const falseSmall=limit!==null&&amount<limit&&hydratedLamports>=limit;
-    const falseKeep=limit!==null&&amount>=limit&&hydratedLamports<limit;
-    if(falseSmall)shadow2j.thresholdFalseSmall++;
-    if(falseKeep)shadow2j.thresholdFalseKeep++;
-    const cls=amount===0n?'zero':exactDebits.length?'exact_net_debit':
-      exactNative?'exact_native_transfer':exactWsol?'exact_wsol_transfer':
-      exactWsolDelta?'exact_wsol_balance_delta':'unreconciled';
-    shadow2j.eligible++;
-    if(tx?.meta?.err!=null)shadow2j.failed++;
-    if(amount===0n){
-      shadow2j.zero++;
-      if(native.some(t=>t.amount>0n))shadow2j.zeroWithNativeTransfer++;
-      if(wsol.some(t=>t.amount>0n)||wsolDeltas.length)shadow2j.zeroWithWsolMovement++;
-      phase2jBump(shadow2j.byZeroEvidence,`${bytes.length}:native${native.length?'Y':'N'}:wsolTransfer${wsol.length?'Y':'N'}:wsolDelta${wsolDeltas.length?'Y':'N'}`);
-    }else shadow2j.nonzero++;
-    if(exactDebits.length)shadow2j.exactNetDebit++;
-    if(exactCredits.length)shadow2j.exactNetCredit++;
-    if(exactNative)shadow2j.exactNativeTransfer++;
-    if(exactWsol)shadow2j.exactWsolTransfer++;
-    if(exactWsolDelta)shadow2j.exactWsolDelta++;
-    phase2jBump(shadow2j.byClass,cls);
-    phase2jBump(shadow2j.byLengthClass,`${bytes.length}:${cls}`);
-    phase2jBump(shadow2j.byInstructionContext,`${pump.length}pump:${native.length}native:${wsol.length}wsol:${wsolDeltas.length}wsolDeltas`);
-    for(const [key,v] of exactDebits)for(const pos of pumpPositions.get(key)||[])
-      phase2jBump(shadow2j.byPumpPosition,`${bytes.length}:${pos}`);
-    // Fee relationships: compare ONLY debits, not arbitrary absolute credits.
-    const debitGaps=[...deltas.values()].filter(v=>v.delta<0n&&amount>0n)
-      .map(v=>phase2jAbs(-v.delta-amount));
-    const bestGap=debitGaps.length?debitGaps.reduce((a,b)=>a<b?a:b):null;
-    const feeClass=bestGap===null?'no_debit':bestGap===0n?'exact':
-      fee!==null&&bestGap===fee?'equals_tx_fee':
-      fee!==null&&fee>0n&&bestGap%fee===0n&&bestGap/fee<=10n?'multiple_tx_fee':
-      amount>0n&&bestGap*100n<=amount?'within_1pct':'other';
-    if(amount>0n)phase2jBump(shadow2j.byFeeGap,`${bytes.length}:${feeClass}`);
-    phase2jBump(shadow2j.byNativeTransfer,`${bytes.length}:${native.length?'present':'absent'}:${exactNative?'exact':'not_exact'}`);
-    phase2jBump(shadow2j.byWsolTransfer,`${bytes.length}:${wsol.length?'present':'absent'}:${exactWsol?'exact':'not_exact'}`);
-    phase2jBump(shadow2j.byWsolDelta,`${bytes.length}:${wsolDeltas.length?'present':'absent'}:${exactWsolDelta?'exact':'not_exact'}`);
-    const examplesForClass=shadow2j.examples.filter(x=>x.class===cls).length;
-    if(examplesForClass<SHADOW_2J_EXAMPLES_PER_CLASS&&shadow2j.examples.length<SHADOW_2J_MAX_EXAMPLES){
-      shadow2j.examples.push({signature,class:cls,payloadBytes:bytes.length,
-        offset40Lamports:amount.toString(),hydratedSol:hydrated,
-        hydratedLamports:hydratedLamports.toString(),thresholdFalseSmall:falseSmall,
-        feeLamports:fee?.toString()??null,closestDebitGapLamports:bestGap?.toString()??null,
-        feeRelation:feeClass,pumpInstructionCount:pump.length,
-        exactDebitPositions:exactDebits.slice(0,4).map(([k,v])=>({accountIndex:v.index,positions:[...(pumpPositions.get(k)||[])]})),
-        nativeTransfers:native.slice(0,8).map(t=>({origin:t.origin,outerIndex:t.outerIndex,lamports:t.amount.toString(),
-          sourceIndex:keys.indexOf(t.source),destinationIndex:keys.indexOf(t.destination)})),
-        wsolTransfers:wsol.slice(0,8).map(t=>({origin:t.origin,outerIndex:t.outerIndex,lamports:t.amount.toString(),
-          mintEvidence:t.mintEvidence,sourceIndex:keys.indexOf(t.source),destinationIndex:keys.indexOf(t.destination)})),
-        wsolBalanceDeltas:wsolDeltas.slice(0,8).map(t=>({accountIndex:t.index,deltaLamports:t.delta.toString(),ownerKnown:t.ownerKnown})),
-        biggestNativeDeltas:[...deltas.values()].sort((a,b)=>{
-          const x=phase2jAbs(a.delta),y=phase2jAbs(b.delta);return x===y?0:x>y?-1:1;
-        }).slice(0,6).map(v=>({index:v.index,deltaLamports:v.delta.toString()}))});
-    }
-  }catch(_e){shadow2j.errors++;}
-}
-function phase2jSummary(){return {
-  seen:shadow2j.seen,eligible:shadow2j.eligible,
-  missingRow:shadow2j.missingRow,missingPayload:shadow2j.missingPayload,
-  multiTarget:shadow2j.multiTarget,truncated:shadow2j.truncated,
-  missingHydrated:shadow2j.missingHydrated,shortPayload:shadow2j.shortPayload,
-  missingBalances:shadow2j.missingBalances,unsafeBalances:shadow2j.unsafeBalances,
-  missingKeys:shadow2j.missingKeys,failed:shadow2j.failed,errors:shadow2j.errors,
-  zero:shadow2j.zero,nonzero:shadow2j.nonzero,
-  exactNetDebit:shadow2j.exactNetDebit,exactNetCredit:shadow2j.exactNetCredit,
-  exactNativeTransfer:shadow2j.exactNativeTransfer,
-  exactWsolTransfer:shadow2j.exactWsolTransfer,exactWsolDelta:shadow2j.exactWsolDelta,
-  zeroWithNativeTransfer:shadow2j.zeroWithNativeTransfer,
-  zeroWithWsolMovement:shadow2j.zeroWithWsolMovement,
-  thresholdFalseSmall:shadow2j.thresholdFalseSmall,
-  thresholdFalseKeep:shadow2j.thresholdFalseKeep,
-  classes:phase2jTop(shadow2j.byClass),byLengthClass:phase2jTop(shadow2j.byLengthClass),
-  exactDebitPumpPositions:phase2jTop(shadow2j.byPumpPosition),
-  feeGapRelations:phase2jTop(shadow2j.byFeeGap),
-  nativeTransferRelations:phase2jTop(shadow2j.byNativeTransfer),
-  wsolTransferRelations:phase2jTop(shadow2j.byWsolTransfer),
-  wsolBalanceRelations:phase2jTop(shadow2j.byWsolDelta),
-  instructionContexts:phase2jTop(shadow2j.byInstructionContext),
-  zeroEvidence:phase2jTop(shadow2j.byZeroEvidence),examples:shadow2j.examples};
-}
-
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -6394,8 +6258,9 @@ async function acquireHeliusRpcStartSlot() {
     return;
   }
 
+  heliusAdaptiveTick();
   const refillRatePerMs =
-    HELIUS_RPC_MAX_STARTS_PER_SECOND /
+    heliusAdaptive.actualRps /
     1000;
 
   const capacity =
@@ -6647,7 +6512,8 @@ function summarizeHeliusRpcMethodDiagnostics() {
           diagnostic.http429,
 
         httpOtherErrors:
-          diagnostic.httpOtherErrors,
+          diagnostic.httpOtherErrors
+        ,
 
         jsonRpcErrors:
           diagnostic.jsonRpcErrors,
@@ -6806,6 +6672,7 @@ async function heliusRpc(method, params) {
   if (!response.ok) {
     if (response.status === 429) {
       diagnostic.http429 += 1;
+      heliusAdaptiveObserve429(method);
     } else {
       diagnostic.httpOtherErrors += 1;
     }
@@ -14457,7 +14324,8 @@ async function enrichTokenHolderConcentration(
           logInfo(
             "Holder enrichment account unavailable after retries",
             {
-              tokenAddress,
+              tokenAddres
+              s,
               ...rpcError,
             }
           );
@@ -15408,7 +15276,6 @@ phase2fRecord(item.signature, event, tx);
 phase2gRecord(item.signature, event, tx);
 phase2hRecord(item.signature, event, tx);
 phase2iRecord(item.signature, event, tx);
-phase2jRecord(item.signature, event, tx);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17385,6 +17252,7 @@ function startQueueLogger() {
         // rpcAttemptPerformance handles that.
         // ==========================================
 
+  const heliusOptimizationV1 = heliusAdaptiveSummary();
   const heliusRpcPacerHealth = {
   mode:
     "token_bucket",
@@ -17832,7 +17700,13 @@ const effectiveConfiguration = {
     WORKER_CONCURRENCY,
 
   heliusRpcMode:
-    "token_bucket",
+    HELIUS_ADAPTIVE_PACER_ENABLED ? "adaptive_token_bucket" : "token_bucket",
+
+  heliusAdaptivePacerEnabled:
+    HELIUS_ADAPTIVE_PACER_ENABLED,
+
+  heliusAdaptiveActualRps:
+    heliusAdaptive.actualRps,
 
   heliusRpcMaxStartsPerSecond:
     HELIUS_RPC_MAX_STARTS_PER_SECOND,
@@ -18275,6 +18149,7 @@ const dbRttProbeHealth = {
             // --------------------------------------
 
             heliusRpcPacerHealth,
+            heliusOptimizationV1,
             heliusRpcMethodHealth,
             rpcFetchPerformance,
             rpcAttemptPerformance,
@@ -18425,7 +18300,6 @@ shadowPumpProgramData: {
   phase2g: phase2gSummary(),
   phase2h: phase2hSummary(),
   phase2i: phase2iSummary(),
-  phase2j: phase2jSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

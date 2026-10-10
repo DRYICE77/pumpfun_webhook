@@ -516,6 +516,48 @@ const workerPromises = [];
 
 const dbWriteQueue = [];
 
+// DB WRITE STALL DIAGNOSTICS V1 — bounded, read-only in-memory state.
+// No extra RPC/SQL, timeouts, scheduling or filtering changes.
+const DB_WRITE_STALL_DIAGNOSTICS_ENABLED =
+  process.env.DB_WRITE_STALL_DIAGNOSTICS_ENABLED !== "false";
+const DB_WRITE_STALL_WARN_MS = Math.max(1000,
+  Number(process.env.DB_WRITE_STALL_WARN_MS || 15000) || 15000);
+const dbWriteActiveStages = new Map();
+const dbWriteStallCounters = {stageTransitions:0, slowObservations:0,
+  queueCapacityWaits:0, queueCapacityWaitingCurrent:0,
+  queueCapacityWaitingMax:0};
+function dbWriteSetStage(diag, stage) {
+  if (!DB_WRITE_STALL_DIAGNOSTICS_ENABLED || !diag) return;
+  diag.stage = stage;
+  diag.stageStartedAt = performanceNow();
+  dbWriteStallCounters.stageTransitions++;
+}
+function dbWriteStallSummary() {
+  const now = performanceNow();
+  const byStage = {};
+  const oldest = [];
+  for (const diag of dbWriteActiveStages.values()) {
+    const ageMs = Math.max(0, now - diag.startedAt);
+    const stageAgeMs = Math.max(0, now - diag.stageStartedAt);
+    const item = {stage:diag.stage, ageMs:Math.round(ageMs),
+      stageAgeMs:Math.round(stageAgeMs), eventType:diag.eventType};
+    byStage[diag.stage] = (byStage[diag.stage] || 0) + 1;
+    if (stageAgeMs >= DB_WRITE_STALL_WARN_MS) dbWriteStallCounters.slowObservations++;
+    oldest.push(item);
+  }
+  oldest.sort((a,b)=>b.stageAgeMs-a.stageAgeMs);
+  return {enabled:DB_WRITE_STALL_DIAGNOSTICS_ENABLED,
+    warningThresholdMs:DB_WRITE_STALL_WARN_MS,
+    trackedActive:dbWriteActiveStages.size,
+    byStage, oldest:oldest.slice(0,12),
+    queueCapacityWaitingCurrent:dbWriteStallCounters.queueCapacityWaitingCurrent,
+    queueCapacityWaitingMax:dbWriteStallCounters.queueCapacityWaitingMax,
+    queueCapacityWaits:dbWriteStallCounters.queueCapacityWaits,
+    stageTransitions:dbWriteStallCounters.stageTransitions,
+    slowObservations:dbWriteStallCounters.slowObservations};
+}
+
+
 // Tokens that currently have a DB job executing.
 const activeDbWriteTokens = new Set();
 
@@ -12889,7 +12931,8 @@ function calculateEventMarketData(event) {
 // ==================================================
 async function writeLaunchpadTokenAndEvent(
   token,
-  event
+  event,
+  dbStallDiag = null
 ) {
   if (
     !token?.token_address ||
@@ -12921,6 +12964,7 @@ async function writeLaunchpadTokenAndEvent(
     null;
 
   if (TOKEN_DB_SERIALIZATION_ENABLED) {
+    dbWriteSetStage(dbStallDiag, "token_serializer");
     tokenSerializationReservation =
       await acquireTokenDbSerializationLane(
         tokenAddress
@@ -12958,6 +13002,7 @@ async function writeLaunchpadTokenAndEvent(
   let client = null;
 
   try {
+    dbWriteSetStage(dbStallDiag, "pool_acquire");
     client =
       await pool.connect();
 
@@ -13013,6 +13058,7 @@ async function writeLaunchpadTokenAndEvent(
       const beginStartedAt =
         performanceNow();
 
+      dbWriteSetStage(dbStallDiag, "begin");
       await client.query("BEGIN");
 
       stageDurations.begin =
@@ -13041,6 +13087,7 @@ async function writeLaunchpadTokenAndEvent(
       const tokenUpsertStartedAt =
         performanceNow();
 
+      dbWriteSetStage(dbStallDiag, "token_upsert");
       const tokenResult =
         await client.query(
           `
@@ -13218,6 +13265,7 @@ async function writeLaunchpadTokenAndEvent(
       const eventWriteStartedAt =
         performanceNow();
 
+      dbWriteSetStage(dbStallDiag, "event_insert_market_update");
       const eventWriteResult =
         await client.query(
           `
@@ -13421,6 +13469,7 @@ async function writeLaunchpadTokenAndEvent(
       const commitStartedAt =
         performanceNow();
 
+      dbWriteSetStage(dbStallDiag, "commit");
       await client.query("COMMIT");
 
       stageDurations.commit =
@@ -13463,6 +13512,7 @@ async function writeLaunchpadTokenAndEvent(
     } catch (error) {
 
       try {
+        dbWriteSetStage(dbStallDiag, "rollback");
         await client.query("ROLLBACK");
       } catch (rollbackError) {
         logError(
@@ -14584,6 +14634,7 @@ async function executeDbWriteJob(job) {
   } = job;
 
   let permanentlySeen = false;
+  const dbStallDiag = job.dbStallDiag || null;
 
   const dbWriteStartedAt =
     performanceNow();
@@ -14600,7 +14651,8 @@ async function executeDbWriteJob(job) {
     const inserted =
       await writeLaunchpadTokenAndEvent(
         token,
-        event
+        event,
+        dbStallDiag
       );
 
     // Once the primary database path has completed
@@ -14639,12 +14691,14 @@ async function executeDbWriteJob(job) {
       event.event_type ===
       "migrate"
     ) {
+      dbWriteSetStage(dbStallDiag, "graduation_update");
       await markTokenGraduated(
         event.token_address,
         event.block_time
       );
     }
 
+    dbWriteSetStage(dbStallDiag, "post_write_finalization");
     // --------------------------------------------
     // ASYNC HOLDER / SAFETY ENRICHMENT
     //
@@ -14881,6 +14935,13 @@ function dispatchDbWriteJobs() {
     dbWritesInFlight += 1;
 
     stats.dbWriteJobsStarted += 1;
+    if (DB_WRITE_STALL_DIAGNOSTICS_ENABLED) {
+      const diag = {startedAt:performanceNow(),
+        stageStartedAt:performanceNow(), stage:"dispatched",
+        eventType:job.event?.event_type || "unknown"};
+      job.dbStallDiag = diag;
+      dbWriteActiveStages.set(job, diag);
+    }
 
     stats.dbWriteInFlightCurrent =
       dbWritesInFlight;
@@ -14956,6 +15017,7 @@ function dispatchDbWriteJobs() {
         );
       })
       .finally(() => {
+        dbWriteActiveStages.delete(job);
         // ----------------------------------------
         // RELEASE TOKEN LANE
         // ----------------------------------------
@@ -15392,6 +15454,8 @@ if (item.shadowCohort3Clean) {
     // of already-queued work for the same token.
     // ----------------------------------------------
 
+    let waitingForDbCapacity = false;
+    try {
     while (true) {
       const handedOff =
         enqueueDbWriteJob(
@@ -15425,8 +15489,25 @@ if (item.shadowCohort3Clean) {
       // Do not drop the accepted event.
       // --------------------------------------------
 
+      if (DB_WRITE_STALL_DIAGNOSTICS_ENABLED) {
+        dbWriteStallCounters.queueCapacityWaits++;
+        if (!waitingForDbCapacity) {
+          waitingForDbCapacity = true;
+          dbWriteStallCounters.queueCapacityWaitingCurrent++;
+          dbWriteStallCounters.queueCapacityWaitingMax = Math.max(
+            dbWriteStallCounters.queueCapacityWaitingMax,
+            dbWriteStallCounters.queueCapacityWaitingCurrent);
+        }
+      }
       await sleep(25);
     }
+    } finally {
+      if (waitingForDbCapacity) {
+        dbWriteStallCounters.queueCapacityWaitingCurrent = Math.max(0,
+          dbWriteStallCounters.queueCapacityWaitingCurrent - 1);
+      }
+    }
+
 
   } catch (error) {
     // Preserve the existing error counter and
@@ -17475,6 +17556,7 @@ function startQueueLogger() {
               )
             : null;
 
+        const dbWriteStallDiagnosticsV1 = dbWriteStallSummary();
         const dbWriteDispatcher = {
           queueSize:
             dbWriteQueue.length,
@@ -17546,6 +17628,7 @@ function startQueueLogger() {
 
           jobsFailed:
             stats.dbWriteJobsFailed,
+          stallDiagnosticsV1: dbWriteStallDiagnosticsV1,
         };
 
         // ==========================================

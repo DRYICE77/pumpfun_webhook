@@ -4922,7 +4922,7 @@ function releaseTokenDbSerializationLane(
 function beginTokenDbWrite(
   tokenAddress
 ) {
-  if (!s) {
+  if (!tokenAddress) {
     return 0;
   }
 

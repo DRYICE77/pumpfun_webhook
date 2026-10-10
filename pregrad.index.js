@@ -4880,7 +4880,7 @@ function releaseTokenDbSerializationLane(
 function beginTokenDbWrite(
   tokenAddress
 ) {
-  if (!tokenAddress) {
+  if (!s) {
     return 0;
   }
 
@@ -14324,8 +14324,7 @@ async function enrichTokenHolderConcentration(
           logInfo(
             "Holder enrichment account unavailable after retries",
             {
-              tokenAddres
-              s,
+              tokenAddres,
               ...rpcError,
             }
           );

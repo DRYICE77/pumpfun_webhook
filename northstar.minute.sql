@@ -55,11 +55,21 @@ events AS MATERIALIZED (
         ON e.block_time >= b.window_start
        AND e.block_time < b.window_end
 
-    WHERE
-        e.event_type IN ('buy', 'sell')
-        AND e.sol_amount > 0
-        AND e.token_address IS NOT NULL
-        AND BTRIM(e.token_address) <> ''
+   WHERE
+    e.event_type IN ('buy', 'sell')
+    AND e.sol_amount > 0
+    AND e.token_address IS NOT NULL
+    AND BTRIM(e.token_address) <> ''
+
+    -- Exclude suspicious malformed sell events.
+       -- Exclude suspicious malformed sell events.
+    AND (
+        e.event_type <> 'sell'
+        OR (
+            e.sol_amount::numeric = e.token_amount::numeric
+            AND e.price_per_token::numeric = 1
+        ) IS NOT TRUE
+    )
 ),
 
 trades AS MATERIALIZED (

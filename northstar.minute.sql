@@ -476,8 +476,7 @@ upserted AS (
     RETURNING
         token_address,
         minute_bucket
-)
-
+),
 
 -- Reconcile ONLY a known malformed-only token-minute key.
 -- Never delete a key for which at least one eligible trade exists.
@@ -488,13 +487,15 @@ reconciled_deletes AS (
     WHERE target.token_address = s.token_address
       AND target.minute_bucket = s.minute_bucket
       AND NOT EXISTS (
-          SELECT 1 FROM prepared AS p
+          SELECT 1
+          FROM prepared AS p
           WHERE p.token_address = s.token_address
             AND p.minute_bucket = s.minute_bucket
       )
-    RETURNING target.token_address, target.minute_bucket
+    RETURNING
+        target.token_address,
+        target.minute_bucket
 )
-
 SELECT
     (
         SELECT COUNT(*)::integer

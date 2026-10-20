@@ -1,12 +1,17 @@
 
 -- ============================================================
--- NORTH STAR MINUTE WORKER SQL v0.4
--- USD PRESERVATION
+-- NORTH STAR MINUTE WORKER SQL v0.5
+-- USD PRESERVATION + TARGETED STALE-ROW RECONCILIATION
 --
--- Changes from v0.3:
--- 1. Preserve existing USD market caps on conflict.
--- 2. Preserve existing SOL/USD prices on conflict.
--- 3. Align change detection with preservation logic.
+-- Changes from v0.4:
+-- 1. Identify token-minute keys with malformed sell events.
+-- 2. Delete an existing aggregate ONLY when that key has
+--    suspicious sells but zero remaining eligible events.
+-- 3. Return minutes_deleted diagnostic.
+-- All other aggregation and USD-preservation logic unchanged.
+-- Does NOT delete arbitrary rows absent from source events.
+-- IMPORTANT: Deletion permanently removes that row's USD fields.
+-- Deploy only after a controlled test and explicit approval.
 --
 -- New rows:
 --   USD fields remain NULL until populated by a
@@ -70,6 +75,26 @@ events AS MATERIALIZED (
             AND e.price_per_token::numeric = 1
         ) IS NOT TRUE
     )
+),
+
+
+-- Target only token-minute keys known to contain malformed sells.
+-- Do not interpret arbitrary absence from prepared as permission
+-- to delete a row: source ingestion may be incomplete.
+suspicious_keys AS MATERIALIZED (
+    SELECT DISTINCT
+        e.token_address,
+        date_trunc('minute', e.block_time) AS minute_bucket
+    FROM public.pump_launchpad_events e
+    JOIN bounds b
+      ON e.block_time >= b.window_start
+     AND e.block_time < b.window_end
+    WHERE e.event_type = 'sell'
+      AND e.sol_amount > 0
+      AND e.token_address IS NOT NULL
+      AND BTRIM(e.token_address) <> ''
+      AND e.sol_amount::numeric = e.token_amount::numeric
+      AND e.price_per_token::numeric = 1
 ),
 
 trades AS MATERIALIZED (
@@ -453,6 +478,23 @@ upserted AS (
         minute_bucket
 )
 
+
+-- Reconcile ONLY a known malformed-only token-minute key.
+-- Never delete a key for which at least one eligible trade exists.
+-- This deliberately avoids a blanket delete of missing source keys.
+reconciled_deletes AS (
+    DELETE FROM public.northstar_token_volume_minutes AS target
+    USING suspicious_keys AS s
+    WHERE target.token_address = s.token_address
+      AND target.minute_bucket = s.minute_bucket
+      AND NOT EXISTS (
+          SELECT 1 FROM prepared AS p
+          WHERE p.token_address = s.token_address
+            AND p.minute_bucket = s.minute_bucket
+      )
+    RETURNING target.token_address, target.minute_bucket
+)
+
 SELECT
     (
         SELECT COUNT(*)::integer
@@ -468,6 +510,11 @@ SELECT
         SELECT COUNT(*)::integer
         FROM upserted
     ) AS minutes_written,
+
+    (
+        SELECT COUNT(*)::integer
+        FROM reconciled_deletes
+    ) AS minutes_deleted,
 
     (
         SELECT COUNT(DISTINCT token_address)::integer

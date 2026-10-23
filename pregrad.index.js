@@ -12076,6 +12076,62 @@ function extractSolAmountShadow(tx) {
 // Requires the solShadow* counters added to stats.
 // ==================================================
 
+// ==================================================
+// 10F-2A. BOUNDED FALLBACK-ONLY FORENSICS (SHADOW)
+//
+// Keep the 20 largest cases in memory; no extra RPC,
+// SQL, writes, timers, or changes to production decisions.
+// Raw transaction logs and payloads are NOT retained.
+// ==================================================
+const SOL_SHADOW_FORENSIC_LIMIT = 20;
+const solShadowFallbackForensics = [];
+let solShadowFallbackForensicObserved = 0;
+
+function recordSolShadowFallbackForensic(tx, eventType, productionSol, thresholdSol) {
+  try {
+    solShadowFallbackForensicObserved++;
+    const signature = tx?.transaction?.signatures?.[0] || null;
+    const messages = getLogMessages(tx);
+    const amountMatch = messages.join("\n").match(/amount_in:\s*([0-9]+)/i);
+    const rawAmountIn = amountMatch ? amountMatch[1] : null;
+
+    // Token-balance mint inventory is evidence, not proof of
+    // which token corresponds to the amount_in log.
+    const mints = [...new Set([
+      ...(tx?.meta?.preTokenBalances || []),
+      ...(tx?.meta?.postTokenBalances || [])
+    ].map(b => b?.mint).filter(Boolean))].slice(0, 12);
+
+    const item = {
+      signature,
+      eventType,
+      productionSol,
+      thresholdSol: Number(thresholdSol),
+      productionPassesThreshold: productionSol >= Number(thresholdSol),
+      rawAmountIn,
+      possibleTokenMints: mints,
+      tokenMintCount: mints.length,
+      slot: tx?.slot ?? null
+    };
+    solShadowFallbackForensics.push(item);
+    solShadowFallbackForensics.sort((a, b) => b.productionSol - a.productionSol);
+    if (solShadowFallbackForensics.length > SOL_SHADOW_FORENSIC_LIMIT) {
+      solShadowFallbackForensics.length = SOL_SHADOW_FORENSIC_LIMIT;
+    }
+  } catch (_error) {
+    stats.solShadowErrors++;
+  }
+}
+
+function solShadowFallbackForensicSummary() {
+  return {
+    observed: solShadowFallbackForensicObserved,
+    retained: solShadowFallbackForensics.length,
+    limit: SOL_SHADOW_FORENSIC_LIMIT,
+    topCases: solShadowFallbackForensics
+  };
+}
+
 function recordSolAmountShadow(
   tx,
   eventType,
@@ -12119,6 +12175,7 @@ function recordSolAmountShadow(
       stats.solShadowBothNull++;
     } else if (productionSol !== null && shadowSol === null) {
       stats.solShadowFallbackOnly++;
+      recordSolShadowFallbackForensic(tx, eventType, productionSol, thresholdSol);
       stats.solShadowFallbackOnlySolTotal += productionSol;
       stats.solShadowFallbackOnlySolMax = Math.max(
         stats.solShadowFallbackOnlySolMax,
@@ -19160,6 +19217,7 @@ solAmountShadow: {
   transferSolTotal: stats.solShadowTransferSolTotal,
   fallbackOnlySolTotal: stats.solShadowFallbackOnlySolTotal,
   fallbackOnlySolMax: stats.solShadowFallbackOnlySolMax,
+  fallbackForensics: solShadowFallbackForensicSummary(),
   largeAmountSamples: stats.solShadowLargeAmountSamples,
   errors: stats.solShadowErrors,
 },

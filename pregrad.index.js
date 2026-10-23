@@ -855,6 +855,43 @@ controlFetchErrors: 0,
   classifiedUnknown: 0,
 
   // ==========================================
+  // SOL AMOUNT SHADOW VALIDATION (OPT-IN)
+  // ==========================================
+  // Counters only. No production SOL amount changes.
+  // No filtering, RPC, SQL, or extra timers.
+  // Updated only by a future shadow observer.
+  // ==========================================
+
+  solShadowSamples: 0,
+  solShadowBuySamples: 0,
+  solShadowSellSamples: 0,
+
+  solShadowMatch: 0,
+  solShadowFallbackOnly: 0,
+  solShadowBothNull: 0,
+  solShadowMismatch: 0,
+
+  // Production amount passes threshold, shadow does not.
+  solShadowWouldReject: 0,
+  solShadowWouldRejectBuy: 0,
+  solShadowWouldRejectSell: 0,
+
+  // Shadow passes threshold, production does not.
+  solShadowWouldAccept: 0,
+
+  // SOL totals are diagnostic, not validated on-chain.
+  solShadowProductionSolTotal: 0,
+  solShadowTransferSolTotal: 0,
+  solShadowFallbackOnlySolTotal: 0,
+  solShadowFallbackOnlySolMax: 0,
+
+  // Suspicious production amounts (threshold configurable
+  // in future observer; counters do not enforce limits).
+  solShadowLargeAmountSamples: 0,
+  solShadowErrors: 0,
+
+
+  // ==========================================
 // SHADOW WEBSOCKET PREFILTER EXPERIMENT
 //
 // Measures whether transactions admitted only
@@ -11889,15 +11926,22 @@ function parseCreateMetadata(tx) {
 
 
 // ==================================================
-// 10F. SOL AMOUNT
+// 10F. SOL AMOUNT — PRODUCTION + SHADOW VALIDATION
 //
-// Preserve the proven transfer-based parser.
+// Production parser is UNCHANGED.
+// Shadow is opt-in and never changes returned amounts.
+// No new RPC calls, SQL, writes, or timers.
 //
-// Priority:
-//
-// 1. Parsed wrapped-SOL token transfer
-// 2. Native lamport transfer
-// 3. Pump log fallback
+// IMPORTANT: The shadow observer must be called at the
+// classification call site (before the size filter).
+// Adding this section alone does not run the observer.
+// ==================================================
+
+const SOL_AMOUNT_SHADOW_ENABLED =
+  process.env.SOL_AMOUNT_SHADOW_ENABLED === "true";
+
+// ==================================================
+// 10F-1. PRODUCTION SOL AMOUNT — UNCHANGED
 // ==================================================
 
 function extractSolAmount(
@@ -11999,6 +12043,118 @@ function extractSolAmount(
   return eventType === "buy"
     ? raw / 1e9
     : raw / 1e6;
+}
+
+// ==================================================
+// 10F-2. SHADOW TRANSFER-ONLY SOL AMOUNT
+//
+// Reuses existing read-only transfer-evidence helper.
+// The helper mirrors the production transfer scan.
+// No production decisions are made here.
+// ==================================================
+
+function extractSolAmountShadow(tx) {
+  const evidence = getProgramData2cTransferEvidence(tx);
+  const amount = evidence.largestTransferSol;
+
+  return amount != null &&
+    Number.isFinite(amount) &&
+    amount > 0
+      ? amount
+      : null;
+}
+
+// ==================================================
+// 10F-3. SHADOW OBSERVER
+//
+// Call once per classified BUY/SELL, BEFORE the
+// production minimum-SOL filter.
+//
+// IMPORTANT: Pass the ALREADY-CALCULATED production
+// amount; do not call extractSolAmount() again.
+//
+// Requires the solShadow* counters added to stats.
+// ==================================================
+
+function recordSolAmountShadow(
+  tx,
+  eventType,
+  productionAmount,
+  thresholdSol
+) {
+  if (!SOL_AMOUNT_SHADOW_ENABLED) return;
+  if (eventType !== "buy" && eventType !== "sell") return;
+
+  try {
+    const shadowAmount = extractSolAmountShadow(tx);
+
+    const productionValid =
+      productionAmount != null &&
+      Number.isFinite(Number(productionAmount)) &&
+      Number(productionAmount) > 0;
+
+    const shadowValid =
+      shadowAmount != null &&
+      Number.isFinite(shadowAmount) &&
+      shadowAmount > 0;
+
+    const productionSol = productionValid
+      ? Number(productionAmount) : null;
+    const shadowSol = shadowValid
+      ? shadowAmount : null;
+
+    stats.solShadowSamples++;
+    if (eventType === "buy") stats.solShadowBuySamples++;
+    else stats.solShadowSellSamples++;
+
+    if (productionSol !== null) {
+      stats.solShadowProductionSolTotal += productionSol;
+      if (productionSol >= 100) stats.solShadowLargeAmountSamples++;
+    }
+    if (shadowSol !== null) {
+      stats.solShadowTransferSolTotal += shadowSol;
+    }
+
+    if (productionSol === null && shadowSol === null) {
+      stats.solShadowBothNull++;
+    } else if (productionSol !== null && shadowSol === null) {
+      stats.solShadowFallbackOnly++;
+      stats.solShadowFallbackOnlySolTotal += productionSol;
+      stats.solShadowFallbackOnlySolMax = Math.max(
+        stats.solShadowFallbackOnlySolMax,
+        productionSol
+      );
+    } else if (
+      productionSol !== null &&
+      shadowSol !== null &&
+      productionSol === shadowSol
+    ) {
+      stats.solShadowMatch++;
+    } else {
+      stats.solShadowMismatch++;
+    }
+
+    // A null or invalid amount is NOT a zero-SOL trade.
+    // This measures the actual effect on threshold eligibility.
+    const threshold = Number(thresholdSol);
+    if (!Number.isFinite(threshold) || threshold < 0) return;
+
+    const productionKeep =
+      productionSol !== null && productionSol >= threshold;
+    const shadowKeep =
+      shadowSol !== null && shadowSol >= threshold;
+
+    if (productionKeep && !shadowKeep) {
+      stats.solShadowWouldReject++;
+      if (eventType === "buy") stats.solShadowWouldRejectBuy++;
+      else stats.solShadowWouldRejectSell++;
+    } else if (!productionKeep && shadowKeep) {
+      stats.solShadowWouldAccept++;
+    }
+  } catch (_error) {
+    // Shadow failures must never block production ingestion.
+    stats.solShadowErrors++;
+  }
 }
 
 
@@ -15372,6 +15528,15 @@ if (item.shadowCohort3Clean) {
     event
   );
 }
+
+// SOL amount shadow: observation only, before minimum-SOL filtering.
+// The observer handles its own exceptions and opt-in flag.
+recordSolAmountShadow(
+  tx,
+  event.event_type,
+  event.sol_amount,
+  effectiveMinSolAmount()
+);
     // ----------------------------------------------
     // MINIMUM TRADE SIZE
     //
@@ -18973,6 +19138,31 @@ cleanCohort2Production: {
 
 shadowMatureSmallTradePrefilter:
   getMatureSmallTradeShadowSummary(),
+
+// --------------------------------------
+// SOL AMOUNT SHADOW VALIDATION
+// --------------------------------------
+solAmountShadow: {
+  enabled: SOL_AMOUNT_SHADOW_ENABLED,
+  thresholdSol: effectiveMinSolAmount(),
+  samples: stats.solShadowSamples,
+  buySamples: stats.solShadowBuySamples,
+  sellSamples: stats.solShadowSellSamples,
+  match: stats.solShadowMatch,
+  fallbackOnly: stats.solShadowFallbackOnly,
+  bothNull: stats.solShadowBothNull,
+  mismatch: stats.solShadowMismatch,
+  wouldReject: stats.solShadowWouldReject,
+  wouldRejectBuy: stats.solShadowWouldRejectBuy,
+  wouldRejectSell: stats.solShadowWouldRejectSell,
+  wouldAccept: stats.solShadowWouldAccept,
+  productionSolTotal: stats.solShadowProductionSolTotal,
+  transferSolTotal: stats.solShadowTransferSolTotal,
+  fallbackOnlySolTotal: stats.solShadowFallbackOnlySolTotal,
+  fallbackOnlySolMax: stats.solShadowFallbackOnlySolMax,
+  largeAmountSamples: stats.solShadowLargeAmountSamples,
+  errors: stats.solShadowErrors,
+},
 
 // --------------------------------------
 // PRESERVE ALL RAW CUMULATIVE COUNTERS

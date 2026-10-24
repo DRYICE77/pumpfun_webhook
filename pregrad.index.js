@@ -1491,6 +1491,107 @@ function recordProgramData2cHydratedOutcome(signature, event, tx) {
 }
 
 // ==================================================
+// 10F-4. PUMP EVENT SOL CANDIDATE — SHADOW ONLY
+//
+// Tests u64 LE at offset 40 for the existing targeted
+// Pump program-data discriminator. This offset is NOT
+// a verified event schema field or net swap proceeds.
+// Uses previously captured websocket data; no new RPC,
+// SQL, writes, filtering, or production amount changes.
+// ==================================================
+const PUMP_SOL_CANDIDATE_SHADOW_ENABLED =
+  process.env.PUMP_SOL_CANDIDATE_SHADOW_ENABLED === "true";
+const PUMP_SOL_CANDIDATE_CASE_LIMIT = 20;
+const pumpSolCandidateCases = [];
+const pumpSolCandidateStats = {
+  eligible: 0, buy: 0, sell: 0,
+  missingCapture: 0, multiEvent: 0, invalidPayload: 0,
+  exact: 0, different: 0, bothNull: 0,
+  candidateOnly: 0, transferOnly: 0,
+  wouldAccept: 0, wouldReject: 0,
+  candidateSolTotal: 0, transferSolTotal: 0,
+  errors: 0
+};
+
+function observePumpSolCandidate(signature, event) {
+  if (!PUMP_SOL_CANDIDATE_SHADOW_ENABLED) return;
+  if (event?.event_type !== "buy" && event?.event_type !== "sell") return;
+  try {
+    const row = shadowProgramData2cPending.get(signature);
+    if (!row) { pumpSolCandidateStats.missingCapture++; return; }
+    if (row.targetEventCount !== 1 || row.truncated) {
+      pumpSolCandidateStats.multiEvent++;
+      return;
+    }
+    // Validate captured bytes, rather than trusting a guessed offset.
+    if (!row.payloadHex || !/^[0-9a-f]+$/i.test(row.payloadHex)) {
+      pumpSolCandidateStats.invalidPayload++;
+      return;
+    }
+    const bytes = Buffer.from(row.payloadHex, "hex");
+    if (bytes.length < 48 ||
+        bytes.subarray(0, 8).toString("hex") !==
+          SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR) {
+      pumpSolCandidateStats.invalidPayload++;
+      return;
+    }
+    const raw = bytes.readBigUInt64LE(40);
+    // Avoid precision loss from unsafe lamport integers.
+    if (raw > BigInt(Number.MAX_SAFE_INTEGER)) {
+      pumpSolCandidateStats.invalidPayload++;
+      return;
+    }
+    const candidate = raw > 0n ? Number(raw) / 1e9 : null;
+    const transferRaw = event?.sol_amount;
+    const transfer = transferRaw == null ? null : Number(transferRaw);
+    const transferSol = transfer != null && Number.isFinite(transfer) && transfer > 0
+      ? transfer : null;
+    const threshold = effectiveMinSolAmount();
+    pumpSolCandidateStats.eligible++;
+    pumpSolCandidateStats[event.event_type]++;
+    if (candidate != null) pumpSolCandidateStats.candidateSolTotal += candidate;
+    if (transferSol != null) pumpSolCandidateStats.transferSolTotal += transferSol;
+    if (candidate == null && transferSol == null) pumpSolCandidateStats.bothNull++;
+    else if (candidate != null && transferSol == null) pumpSolCandidateStats.candidateOnly++;
+    else if (candidate == null) pumpSolCandidateStats.transferOnly++;
+    else if (raw === BigInt(Math.round(transferSol * 1e9))) pumpSolCandidateStats.exact++;
+    else pumpSolCandidateStats.different++;
+    const candidateKeep = candidate != null && candidate >= threshold;
+    const productionKeep = transferSol != null && transferSol >= threshold;
+    if (candidateKeep && !productionKeep) pumpSolCandidateStats.wouldAccept++;
+    if (!candidateKeep && productionKeep) pumpSolCandidateStats.wouldReject++;
+    if ((candidateKeep !== productionKeep ||
+         (candidate != null && transferSol != null &&
+          Math.abs(candidate - transferSol) > 0.01)) &&
+        pumpSolCandidateCases.length < PUMP_SOL_CANDIDATE_CASE_LIMIT) {
+      pumpSolCandidateCases.push({
+        signature, eventType: event.event_type,
+        discriminator: SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
+        payloadBytes: bytes.length,
+        candidateOffset: 40,
+        candidateSol: candidate,
+        transferSol,
+        thresholdSol: threshold,
+        candidateKeep,
+        productionKeep,
+        ratio: transferSol != null && candidate != null
+          ? Number((candidate / transferSol).toFixed(4)) : null
+      });
+    }
+  } catch (_error) {
+    pumpSolCandidateStats.errors++;
+  }
+}
+function pumpSolCandidateSummary() {
+  return {
+    enabled: PUMP_SOL_CANDIDATE_SHADOW_ENABLED,
+    note: "Offset 40 is an unverified gross-SOL candidate, not validated net proceeds",
+    ...pumpSolCandidateStats,
+    examples: pumpSolCandidateCases
+  };
+}
+
+// ==================================================
 // PHASE 2D — SHADOW BYTE-OFFSET FIELD DISCOVERY
 // Candidate u64 fields are scanned at 8-byte boundaries
 // after the 8-byte discriminator. No production decisions.
@@ -15531,6 +15632,7 @@ phase2fRecord(item.signature, event, tx);
 phase2gRecord(item.signature, event, tx);
 phase2hRecord(item.signature, event, tx);
 phase2iRecord(item.signature, event, tx);
+observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -19176,6 +19278,8 @@ cleanCohort2Production: {
 
 shadowMatureSmallTradePrefilter:
   getMatureSmallTradeShadowSummary(),
+
+pumpSolCandidateShadow: pumpSolCandidateSummary(),
 
 // --------------------------------------
 // SOL AMOUNT SHADOW VALIDATION

@@ -11944,6 +11944,7 @@ const SOL_AMOUNT_SHADOW_ENABLED =
 // 10F-1. PRODUCTION SOL AMOUNT — UNCHANGED
 // ==================================================
 
+
 function extractSolAmount(
   tx,
   eventType
@@ -11976,6 +11977,7 @@ function extractSolAmount(
     const info =
       instruction?.parsed?.info || {};
 
+    // Wrapped SOL evidence
     if (info.mint === SOL_MINT) {
       const raw =
         info?.tokenAmount?.uiAmount ??
@@ -11990,6 +11992,7 @@ function extractSolAmount(
       recordAmount(raw);
     }
 
+    // Native SOL evidence
     if (info.lamports != null) {
       recordAmount(
         Number(info.lamports) / 1e9
@@ -11997,12 +12000,14 @@ function extractSolAmount(
     }
   };
 
+  // Scan outer instructions
   for (
     const instruction of getInstructions(tx)
   ) {
     scan(instruction);
   }
 
+  // Scan inner instructions
   for (
     const group of getInnerInstructions(tx)
   ) {
@@ -12014,36 +12019,12 @@ function extractSolAmount(
     }
   }
 
-  if (largestSolAmount !== null) {
-    return largestSolAmount;
-  }
-
-  const logs =
-    getLogMessages(tx).join("\n");
-
-  const amountInMatch =
-    logs.match(
-      /amount_in:\s*([0-9]+)/i
-    );
-
-  if (!amountInMatch) {
-    return null;
-  }
-
-  const raw =
-    Number(amountInMatch[1]);
-
-  if (
-    !Number.isFinite(raw) ||
-    raw <= 0
-  ) {
-    return null;
-  }
-
-  return eventType === "buy"
-    ? raw / 1e9
-    : raw / 1e6;
+  // No amount_in fallback.
+  // If no SOL transfer evidence exists,
+  // return null instead of guessing.
+  return largestSolAmount;
 }
+
 
 // ==================================================
 // 10F-2. SHADOW TRANSFER-ONLY SOL AMOUNT

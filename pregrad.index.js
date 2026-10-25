@@ -1491,27 +1491,78 @@ function recordProgramData2cHydratedOutcome(signature, event, tx) {
 }
 
 // ==================================================
-// 10F-4. PUMP EVENT SOL CANDIDATE — SHADOW ONLY
+// 10F-4. PUMP TRADE EVENT — SCHEMA-AWARE SHADOW V2
 //
-// Tests u64 LE at offset 40 for the existing targeted
-// Pump program-data discriminator. This offset is NOT
-// a verified event schema field or net swap proceeds.
-// Uses previously captured websocket data; no new RPC,
-// SQL, writes, filtering, or production amount changes.
+// Verified leading TradeEvent fields (Borsh):
+//   0..7   event discriminator
+//   8..39  mint pubkey
+//   40..47 solAmount u64 LE (lamports)
+//   48..55 tokenAmount u64 LE (base units)
+//   56     isBuy bool (0/1)
+//   57..88 user pubkey
+//
+// Read-only diagnostic. solAmount is an EVENT amount,
+// not necessarily the wallet's net swap proceeds.
+// Does NOT modify filtering, event amounts, RPC or SQL.
 // ==================================================
 const PUMP_SOL_CANDIDATE_SHADOW_ENABLED =
   process.env.PUMP_SOL_CANDIDATE_SHADOW_ENABLED === "true";
 const PUMP_SOL_CANDIDATE_CASE_LIMIT = 20;
+const PUMP_TRADE_EVENT_MIN_BYTES = 89;
 const pumpSolCandidateCases = [];
 const pumpSolCandidateStats = {
   eligible: 0, buy: 0, sell: 0,
   missingCapture: 0, multiEvent: 0, invalidPayload: 0,
+  discriminatorMismatch: 0, invalidDirection: 0,
+  directionMismatch: 0, mintMismatch: 0,
   exact: 0, different: 0, bothNull: 0,
   candidateOnly: 0, transferOnly: 0,
   wouldAccept: 0, wouldReject: 0,
   candidateSolTotal: 0, transferSolTotal: 0,
+  tokenAmountComparable: 0, tokenAmountNearMatch: 0,
+  tokenAmountMismatch: 0,
+  positiveDelta: 0, negativeDelta: 0, zeroDelta: 0,
+  deltaSolTotal: 0,
   errors: 0
 };
+
+// Base58 encoding for comparing a decoded 32-byte mint
+// to the existing classified event. No extra dependencies.
+function pumpShadowPubkeyBase58(bytes) {
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let value = BigInt("0x" + bytes.toString("hex"));
+  let encoded = "";
+  while (value > 0n) {
+    encoded = alphabet[Number(value % 58n)] + encoded;
+    value /= 58n;
+  }
+  let leadingZeroes = 0;
+  while (leadingZeroes < bytes.length && bytes[leadingZeroes] === 0) {
+    leadingZeroes++;
+  }
+  return "1".repeat(leadingZeroes) + encoded;
+}
+
+function decodePumpTradeEventShadow(payloadHex) {
+  if (typeof payloadHex !== "string" ||
+      payloadHex.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/i.test(payloadHex)) return null;
+  const bytes = Buffer.from(payloadHex, "hex");
+  if (bytes.length < PUMP_TRADE_EVENT_MIN_BYTES) return null;
+  if (bytes.subarray(0, 8).toString("hex") !==
+      SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR) return null;
+  const isBuyByte = bytes.readUInt8(56);
+  if (isBuyByte !== 0 && isBuyByte !== 1) return null;
+  return {
+    discriminator: SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
+    payloadBytes: bytes.length,
+    mint: pumpShadowPubkeyBase58(bytes.subarray(8, 40)),
+    trader: pumpShadowPubkeyBase58(bytes.subarray(57, 89)),
+    solLamports: bytes.readBigUInt64LE(40),
+    tokenAmountRaw: bytes.readBigUInt64LE(48),
+    eventType: isBuyByte === 1 ? "buy" : "sell"
+  };
+}
 
 function observePumpSolCandidate(signature, event) {
   if (!PUMP_SOL_CANDIDATE_SHADOW_ENABLED) return;
@@ -1523,30 +1574,39 @@ function observePumpSolCandidate(signature, event) {
       pumpSolCandidateStats.multiEvent++;
       return;
     }
-    // Validate captured bytes, rather than trusting a guessed offset.
-    if (!row.payloadHex || !/^[0-9a-f]+$/i.test(row.payloadHex)) {
+    const decoded = decodePumpTradeEventShadow(row.payloadHex);
+    if (!decoded) {
       pumpSolCandidateStats.invalidPayload++;
       return;
     }
-    const bytes = Buffer.from(row.payloadHex, "hex");
-    if (bytes.length < 48 ||
-        bytes.subarray(0, 8).toString("hex") !==
-          SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR) {
-      pumpSolCandidateStats.invalidPayload++;
+    if (decoded.eventType !== event.event_type) {
+      pumpSolCandidateStats.directionMismatch++;
       return;
     }
-    const raw = bytes.readBigUInt64LE(40);
-    // Avoid precision loss from unsafe lamport integers.
+    if (event.token_address && decoded.mint !== event.token_address) {
+      pumpSolCandidateStats.mintMismatch++;
+      return;
+    }
+    const raw = decoded.solLamports;
+    // Avoid loss of lamport-level precision when comparing.
     if (raw > BigInt(Number.MAX_SAFE_INTEGER)) {
       pumpSolCandidateStats.invalidPayload++;
       return;
     }
     const candidate = raw > 0n ? Number(raw) / 1e9 : null;
-    const transferRaw = event?.sol_amount;
+    const transferRaw = event.sol_amount;
     const transfer = transferRaw == null ? null : Number(transferRaw);
     const transferSol = transfer != null && Number.isFinite(transfer) && transfer > 0
       ? transfer : null;
     const threshold = effectiveMinSolAmount();
+    if (!Number.isFinite(threshold) || threshold < 0) {
+      pumpSolCandidateStats.invalidPayload++;
+      return;
+    }
+    const thresholdLamports = BigInt(Math.round(threshold * 1e9));
+    const candidateKeep = candidate != null && raw >= thresholdLamports;
+    const productionKeep = transferSol != null && transferSol >= threshold;
+
     pumpSolCandidateStats.eligible++;
     pumpSolCandidateStats[event.event_type]++;
     if (candidate != null) pumpSolCandidateStats.candidateSolTotal += candidate;
@@ -1556,23 +1616,51 @@ function observePumpSolCandidate(signature, event) {
     else if (candidate == null) pumpSolCandidateStats.transferOnly++;
     else if (raw === BigInt(Math.round(transferSol * 1e9))) pumpSolCandidateStats.exact++;
     else pumpSolCandidateStats.different++;
-    const candidateKeep = candidate != null && candidate >= threshold;
-    const productionKeep = transferSol != null && transferSol >= threshold;
     if (candidateKeep && !productionKeep) pumpSolCandidateStats.wouldAccept++;
     if (!candidateKeep && productionKeep) pumpSolCandidateStats.wouldReject++;
+
+    // Token amounts in classified events are human-readable;
+    // Pump.fun token events conventionally use 6 decimals.
+    // This is corroboration, NOT an eligibility condition.
+    const classifiedTokens = Number(event.token_amount);
+    const eventTokens = Number(decoded.tokenAmountRaw) / 1e6;
+    let tokenNearMatch = null;
+    if (event.token_amount != null && Number.isFinite(classifiedTokens) &&
+        classifiedTokens >= 0 && Number.isFinite(eventTokens)) {
+      pumpSolCandidateStats.tokenAmountComparable++;
+      tokenNearMatch = Math.abs(classifiedTokens - eventTokens) <=
+        Math.max(0.000001, classifiedTokens * 0.000001);
+      if (tokenNearMatch) pumpSolCandidateStats.tokenAmountNearMatch++;
+      else pumpSolCandidateStats.tokenAmountMismatch++;
+    }
+
+    let deltaSol = null;
+    if (candidate != null && transferSol != null) {
+      deltaSol = candidate - transferSol;
+      pumpSolCandidateStats.deltaSolTotal += deltaSol;
+      if (Math.abs(deltaSol) < 1e-9) pumpSolCandidateStats.zeroDelta++;
+      else if (deltaSol > 0) pumpSolCandidateStats.positiveDelta++;
+      else pumpSolCandidateStats.negativeDelta++;
+    }
     if ((candidateKeep !== productionKeep ||
-         (candidate != null && transferSol != null &&
-          Math.abs(candidate - transferSol) > 0.01)) &&
+         (deltaSol != null && Math.abs(deltaSol) > 0.01) ||
+         tokenNearMatch === false) &&
         pumpSolCandidateCases.length < PUMP_SOL_CANDIDATE_CASE_LIMIT) {
       pumpSolCandidateCases.push({
         signature, eventType: event.event_type,
-        discriminator: SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
-        payloadBytes: bytes.length,
-        candidateOffset: 40,
-        candidateSol: candidate,
-        transferSol,
+        mint: decoded.mint, trader: decoded.trader,
+        discriminator: decoded.discriminator,
+        payloadBytes: decoded.payloadBytes,
+        eventSolLamports: raw.toString(),
+        eventSol: candidate,
+        eventTokenAmountRaw: decoded.tokenAmountRaw.toString(),
+        eventTokensAssuming6Decimals: eventTokens,
+        classifiedTokens: Number.isFinite(classifiedTokens) ? classifiedTokens : null,
+        tokenNearMatch,
+        productionTransferSol: transferSol,
+        deltaSol,
         thresholdSol: threshold,
-        candidateKeep,
+        eventKeep: candidateKeep,
         productionKeep,
         ratio: transferSol != null && candidate != null
           ? Number((candidate / transferSol).toFixed(4)) : null
@@ -1582,10 +1670,12 @@ function observePumpSolCandidate(signature, event) {
     pumpSolCandidateStats.errors++;
   }
 }
+
 function pumpSolCandidateSummary() {
   return {
     enabled: PUMP_SOL_CANDIDATE_SHADOW_ENABLED,
-    note: "Offset 40 is an unverified gross-SOL candidate, not validated net proceeds",
+    schema: "Pump.fun TradeEvent leading fields: mint@8, solAmount@40, tokenAmount@48, isBuy@56, user@57",
+    note: "TradeEvent solAmount is not independently verified net wallet proceeds; no production changes",
     ...pumpSolCandidateStats,
     examples: pumpSolCandidateCases
   };

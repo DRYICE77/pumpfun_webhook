@@ -2580,6 +2580,134 @@ function phase2jSummary(){
 }
 
 // ==================================================
+// PHASE 2K — SELL THRESHOLD / DEBIT GAP SHADOW
+// Diagnostic only: no RPC, SQL, filters, or production changes.
+// Reconciles threshold disagreements against Pump-account
+// debits and separates zero-value TradeEvents.
+// ==================================================
+const SHADOW_2K_ENABLED = process.env.SHADOW_2K_ENABLED !== "false";
+const SHADOW_2K_MAX_EXAMPLES = 36;
+const shadow2k = {
+  seen:0,eligible:0,missing:0,multi:0,invalid:0,
+  directionMismatch:0,mintMismatch:0,missingBalances:0,
+  unsafeBalances:0,errors:0,
+  byThresholdClass:new Map(),byReconciliation:new Map(),
+  thresholdByReconciliation:new Map(),gapByReconciliation:new Map(),
+  zeroByMovement:new Map(),zeroByProduction:new Map(),
+  gapByPosition:new Map(),gapByFeeRelation:new Map(),
+  examples:[]
+};
+function phase2kInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2kAbs(v){return v<0n?-v:v;}
+function phase2kRecord(signature,event,tx){
+  if(!SHADOW_2K_ENABLED||event?.event_type!=="sell")return;
+  shadow2k.seen++;
+  try{
+    const row=shadowProgramData2cPending.get(signature);
+    if(!row?.payloadHex){shadow2k.missing++;return;}
+    if(row.targetEventCount!==1||row.truncated){shadow2k.multi++;return;}
+    const decoded=decodePumpTradeEventShadow(row.payloadHex);
+    if(!decoded){shadow2k.invalid++;return;}
+    if(decoded.eventType!=="sell"){shadow2k.directionMismatch++;return;}
+    if(!event.token_address||decoded.mint!==event.token_address){shadow2k.mintMismatch++;return;}
+    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+    if(!Array.isArray(pre)||!Array.isArray(post)||!pre.length||pre.length!==post.length){
+      shadow2k.missingBalances++;return;
+    }
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    if(keys.length<pre.length||pre.some((n,i)=>!Number.isSafeInteger(n)||!Number.isSafeInteger(post[i]))){
+      shadow2k.unsafeBalances++;return;
+    }
+    const changes=new Map();
+    for(let i=0;i<pre.length;i++)if(keys[i])changes.set(keys[i],{
+      index:i,delta:BigInt(post[i])-BigInt(pre[i])});
+    const pumpAccounts=new Map();let pumpInstructionCount=0;
+    const scan=ins=>{
+      if(String(ins?.programId||"")!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      pumpInstructionCount++;
+      for(const [pos,a] of (ins?.accounts||[]).entries()){
+        const name=typeof a==="number"?keys[a]:String(a?.pubkey||a||"");
+        if(!name)continue;
+        if(!pumpAccounts.has(name))pumpAccounts.set(name,new Set());
+        pumpAccounts.get(name).add(pos);
+      }
+    };
+    getInstructions(tx).forEach(scan);
+    for(const group of getInnerInstructions(tx))for(const ins of group?.instructions||[])scan(ins);
+    const amount=decoded.solLamports;
+    const debits=[...pumpAccounts].map(([name,positions])=>{
+      const delta=changes.get(name)?.delta??0n;
+      return {name,index:changes.get(name)?.index??null,
+        positions:[...positions],delta,debit:delta<0n?-delta:0n,
+        gap:phase2kAbs(amount-(delta<0n?-delta:0n))};
+    }).filter(x=>x.debit>0n).sort((a,b)=>a.gap===b.gap?0:a.gap<b.gap?-1:1);
+    const best=debits[0]||null;
+    const exact=amount>0n&&!!best&&best.gap===0n;
+    const near=amount>0n&&!!best&&best.gap*100n<=amount; // <= 1%
+    const cls=amount===0n?"zero_event":exact?"exact_debit":
+      near?"within_1pct":best?"unmatched_debit":"no_debit";
+    const threshold=effectiveMinSolAmount();
+    const production=event.sol_amount==null?null:Number(event.sol_amount);
+    const validThreshold=Number.isFinite(threshold)&&threshold>=0;
+    const thresholdLamports=validThreshold?BigInt(Math.round(threshold*1e9)):null;
+    const eventKeep=validThreshold&&amount>=thresholdLamports;
+    const productionKeep=validThreshold&&production!==null&&Number.isFinite(production)&&production>=threshold;
+    const thresholdClass=!validThreshold?"unknown_threshold":eventKeep&&!productionKeep?"would_accept":
+      !eventKeep&&productionKeep?"would_reject":eventKeep?"both_keep":"both_small";
+    shadow2k.eligible++;
+    phase2kInc(shadow2k.byReconciliation,cls);
+    phase2kInc(shadow2k.byThresholdClass,thresholdClass);
+    phase2kInc(shadow2k.thresholdByReconciliation,`${thresholdClass}:${cls}`);
+    const feeRaw=tx?.meta?.fee;
+    const fee=Number.isSafeInteger(feeRaw)&&feeRaw>=0?BigInt(feeRaw):null;
+    if(amount>0n&&best){
+      const bps=best.gap*10000n/amount;
+      const band=best.gap===0n?"exact":bps<=10n?"<=0.1%":
+        bps<=100n?"<=1%":bps<=1000n?"<=10%":">10%";
+      phase2kInc(shadow2k.gapByReconciliation,`${cls}:${band}`);
+      for(const pos of best.positions)phase2kInc(shadow2k.gapByPosition,`${cls}:pos${pos}`);
+      const feeRelation=fee===null?"fee_unknown":best.gap===fee?"gap_equals_tx_fee":
+        best.gap>fee?"gap_above_tx_fee":"gap_below_tx_fee";
+      phase2kInc(shadow2k.gapByFeeRelation,`${cls}:${feeRelation}`);
+    }
+    if(amount===0n){
+      const credit=[...pumpAccounts.keys()].some(k=>(changes.get(k)?.delta??0n)>0n);
+      const movement=debits.length?"pump_debit":credit?"pump_credit":"no_pump_movement";
+      phase2kInc(shadow2k.zeroByMovement,`${movement}:instructions${pumpInstructionCount}`);
+      phase2kInc(shadow2k.zeroByProduction,production===null?"production_null":
+        production===0?"production_zero":"production_positive");
+    }
+    const existing=shadow2k.examples.filter(e=>e.thresholdClass===thresholdClass&&e.class===cls).length;
+    if(shadow2k.examples.length<SHADOW_2K_MAX_EXAMPLES&&existing<3){
+      shadow2k.examples.push({signature,class:cls,thresholdClass,
+        eventSol:Number(amount)/1e9,productionSol:production,thresholdSol:threshold,
+        payloadBytes:decoded.payloadBytes,pumpInstructionCount,
+        feeLamports:fee?.toString()??null,
+        bestDebit:best?{index:best.index,positions:best.positions,
+          debitLamports:best.debit.toString(),gapLamports:best.gap.toString(),
+          gapBps:amount>0n?Number(best.gap*10000n/amount):null}:null});
+    }
+  }catch(_err){shadow2k.errors++;}
+}
+function phase2kSummary(){
+  const top=(map,n=30)=>[...map].sort((a,b)=>b[1]-a[1]).slice(0,n)
+    .map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2K_ENABLED,seen:shadow2k.seen,eligible:shadow2k.eligible,
+    missing:shadow2k.missing,multi:shadow2k.multi,invalid:shadow2k.invalid,
+    directionMismatch:shadow2k.directionMismatch,mintMismatch:shadow2k.mintMismatch,
+    missingBalances:shadow2k.missingBalances,unsafeBalances:shadow2k.unsafeBalances,
+    errors:shadow2k.errors,byThresholdClass:top(shadow2k.byThresholdClass),
+    byReconciliation:top(shadow2k.byReconciliation),
+    thresholdByReconciliation:top(shadow2k.thresholdByReconciliation),
+    gapByReconciliation:top(shadow2k.gapByReconciliation),
+    gapByPosition:top(shadow2k.gapByPosition),
+    gapByFeeRelation:top(shadow2k.gapByFeeRelation),
+    zeroByMovement:top(shadow2k.zeroByMovement),
+    zeroByProduction:top(shadow2k.zeroByProduction),examples:shadow2k.examples,
+    note:"Closest Pump-instruction account debit is transaction-level evidence, not per-event proof; gap does not prove fee attribution."};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -15863,6 +15991,7 @@ phase2gRecord(item.signature, event, tx);
 phase2hRecord(item.signature, event, tx);
 phase2iRecord(item.signature, event, tx);
 phase2jRecord(item.signature, event, tx);
+phase2kRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -18919,6 +19048,7 @@ shadowPumpProgramData: {
   phase2h: phase2hSummary(),
   phase2i: phase2iSummary(),
   phase2j: phase2jSummary(),
+  phase2k: phase2kSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

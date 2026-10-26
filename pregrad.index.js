@@ -3120,6 +3120,153 @@ function phase2nSummary(){
     caution:"Account positions are not verified roles. Whole-transaction lamport changes and parsed transfer visibility cannot establish per-instruction settlement or fee attribution. No production changes."};
 }
 
+
+// ==================================================
+// PHASE 2O — SELL SETTLEMENT / INSTRUCTION-ROLE EVIDENCE
+// Shadow-only; no IDL-derived roles are asserted.
+// Correlates target Pump instruction accounts with same-outer-index
+// inner native transfers, event amount, and transaction-wide deltas.
+// Inner instruction groups establish outer-index association, NOT
+// exact CPI ancestry or per-instruction balance attribution.
+// No additional RPC, SQL, filtering, or production amount changes.
+// ==================================================
+const SHADOW_2O_ENABLED = process.env.SHADOW_2O_ENABLED !== "false";
+const PHASE_2O_EXAMPLE_LIMIT = 18;
+const shadow2o = {seen:0,eligible:0,missingCapture:0,invalidEvent:0,
+  missingBalances:0,noTargetInstruction:0,errors:0,
+  byLayout:new Map(),byPosition:new Map(),byFeeGap:new Map(),
+  byGroupTransfers:new Map(),byConfidence:new Map(),
+  byProduction:new Map(),examples:[]};
+function phase2oInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2oRecord(signature,event,tx){
+  if(!SHADOW_2O_ENABLED||event?.event_type!=="sell")return;
+  shadow2o.seen++;
+  try{
+    const row=shadowProgramData2cPending.get(signature);
+    if(!row||row.targetEventCount!==1||row.truncated){shadow2o.missingCapture++;return;}
+    const decoded=decodePumpTradeEventShadow(row.payloadHex);
+    if(!decoded||decoded.eventType!=="sell"||decoded.mint!==event.token_address||
+       decoded.solLamports<=0n){shadow2o.invalidEvent++;return;}
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+    if(!Array.isArray(pre)||!Array.isArray(post)||pre.length!==post.length||
+       keys.length<pre.length||!pre.every((v,i)=>Number.isSafeInteger(v)&&Number.isSafeInteger(post[i]))){
+      shadow2o.missingBalances++;return;
+    }
+    const delta=new Map(keys.slice(0,pre.length).map((k,i)=>[k,BigInt(post[i])-BigInt(pre[i])]));
+    const resolve=v=>typeof v==="number"?keys[v]||null:
+      typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+    const outer=getInstructions(tx),groups=getInnerInstructions(tx);
+    const candidates=[];
+    const inspect=(ins,origin,outerIndex)=>{
+      const program=resolve(ins?.programIdIndex)||resolve(ins?.programId);
+      if(program!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const data=phase2mInstructionData(ins);
+      const disc=data?.length>=8?data.subarray(0,8).toString("hex"):null;
+      if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+      const accounts=(ins?.accounts||[]).map(resolve);
+      candidates.push({disc,layout:disc+":"+accounts.length,accounts,origin,outerIndex});
+    };
+    outer.forEach((ins,i)=>inspect(ins,"outer",i));
+    for(const group of groups){
+      const index=Number(group?.index);
+      for(const ins of group?.instructions||[])inspect(ins,"inner",Number.isInteger(index)?index:null);
+    }
+    if(!candidates.length){shadow2o.noTargetInstruction++;return;}
+    shadow2o.eligible++;
+    const amount=decoded.solLamports;
+    const production=Number(event.sol_amount);
+    phase2oInc(shadow2o.byProduction,event.sol_amount==null||!Number.isFinite(production)?
+      "missing":BigInt(Math.round(production*1e9))<amount?"below_event":
+      BigInt(Math.round(production*1e9))>amount?"above_event":"exact");
+    const groupTransfers=new Map();
+    for(const group of groups){
+      const index=Number(group?.index);
+      if(!Number.isInteger(index))continue;
+      const transfers=[];
+      for(const ins of group?.instructions||[]){
+        const info=ins?.parsed?.info;
+        if((ins?.parsed?.type!=="transfer"&&ins?.parsed?.type!=="transferWithSeed")||
+           info?.lamports==null)continue;
+        const raw=String(info.lamports);
+        if(!/^\d+$/.test(raw))continue;
+        transfers.push({source:info.source||null,destination:info.destination||null,
+          lamports:raw});
+      }
+      groupTransfers.set(index,transfers);
+    }
+    const rows=[];
+    for(const ins of candidates){
+      phase2oInc(shadow2o.byLayout,ins.layout);
+      const transfers=groupTransfers.get(ins.outerIndex)||[];
+      const movements=[];
+      for(let position=0;position<ins.accounts.length;position++){
+        const pubkey=ins.accounts[position];
+        const d=delta.get(pubkey);
+        if(d==null||d===0n)continue;
+        const out=transfers.filter(t=>t.source===pubkey);
+        const incoming=transfers.filter(t=>t.destination===pubkey);
+        const outSum=out.reduce((a,t)=>a+BigInt(t.lamports),0n);
+        const inSum=incoming.reduce((a,t)=>a+BigInt(t.lamports),0n);
+        const abs=d<0n?-d:d;
+        const gap=abs>amount?abs-amount:amount-abs;
+        const gapBps=Number(gap*10000n/amount);
+        const direction=d<0n?"debit":"credit";
+        const near=gapBps<=200;
+        if(near&&direction==="debit"){
+          phase2oInc(shadow2o.byPosition,ins.layout+":"+position+":debit_near_event");
+          phase2oInc(shadow2o.byFeeGap,ins.layout+":"+
+            (gapBps===0?"exact":gapBps<=100?"0_to_100bps":"100_to_200bps"));
+        }
+        if(out.length||incoming.length)phase2oInc(shadow2o.byPosition,
+          ins.layout+":"+position+":parsed_transfer_participant");
+        movements.push({position,pubkey,direction,deltaLamports:d.toString(),
+          eventGapBps:gapBps,innerTransferOutLamports:outSum.toString(),
+          innerTransferInLamports:inSum.toString(),
+          // Transaction delta and CPI-group transfer totals need not reconcile.
+          groupTransferNetLamports:(inSum-outSum).toString()});
+      }
+      const closest=movements.filter(m=>m.direction==="debit")
+        .sort((a,b)=>a.eventGapBps-b.eventGapBps)[0]||null;
+      const feeBps=closest?closest.eventGapBps:null;
+      const confidence=closest&&feeBps<=200?"correlated_not_verified":"unresolved";
+      phase2oInc(shadow2o.byConfidence,ins.layout+":"+confidence);
+      phase2oInc(shadow2o.byGroupTransfers,ins.layout+":"+
+        (transfers.length?"parsed_inner_transfers":"no_parsed_inner_transfers"));
+      rows.push({layout:ins.layout,origin:ins.origin,outerIndex:ins.outerIndex,
+        accountCount:ins.accounts.length,closestDebit:closest,
+        groupTransferCount:transfers.length,
+        groupTransfers:transfers.slice(0,10),
+        movements:movements.sort((a,b)=>a.eventGapBps-b.eventGapBps).slice(0,10),
+        confidence});
+    }
+    const category=rows.map(r=>r.layout+":"+(r.closestDebit?.position??"none")).join("|");
+    if(shadow2o.examples.length<PHASE_2O_EXAMPLE_LIMIT&&
+       shadow2o.examples.filter(x=>x.category===category).length<2){
+      shadow2o.examples.push({signature,mint:decoded.mint,category,
+        eventLamports:amount.toString(),productionSol:event.sol_amount??null,
+        transactionFeeLamports:tx?.meta?.fee??null,
+        targetInstructionCount:candidates.length,
+        // Do not claim outer-index grouping proves exact instruction ownership.
+        instructions:rows.slice(0,3)});
+    }
+  }catch(_error){shadow2o.errors++;}
+}
+function phase2oSummary(){
+  const top=(m,n=45)=>[...m].sort((a,b)=>b[1]-a[1]).slice(0,n)
+    .map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2O_ENABLED,mode:"shadow_only",version:"2O.1",
+    seen:shadow2o.seen,eligible:shadow2o.eligible,
+    missingCapture:shadow2o.missingCapture,invalidEvent:shadow2o.invalidEvent,
+    missingBalances:shadow2o.missingBalances,
+    noTargetInstruction:shadow2o.noTargetInstruction,errors:shadow2o.errors,
+    byLayout:top(shadow2o.byLayout),byPosition:top(shadow2o.byPosition),
+    byFeeGap:top(shadow2o.byFeeGap),byGroupTransfers:top(shadow2o.byGroupTransfers),
+    byConfidence:top(shadow2o.byConfidence),byProduction:top(shadow2o.byProduction),
+    examples:shadow2o.examples,
+    caution:"No verified IDL account-role assignment. Inner transfers are associated with outer instruction index, not proven CPI ancestry. Whole-transaction deltas cannot isolate individual swaps, fees, or net proceeds. No production changes."};
+}
+
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -16408,6 +16555,7 @@ phase2kRecord(item.signature, event, tx);
 phase2lRecord(item.signature, event, tx);
 phase2mRecord(item.signature, event, tx);
 phase2nRecord(item.signature, event, tx);
+phase2oRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19468,6 +19616,7 @@ shadowPumpProgramData: {
   phase2l: phase2lSummary(),
   phase2m: phase2mSummary(),
   phase2n: phase2nSummary(),
+  phase2o: phase2oSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

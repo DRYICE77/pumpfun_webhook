@@ -3538,6 +3538,122 @@ function phase2qSummary(){
 }
 
 // ==================================================
+// PHASE 2R — SHADOW SELL CAPTURE GAP + CURVE ROLE DIAGNOSTICS
+// Diagnoses absent WS TradeEvent capture against hydrated RPC logs,
+// and tests whether production-over-event transfer winners touch
+// the target instruction's bonding-curve account.
+// No extra RPC/SQL, no filtering or production amount changes.
+// ==================================================
+const SHADOW_2R_ENABLED = process.env.SHADOW_2R_ENABLED !== "false";
+const PHASE_2R_EXAMPLE_LIMIT = 12;
+const shadow2r = {
+  seen:0,missingCapture:0,overEvent:0,errors:0,
+  capture:new Map(),overRelationships:new Map(),
+  overWinnerSources:new Map(),examplesMissing:[],examplesOver:[]
+};
+function phase2rInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2rRecord(signature,event,tx){
+  if(!SHADOW_2R_ENABLED||event?.event_type!=="sell")return;
+  shadow2r.seen++;
+  try{
+    const row=shadowProgramData2cPending.get(signature);
+    if(!row){
+      shadow2r.missingCapture++;
+      const logs=getLogMessages(tx);
+      let targetCount=0,programDataCount=0,decodeFailures=0;
+      for(const line of logs){
+        const match=String(line).match(/Program data:\s*([A-Za-z0-9+/=]+)/);
+        if(!match)continue;
+        programDataCount++;
+        try{
+          const bytes=Buffer.from(match[1],"base64");
+          if(bytes.length>=8&&bytes.subarray(0,8).toString("hex")===
+              SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR)targetCount++;
+        }catch(_e){decodeFailures++;}
+      }
+      const category=targetCount===0?(programDataCount===0?
+        "rpc_no_program_data":"rpc_program_data_no_target"):
+        targetCount===1?"rpc_one_target_ws_missing":"rpc_multiple_targets_ws_missing";
+      phase2rInc(shadow2r.capture,category);
+      if(decodeFailures)phase2rInc(shadow2r.capture,"rpc_decode_error");
+      if(shadow2r.examplesMissing.length<PHASE_2R_EXAMPLE_LIMIT &&
+         shadow2r.examplesMissing.filter(x=>x.category===category).length<3)
+        shadow2r.examplesMissing.push({signature,category,programDataCount,
+          rpcTargetCount:targetCount,rpcLogCount:logs.length});
+      return;
+    }
+    const decoded=row.targetEventCount===1&&!row.truncated?
+      decodePumpTradeEventShadow(row.payloadHex):null;
+    if(!decoded||decoded.eventType!=="sell"||decoded.mint!==event.token_address||
+       decoded.solLamports<=0n||decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER))return;
+    const production=Number(event.sol_amount),eventSol=Number(decoded.solLamports)/1e9;
+    if(!Number.isFinite(production)||production-eventSol<=1e-9)return;
+    shadow2r.overEvent++;
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const resolve=v=>typeof v==="number"?keys[v]||null:
+      typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+    const targets=[];
+    const inspect=ins=>{
+      if((resolve(ins?.programIdIndex)||resolve(ins?.programId))!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const data=phase2mInstructionData(ins);
+      const disc=data?.length>=8?data.subarray(0,8).toString("hex"):null;
+      if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+      const pos=disc==="33e685a4017f83ad"?3:
+        disc==="5df6823ce7e940b2"?10:
+        disc==="1c92de7726c469d5"?5:null;
+      targets.push({disc,curve:pos==null?null:resolve((ins?.accounts||[])[pos])});
+    };
+    for(const ins of getInstructions(tx))inspect(ins);
+    for(const group of getInnerInstructions(tx))for(const ins of group?.instructions||[])inspect(ins);
+    const target=targets.length===1?targets[0]:null;
+    const winners=[];
+    const scan=(ins,origin)=>{
+      const info=ins?.parsed?.info||{};
+      const amounts=[];
+      if(info.mint==="So11111111111111111111111111111111111111112"){
+        const raw=info?.tokenAmount?.uiAmount??info?.uiAmount??
+          (info?.amount!=null&&info?.decimals===9?Number(info.amount)/1e9:null);
+        if(raw!=null)amounts.push({sol:Number(raw),kind:"wsol"});
+      }
+      if(info.lamports!=null)amounts.push({sol:Number(info.lamports)/1e9,kind:"native"});
+      for(const a of amounts)if(Number.isFinite(a.sol)&&Math.abs(a.sol-production)<=1e-9)
+        winners.push({...a,origin,source:info.source||null,destination:info.destination||null});
+    };
+    for(const ins of getInstructions(tx))scan(ins,"outer");
+    for(const group of getInnerInstructions(tx))for(const ins of group?.instructions||[])scan(ins,"inner");
+    if(!target)phase2rInc(shadow2r.overRelationships,targets.length?"multiple_targets":"no_target");
+    else if(!target.curve)phase2rInc(shadow2r.overRelationships,"unknown_curve_account");
+    else if(!winners.length)phase2rInc(shadow2r.overRelationships,"no_matching_transfer");
+    else for(const w of winners){
+      const relation=w.source===target.curve?"source_is_curve":
+        w.destination===target.curve?"destination_is_curve":"neither_endpoint_is_curve";
+      phase2rInc(shadow2r.overRelationships,relation);
+      phase2rInc(shadow2r.overWinnerSources,w.kind+":"+w.origin);
+    }
+    const excessSol=production-eventSol;
+    shadow2r.examplesOver.push({signature,eventSol,productionSol:production,
+      excessSol:Number(excessSol.toFixed(9)),targetCount:targets.length,
+      targetLayout:target?.disc||null,curveKnown:!!target?.curve,
+      winners:winners.slice(0,3).map(w=>({kind:w.kind,origin:w.origin,
+        sourceIsCurve:!!target?.curve&&w.source===target.curve,
+        destinationIsCurve:!!target?.curve&&w.destination===target.curve}))});
+    shadow2r.examplesOver.sort((a,b)=>b.excessSol-a.excessSol);
+    if(shadow2r.examplesOver.length>PHASE_2R_EXAMPLE_LIMIT)shadow2r.examplesOver.pop();
+  }catch(_error){shadow2r.errors++;}
+}
+function phase2rSummary(){
+  const top=m=>[...m].sort((a,b)=>b[1]-a[1]).map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2R_ENABLED,mode:"shadow_only",version:"2R.1",
+    seen:shadow2r.seen,missingCapture:shadow2r.missingCapture,
+    overEvent:shadow2r.overEvent,errors:shadow2r.errors,
+    missingCaptureRpcEvidence:top(shadow2r.capture),
+    overEventWinnerRelationships:top(shadow2r.overRelationships),
+    overEventWinnerSources:top(shadow2r.overWinnerSources),
+    missingExamples:shadow2r.examplesMissing,largestOverExamples:shadow2r.examplesOver,
+    caution:"RPC logs diagnose websocket capture gaps, not their root cause. Account-index curve roles are provisional; transfer endpoints and outer groups do not prove CPI settlement. Winner counts may exceed transactions. No production changes."};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -16828,6 +16944,7 @@ phase2nRecord(item.signature, event, tx);
 phase2oRecord(item.signature, event, tx);
 phase2pRecord(item.signature, event, tx);
 phase2qRecord(item.signature, event, tx);
+phase2rRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19891,6 +20008,7 @@ shadowPumpProgramData: {
   phase2o: phase2oSummary(),
   phase2p: phase2pSummary(),
   phase2q: phase2qSummary(),
+  phase2r: phase2rSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

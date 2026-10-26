@@ -3794,6 +3794,122 @@ function phase2sSummary(){
 }
 
 // ==================================================
+// PHASE 2T — COMBINED VALIDATED SELL SELECTOR (SHADOW)
+// Prefer websocket TradeEvent, recover from existing RPC logs,
+// otherwise use production. No production filtering or writes change.
+// ==================================================
+const SHADOW_2T_ENABLED = process.env.SHADOW_2T_ENABLED !== "false";
+const shadow2t = {seen:0,selectedWs:0,selectedRpc:0,fallback:0,
+  wsInvalid:0,rpcInvalid:0,wsRpcMismatch:0,errors:0,
+  reasons:Object.create(null),threshold:Object.create(null),
+  selectedSol:0,productionSol:0,positiveDeltaSol:0,negativeDeltaSol:0,
+  examples:[]};
+function phase2tCount(group,key){group[key]=(group[key]||0)+1;}
+function phase2tValidate(decoded,event,tx){
+  if(!decoded||decoded.eventType!=="sell"||decoded.mint!==event.token_address||
+     decoded.solLamports<=0n||decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER))
+    return {reason:"invalid_event"};
+  const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+  const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+  if(!Array.isArray(pre)||!Array.isArray(post)||pre.length!==post.length||
+     keys.length<pre.length||!pre.every((v,i)=>Number.isSafeInteger(v)&&Number.isSafeInteger(post[i])))
+    return {reason:"missing_balances"};
+  const deltas=new Map(keys.slice(0,pre.length).map((k,i)=>[k,BigInt(post[i])-BigInt(pre[i])]));
+  const resolve=v=>typeof v==="number"?keys[v]||null:
+    typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+  const targets=[];
+  const inspect=ins=>{
+    if((resolve(ins?.programIdIndex)||resolve(ins?.programId))!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+    const bytes=phase2mInstructionData(ins);
+    const disc=bytes?.length>=8?bytes.subarray(0,8).toString("hex"):null;
+    if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+    targets.push((ins?.accounts||[]).map(resolve));
+  };
+  for(const ins of getInstructions(tx))inspect(ins);
+  for(const group of getInnerInstructions(tx))for(const ins of group?.instructions||[])inspect(ins);
+  if(targets.length!==1)return {reason:targets.length?"multiple_targets":"no_target"};
+  const amount=decoded.solLamports;
+  const gaps=targets[0].map(k=>deltas.get(k)).filter(d=>d!=null&&d<0n)
+    .map(d=>{const debit=-d;return debit>amount?debit-amount:amount-debit;});
+  if(!gaps.length)return {reason:"no_debit"};
+  const closest=gaps.reduce((a,b)=>a<b?a:b);
+  if(closest*10000n>amount*200n)return {reason:"debit_gap_over_2pct"};
+  return {reason:"validated",sol:Number(amount)/1e9,gapBps:Number(closest*10000n/amount)};
+}
+function phase2tRecord(signature,event,tx){
+  if(!SHADOW_2T_ENABLED||event?.event_type!=="sell")return;
+  shadow2t.seen++;
+  try{
+    const row=shadowProgramData2cPending.get(signature);
+    let ws=null,rpc=null,wsResult={reason:"missing_ws"},rpcResult={reason:"missing_rpc"};
+    if(row){
+      if(row.targetEventCount===1&&!row.truncated){
+        ws=decodePumpTradeEventShadow(row.payloadHex);
+        wsResult=phase2tValidate(ws,event,tx);
+      }else wsResult={reason:"ambiguous_ws"};
+      if(wsResult.reason!=="validated")shadow2t.wsInvalid++;
+    }
+    // Read already-hydrated logs only; never request an additional transaction.
+    const payloads=[];
+    for(const line of getLogMessages(tx)){
+      const match=String(line).match(/Program data:\s*([A-Za-z0-9+/=]+)/);
+      if(!match||!(/^[A-Za-z0-9+/]+={0,2}$/).test(match[1])||match[1].length%4!==0)continue;
+      const bytes=Buffer.from(match[1],"base64");
+      if(bytes.length>=8&&bytes.subarray(0,8).toString("hex")===SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR)
+        payloads.push(bytes.toString("hex"));
+    }
+    if(payloads.length===1){
+      rpc=decodePumpTradeEventShadow(payloads[0]);
+      rpcResult=phase2tValidate(rpc,event,tx);
+    }else rpcResult={reason:payloads.length?"ambiguous_rpc":"missing_rpc"};
+    if(rpcResult.reason!=="validated")shadow2t.rpcInvalid++;
+    if(wsResult.reason==="validated"&&rpcResult.reason==="validated"&&
+       (ws.solLamports!==rpc.solLamports||ws.tokenAmountRaw!==rpc.tokenAmountRaw))
+      shadow2t.wsRpcMismatch++;
+    let source="production",chosen=null;
+    if(wsResult.reason==="validated"){source="websocket";chosen=wsResult.sol;shadow2t.selectedWs++;}
+    else if(rpcResult.reason==="validated"){source="rpc";chosen=rpcResult.sol;shadow2t.selectedRpc++;}
+    else {shadow2t.fallback++;phase2tCount(shadow2t.reasons,"ws:"+wsResult.reason+"|rpc:"+rpcResult.reason);}
+    const raw=event.sol_amount==null?NaN:Number(event.sol_amount);
+    const production=Number.isFinite(raw)&&raw>0?raw:null;
+    if(source==="production")chosen=production;
+    const threshold=effectiveMinSolAmount();
+    const valid=Number.isFinite(threshold)&&threshold>=0;
+    const candidateKeep=valid&&chosen!=null&&chosen>=threshold;
+    const productionKeep=valid&&production!=null&&production>=threshold;
+    const outcome=!valid?"invalid_threshold":candidateKeep&&!productionKeep?"would_add":
+      !candidateKeep&&productionKeep?"would_remove":candidateKeep?"both_keep":"both_small";
+    phase2tCount(shadow2t.threshold,outcome);
+    if(source!=="production"){
+      shadow2t.selectedSol+=chosen;
+      if(production!=null)shadow2t.productionSol+=production;
+      const diff=chosen-(production??0);
+      if(diff>0)shadow2t.positiveDeltaSol+=diff;
+      else shadow2t.negativeDeltaSol+=-diff;
+    }
+    if(shadow2t.examples.length<12&&(outcome==="would_add"||outcome==="would_remove"||
+       (source==="production"&&shadow2t.examples.filter(x=>x.source==="production").length<3)))
+      shadow2t.examples.push({signature,source,outcome,chosenSol:chosen,productionSol:production,
+        wsReason:wsResult.reason,rpcReason:rpcResult.reason});
+  }catch(_error){shadow2t.errors++;phase2tCount(shadow2t.reasons,"exception");}
+}
+function phase2tSummary(){
+  const round=n=>Number(n.toFixed(9));
+  return {version:"2T.1",mode:"shadow_only",enabled:SHADOW_2T_ENABLED,
+    seen:shadow2t.seen,selectedWebsocket:shadow2t.selectedWs,
+    recoveredRpc:shadow2t.selectedRpc,fallbackProduction:shadow2t.fallback,
+    wsInvalid:shadow2t.wsInvalid,rpcInvalid:shadow2t.rpcInvalid,
+    wsRpcValidatedMismatch:shadow2t.wsRpcMismatch,errors:shadow2t.errors,
+    threshold:shadow2t.threshold,selectionFailures:shadow2t.reasons,
+    selectedEventSol:round(shadow2t.selectedSol),
+    productionOnSelectedSol:round(shadow2t.productionSol),
+    positiveDifferenceSol:round(shadow2t.positiveDeltaSol),
+    negativeDifferenceSol:round(shadow2t.negativeDeltaSol),
+    examples:shadow2t.examples,
+    caution:"Transaction-wide debit match is correlation, not proof of settlement; no production changes."};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -17086,6 +17202,7 @@ phase2pRecord(item.signature, event, tx);
 phase2qRecord(item.signature, event, tx);
 phase2rRecord(item.signature, event, tx);
 phase2sRecord(item.signature, event, tx);
+phase2tRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19921,863 +20038,35 @@ const dbRttProbeHealth = {
         // EMIT SCANNER HEALTH RECORD
         // ==========================================
 
-        logInfo(
-          "Scanner stats",
-          {
-            time:
-              nowIso(),
-
-            systemEnabled:
-              isPregradEnabled(),
-
-            manualOverride:
-              pregradControl.manual_override,
-
-            websocketState:
-              ws?.readyState ?? null,
-
-            socketAlive,
-
-            intakePaused,
-
-            workerRunning,
-
-            // --------------------------------------
-            // SIGNATURE PIPELINE
-            // --------------------------------------
-
-            queueSize:
-              signatureQueue.length,
-
-            queuedSignatureCount:
-              queuedSignatures.size,
-
-            inFlightCount:
-              inFlightSignatures.size,
-
-            seenSignatureCount:
-              seenSignatures.size,
-
-            holderEnrichmentInFlight:
-              tokenSafetyEnrichmentInFlight.size,
-
-            oldestSignatureAgeMs,
-
-            // --------------------------------------
-            // INTERVAL INGESTION RATES
-            // --------------------------------------
-
-            incomingPerSecond,
-            drainedPerSecond,
-            insertedPerSecond,
-            processedPerSecond,
-
-            // --------------------------------------
-            // DB WRITE DISPATCHER
-            // --------------------------------------
-
-            dbWriteDispatcher,
-
-            // --------------------------------------
-            // TOKEN SERIALIZATION
-            // --------------------------------------
-
-            tokenSerializerHealth,
-            tokenSerializerWorkerHealth,
-
-            // --------------------------------------
-            // RPC PACING / PERFORMANCE
-            // --------------------------------------
-
-            heliusRpcPacerHealth,
-            heliusOptimizationV1,
-            heliusRpcMethodHealth,
-            rpcFetchPerformance,
-            rpcAttemptPerformance,
-
-// --------------------------------------
-// DATABASE PERFORMANCE
-// --------------------------------------
-
-dbWritePerformance,
-dbPoolAcquirePerformance,
-dbQueryExecutionPerformance,
-
-dbRttProbeHealth,
-
-dbBeginPerformance,
-dbTokenUpsertPerformance,
-dbEventInsertPerformance,
-dbMarketUpdatePerformance,
-dbCommitPerformance,
-
-contentionDepthPerformance,
-
-slowDbQueries,
-
-
-
-            // --------------------------------------
-            // END-TO-END PROCESSING
-            // --------------------------------------
-
-            processingPerformance,
-
-            // --------------------------------------
-            // COVERAGE / PAUSE HEALTH
-            // --------------------------------------
-
-            intakePausePerformance,
-            currentPauseMs,
-
-            // --------------------------------------
-            // POSTGRES / CONFIGURATION
-            // --------------------------------------
-
-            postgresPool,
-            effectiveConfiguration,
-
-          // --------------------------------------
-// SHADOW WEBSOCKET PREFILTER EXPERIMENT
-//
-// Groups the shadow pre-RPC filtering
-// diagnostics into one readable object.
-//
-// Observation only.
-// Does not affect ingestion behavior.
-// --------------------------------------
-
-shadowWebsocketPrefilter: {
-  explicitMatches:
-    stats.shadowPrefilterExplicitMatches,
-
-  programIdOnlyMatches:
-    stats.shadowPrefilterProgramIdOnlyMatches,
-
-  programIdOnlyFetched:
-    stats.shadowProgramIdOnlyFetched,
-
-  acceptedCreate:
-    stats.shadowProgramIdOnlyAcceptedCreate,
-
-  acceptedBuy:
-    stats.shadowProgramIdOnlyAcceptedBuy,
-
-  acceptedSell:
-    stats.shadowProgramIdOnlyAcceptedSell,
-
-  acceptedMigrate:
-    stats.shadowProgramIdOnlyAcceptedMigrate,
-
-  unsupported:
-    stats.shadowProgramIdOnlyUnsupported,
-
-  unresolvedMint:
-    stats.shadowProgramIdOnlyUnresolvedMint,
-
-  otherRejected:
-    stats.shadowProgramIdOnlyOtherRejected,
-},
-
-shadowSmallTradePrefilter: {
-  samples:
-    stats.shadowSmallTradeSamples,
-
-  small:
-    stats.shadowSmallTradeSmall,
-
-  keep:
-    stats.shadowSmallTradeKeep,
-
-  unknownAmount:
-    stats.shadowSmallTradeUnknownAmount,
-
-  buy: {
-    samples:
-      stats.shadowSmallTradeBuySamples,
-
-    small:
-      stats.shadowSmallTradeBuySmall,
-
-    keep:
-      stats.shadowSmallTradeBuyKeep,
-  },
-
-  sell: {
-    samples:
-      stats.shadowSmallTradeSellSamples,
-
-    small:
-      stats.shadowSmallTradeSellSmall,
-
-    keep:
-      stats.shadowSmallTradeSellKeep,
-  },
-
-  ...getSmallTradeShadowSummary(),
-},
-shadowPumpProgramData: {
-  notifications:
-    stats.shadowProgramDataNotifications,
-
-  payloads:
-    stats.shadowProgramDataPayloads,
-
-  base64Decoded:
-    stats.shadowProgramDataBase64Decoded,
-
-  decodeErrors:
-    stats.shadowProgramDataDecodeErrors,
-
-  emptyPayloads:
-    stats.shadowProgramDataEmptyPayloads,
-
-  shapesTracked:
-    shadowProgramDataShapes.size,
-
-  phase2d: phase2dSummary(),
-  phase2e: phase2eSummary(),
-  phase2f: phase2fSummary(),
-  phase2g: phase2gSummary(),
-  phase2h: phase2hSummary(),
-  phase2i: phase2iSummary(),
-  phase2j: phase2jSummary(),
-  phase2k: phase2kSummary(),
-  phase2l: phase2lSummary(),
-  phase2m: phase2mSummary(),
-  phase2n: phase2nSummary(),
-  phase2o: phase2oSummary(),
-  phase2p: phase2pSummary(),
-  phase2q: phase2qSummary(),
-  phase2r: phase2rSummary(),
-  phase2s: phase2sSummary(),
-  phase2c: {
-    ...shadowProgramData2cStats,
-    pending: shadowProgramData2cPending.size,
-    mismatchRetained: shadowProgramData2cMismatches.length,
-    // Latest 20 mismatches, with payloads for offline byte-layout analysis.
- // Keep 50 mismatches in memory.
-// Report only the latest 5 to limit Railway log volume.
-mismatches: shadowProgramData2cMismatches.slice(-5),
-  },
-
-  layoutExperiment: (() => {
-    const rows = [...shadowProgramDataLayoutSamples.values()];
-    const threshold = effectiveMinSolAmount();
-    const evaluated = rows.map(row => {
-      const truth = row.hydratedSolAmount;
-      const truthLamports = truth === null
-        ? null : BigInt(Math.round(truth * 1e9)).toString();
-      const decoded = row.events.map(e => ({
-        ...e,
-        exactMatch: truthLamports !== null &&
-          e.offset40Lamports === truthLamports,
-        // Threshold comparisons use integer lamports, not floats.
-        thresholdSmall: e.offset40Lamports === null
-          ? null : BigInt(e.offset40Lamports) <
-            BigInt(Math.round(threshold * 1e9)),
-      }));
-      const single = row.targetEventCount === 1 && !row.truncated;
-      const matched = decoded.some(e => e.exactMatch);
-      const predictedSmall = single ? decoded[0]?.thresholdSmall : null;
-      const actualSmall = truth === null ? null :
-        BigInt(truthLamports) < BigInt(Math.round(threshold * 1e9));
-      return {
-        signature: row.signature,
-        eventHint: row.eventHint,
-        hydratedEventType: row.hydratedEventType,
-        hydratedSolAmount: truth,
-        targetEventCount: row.targetEventCount,
-        truncated: row.truncated,
-        single,
-        matched,
-        thresholdCorrect: predictedSmall === null || actualSmall === null
-          ? null : predictedSmall === actualSmall,
-        events: decoded,
-      };
-    });
-    const valid = evaluated.filter(r => r.hydratedSolAmount !== null);
-    const single = valid.filter(r => r.single);
-    const multi = valid.filter(r => !r.single);
-    return {
-      targetDiscriminator: SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR,
-      maxSamples: SHADOW_PROGRAM_DATA_LAYOUT_MAX_SAMPLES,
-      captured: rows.length,
-      hydrated: valid.length,
-      singleHydrated: single.length,
-      singleExactMatches: single.filter(r => r.matched).length,
-      singleThresholdCorrect: single.filter(r => r.thresholdCorrect === true).length,
-      singleThresholdWrong: single.filter(r => r.thresholdCorrect === false).length,
-      multiHydrated: multi.length,
-      multiAnyExactMatch: multi.filter(r => r.matched).length,
-      truncated: rows.filter(r => r.truncated).length,
-      // Bound health-log output; no additional RPC or DB writes.
-      samples: evaluated.slice(0, 10),
-    };
-  })(),
-
-  topShapes:
-    [...shadowProgramDataShapes.values()]
-      .sort(
-        (a, b) =>
-          b.samples - a.samples
-      )
-      .slice(0, 20)
-      .map(
-        row => ({
-          eventHint:
-            row.eventHint,
-
-          decodedBytes:
-            row.decodedBytes,
-
-          discriminatorHex:
-            row.discriminatorHex,
-
-          discriminatorDecimal:
-            row.discriminatorDecimal,
-
-          samples:
-            row.samples,
-        })
-      ),
-},
-// --------------------------------------
-// SHADOW SMALL-TRADE COHORT #2
-//
-// Forward validation for:
-//
-// • CLEAN fingerprints
-// • NEAR-CLEAN fingerprints
-//
-// CLEAN is now eligible for production
-// pre-RPC filtering through the shared
-// production kill switch.
-//
-// NEAR-CLEAN remains shadow only.
-// --------------------------------------
-
-shadowSmallTradeCohort2: {
-  thresholdSol:
-    SHADOW_COHORT_2_THRESHOLD_SOL,
-
-  clean: {
-    frozenFingerprints:
-      SHADOW_COHORT_2_CLEAN_KEYS.size,
-
-    samples:
-      stats.shadowCohort2CleanSamples,
-
-    small:
-      stats.shadowCohort2CleanSmall,
-
-    keep:
-      stats.shadowCohort2CleanKeep,
-
-    unknown:
-      stats.shadowCohort2CleanUnknown,
-
-    precisionPct:
-      (
-        stats.shadowCohort2CleanSmall +
-        stats.shadowCohort2CleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort2CleanSmall /
-              (
-                stats.shadowCohort2CleanSmall +
-                stats.shadowCohort2CleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    falsePositivePct:
-      (
-        stats.shadowCohort2CleanSmall +
-        stats.shadowCohort2CleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort2CleanKeep /
-              (
-                stats.shadowCohort2CleanSmall +
-                stats.shadowCohort2CleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    thresholdMismatch:
-      stats.shadowCohort2CleanThresholdMismatch,
-
-    eventTypeMismatch:
-      stats.shadowCohort2CleanEventTypeMismatch,
-  },
-
-  nearClean: {
-    frozenFingerprints:
-      SHADOW_COHORT_2_NEAR_CLEAN_KEYS.size,
-
-    samples:
-      stats.shadowCohort2NearCleanSamples,
-
-    small:
-      stats.shadowCohort2NearCleanSmall,
-
-    keep:
-      stats.shadowCohort2NearCleanKeep,
-
-    unknown:
-      stats.shadowCohort2NearCleanUnknown,
-
-    precisionPct:
-      (
-        stats.shadowCohort2NearCleanSmall +
-        stats.shadowCohort2NearCleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort2NearCleanSmall /
-              (
-                stats.shadowCohort2NearCleanSmall +
-                stats.shadowCohort2NearCleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    falsePositivePct:
-      (
-        stats.shadowCohort2NearCleanSmall +
-        stats.shadowCohort2NearCleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort2NearCleanKeep /
-              (
-                stats.shadowCohort2NearCleanSmall +
-                stats.shadowCohort2NearCleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    thresholdMismatch:
-      stats.shadowCohort2NearCleanThresholdMismatch,
-
-    eventTypeMismatch:
-      stats.shadowCohort2NearCleanEventTypeMismatch,
-
-    keepSol: {
-      total:
-        Number(
-          stats.shadowCohort2NearCleanKeepSolTotal
-            .toFixed(6)
-        ),
-
-      average:
-        stats.shadowCohort2NearCleanKeep > 0
-          ? Number(
-              (
-                stats.shadowCohort2NearCleanKeepSolTotal /
-                stats.shadowCohort2NearCleanKeep
-              ).toFixed(6)
-            )
-          : null,
-
-      max:
-        stats.shadowCohort2NearCleanKeep > 0
-          ? Number(
-              stats.shadowCohort2NearCleanKeepSolMax
-                .toFixed(6)
-            )
-          : null,
-
-      "0.05To0.075":
-        stats.shadowCohort2NearCleanKeep005To0075,
-
-      "0.075To0.10":
-        stats.shadowCohort2NearCleanKeep0075To010,
-
-      "0.10To0.25":
-        stats.shadowCohort2NearCleanKeep010To025,
-
-      "0.25To0.50":
-        stats.shadowCohort2NearCleanKeep025To050,
-
-      "0.50To1.00":
-        stats.shadowCohort2NearCleanKeep050To100,
-
-      "1.00Plus":
-        stats.shadowCohort2NearCleanKeep100Plus,
-    },
-
-    byFingerprint:
-      Array.from(
-        shadowCohort2NearCleanByFingerprint.values()
-      ).map(row => {
-        const known =
-          row.small + row.keep;
-
-        return {
-          key: row.key,
-          samples: row.samples,
-          small: row.small,
-          keep: row.keep,
-          unknown: row.unknown,
-
-          precisionPct:
-            known > 0
-              ? Number(
-                  (
-                    100 *
-                    row.small /
-                    known
-                  ).toFixed(4)
-                )
-              : null,
-
-          falsePositivePct:
-            known > 0
-              ? Number(
-                  (
-                    100 *
-                    row.keep /
-                    known
-                  ).toFixed(4)
-                )
-              : null,
-
-          keepSol: {
-            total:
-              Number(
-                row.keepSolTotal.toFixed(6)
-              ),
-
-            average:
-              row.keep > 0
-                ? Number(
-                    (
-                      row.keepSolTotal /
-                      row.keep
-                    ).toFixed(6)
-                  )
-                : null,
-
-            max:
-              row.keep > 0
-                ? Number(
-                    row.keepSolMax.toFixed(6)
-                  )
-                : null,
-
-            "0.05To0.075":
-              row.keep005To0075,
-
-            "0.075To0.10":
-              row.keep0075To010,
-
-            "0.10To0.25":
-              row.keep010To025,
-
-            "0.25To0.50":
-              row.keep025To050,
-
-            "0.50To1.00":
-              row.keep050To100,
-
-            "1.00Plus":
-              row.keep100Plus,
-          },
-        };
-      }),
-  },
-},
-
-// --------------------------------------
-// SHADOW SMALL-TRADE COHORT #3 — CLEAN
-//
-// Forward shadow validation.
-//
-// NOTE:
-// Cohort #3 currently contains one fingerprint
-// that also belongs to Cohort #2 NearClean.
-// Therefore this aggregate should NOT be treated
-// as a strictly independent holdout.
-//
-// Per-fingerprint diagnostics below allow exact
-// forward attribution of SMALL / KEEP outcomes.
-// --------------------------------------
-
-shadowSmallTradeCohort3: {
-  thresholdSol:
-    SHADOW_COHORT_3_THRESHOLD_SOL,
-
-  clean: {
-    frozenFingerprints:
-      SHADOW_COHORT_3_CLEAN_KEYS.size,
-
-    samples:
-      stats.shadowCohort3CleanSamples,
-
-    small:
-      stats.shadowCohort3CleanSmall,
-
-    keep:
-      stats.shadowCohort3CleanKeep,
-
-    unknown:
-      stats.shadowCohort3CleanUnknown,
-
-    precisionPct:
-      (
-        stats.shadowCohort3CleanSmall +
-        stats.shadowCohort3CleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort3CleanSmall /
-              (
-                stats.shadowCohort3CleanSmall +
-                stats.shadowCohort3CleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    falsePositivePct:
-      (
-        stats.shadowCohort3CleanSmall +
-        stats.shadowCohort3CleanKeep
-      ) > 0
-        ? Number(
-            (
-              100 *
-              stats.shadowCohort3CleanKeep /
-              (
-                stats.shadowCohort3CleanSmall +
-                stats.shadowCohort3CleanKeep
-              )
-            ).toFixed(4)
-          )
-        : null,
-
-    thresholdMismatch:
-      stats.shadowCohort3CleanThresholdMismatch,
-
-    eventTypeMismatch:
-      stats.shadowCohort3CleanEventTypeMismatch,
-
-    byFingerprint:
-      Array.from(
-        shadowCohort3CleanByFingerprint.values()
-      ).map(row => {
-        const known =
-          row.small + row.keep;
-
-        return {
-          key: row.key,
-          samples: row.samples,
-          small: row.small,
-          keep: row.keep,
-          unknown: row.unknown,
-
-          precisionPct:
-            known > 0
-              ? Number(
-                  (
-                    100 *
-                    row.small /
-                    known
-                  ).toFixed(4)
-                )
-              : null,
-
-          falsePositivePct:
-            known > 0
-              ? Number(
-                  (
-                    100 *
-                    row.keep /
-                    known
-                  ).toFixed(4)
-                )
-              : null,
-
-          keepSol: {
-            total:
-              Number(
-                row.keepSolTotal.toFixed(6)
-              ),
-
-            average:
-              row.keep > 0
-                ? Number(
-                    (
-                      row.keepSolTotal /
-                      row.keep
-                    ).toFixed(6)
-                  )
-                : null,
-
-            max:
-              row.keep > 0
-                ? Number(
-                    row.keepSolMax.toFixed(6)
-                  )
-                : null,
-
-            "0.05To0.075":
-              row.keep005To0075,
-
-            "0.075To0.10":
-              row.keep0075To010,
-
-            "0.10To0.25":
-              row.keep010To025,
-
-            "0.25To0.50":
-              row.keep025To050,
-
-            "0.50To1.00":
-              row.keep050To100,
-
-            "1.00Plus":
-              row.keep100Plus,
-          },
-        };
-      }),
-  },
-},
-
-// --------------------------------------
-// SHADOW MATURE SMALL-TRADE ALLOWLIST
-//
-// Measures transactions that a future
-// mature pre-RPC filter WOULD have skipped.
-//
-// Observation only.
-// Transactions are still hydrated normally.
-// --------------------------------------
-productionSmallTradePreRpcFilter: {
-  enabled:
-    SMALL_TRADE_PRE_RPC_FILTER_ENABLED,
-
-  thresholdSol:
-    SHADOW_MATURE_HOLDOUT_THRESHOLD_SOL,
-
-  activeMinSolThreshold:
-    effectiveMinSolAmount(),
-
-  frozenFingerprints:
-    SHADOW_MATURE_HOLDOUT_KEYS.size,
-
-  candidates:
-    stats.smallTradePreRpcCandidates,
-
-  skippedBeforeRpc:
-    stats.smallTradePreRpcSkipped,
-
-  bypassedDisabled:
-    stats.smallTradePreRpcBypassedDisabled,
-
-  bypassedThresholdMismatch:
-    stats.smallTradePreRpcBypassedThreshold,
-
-  observedRpcSavingsPct:
-    (
-      stats.rpcFetchSamples +
-      stats.smallTradePreRpcSkipped
-    ) > 0
-      ? Number(
-          (
-            100 *
-            stats.smallTradePreRpcSkipped /
-            (
-              stats.rpcFetchSamples +
-              stats.smallTradePreRpcSkipped
-            )
-          ).toFixed(3)
-        )
-      : 0,
-},
-
-// --------------------------------------
-// PRODUCTION CLEAN COHORT #2
-// --------------------------------------
-
-cleanCohort2Production: {
-  enabled:
-    SMALL_TRADE_PRE_RPC_FILTER_ENABLED,
-
-  thresholdSol:
-    SHADOW_COHORT_2_THRESHOLD_SOL,
-
-  activeMinSolThreshold:
-    effectiveMinSolAmount(),
-
-  frozenFingerprints:
-    SHADOW_COHORT_2_CLEAN_KEYS.size,
-
-  candidates:
-    stats.cleanCohort2PreRpcCandidates,
-
-  skippedBeforeRpc:
-    stats.cleanCohort2PreRpcSkipped,
-
-  bypassedDisabled:
-    stats.cleanCohort2PreRpcBypassedDisabled,
-
-  bypassedThresholdMismatch:
-    stats.cleanCohort2PreRpcBypassedThreshold,
-},
-            
-
-shadowMatureSmallTradePrefilter:
-  getMatureSmallTradeShadowSummary(),
-
-pumpSolCandidateShadow: pumpSolCandidateSummary(),
-
-// --------------------------------------
-// SOL AMOUNT SHADOW VALIDATION
-// --------------------------------------
-solAmountShadow: {
-  enabled: SOL_AMOUNT_SHADOW_ENABLED,
-  thresholdSol: effectiveMinSolAmount(),
-  samples: stats.solShadowSamples,
-  buySamples: stats.solShadowBuySamples,
-  sellSamples: stats.solShadowSellSamples,
-  match: stats.solShadowMatch,
-  fallbackOnly: stats.solShadowFallbackOnly,
-  bothNull: stats.solShadowBothNull,
-  mismatch: stats.solShadowMismatch,
-  wouldReject: stats.solShadowWouldReject,
-  wouldRejectBuy: stats.solShadowWouldRejectBuy,
-  wouldRejectSell: stats.solShadowWouldRejectSell,
-  wouldAccept: stats.solShadowWouldAccept,
-  productionSolTotal: stats.solShadowProductionSolTotal,
-  transferSolTotal: stats.solShadowTransferSolTotal,
-  fallbackOnlySolTotal: stats.solShadowFallbackOnlySolTotal,
-  fallbackOnlySolMax: stats.solShadowFallbackOnlySolMax,
-  fallbackForensics: solShadowFallbackForensicSummary(),
-  largeAmountSamples: stats.solShadowLargeAmountSamples,
-  errors: stats.solShadowErrors,
-},
-
-// --------------------------------------
-// PRESERVE ALL RAW CUMULATIVE COUNTERS
-// --------------------------------------
-
-...stats,
-          }
-        );
+        // Compact operational dashboard + current SELL validation only.
+        // Legacy diagnostics remain collected internally but are not serialized.
+        logInfo("Scanner stats", {
+          time: nowIso(),
+          scanner: {enabled:isPregradEnabled(),manualOverride:pregradControl.manual_override,
+            websocketState:ws?.readyState??null,socketAlive,intakePaused,workerRunning},
+          pipeline: {queueSize:signatureQueue.length,inFlight:inFlightSignatures.size,
+            oldestSignatureAgeMs,incomingPerSecond,drainedPerSecond,
+            processedPerSecond,insertedPerSecond,
+            queued:stats.queued,dequeued:stats.dequeued,processed:stats.processed,
+            insertedEvents:stats.insertedEvents,insertedTokens:stats.insertedTokens,
+            skippedSmallSolAmount:stats.skippedSmallSolAmount,
+            droppedDuringPause:stats.droppedDuringPause,
+            droppedQueueFull:stats.droppedQueueFull,droppedStale:stats.droppedStale,
+            intakePausedCount:stats.intakePausedCount,intakeResumedCount:stats.intakeResumedCount},
+          filtering: {minSolAmount:effectiveMinSolAmount(),
+            preRpcSkipped:stats.smallTradePreRpcSkipped,
+            cleanCohort2Skipped:stats.cleanCohort2PreRpcSkipped},
+          rpc: {pacer:heliusOptimizationV1,methods:heliusRpcMethodHealth,
+            fetch:rpcFetchPerformance,attempts:rpcAttemptPerformance,
+            retries:stats.rpcRetries,rateLimitedRetries:stats.rpcRateLimitedRetries,
+            fetchErrors:stats.txFetchErrors},
+          database: {dispatcher:dbWriteDispatcher,write:dbWritePerformance,
+            pool:postgresPool,acquire:dbPoolAcquirePerformance,
+            execution:dbQueryExecutionPerformance,rtt:dbRttProbeHealth},
+          errors: {workers:stats.workerErrors,control:stats.controlFetchErrors,
+            safetyEnrichment:stats.safetyEnrichmentErrors},
+          sellRecovery: phase2tSummary()
+        });
         // ==========================================
         // UPDATE INTERVAL BASELINE
         //

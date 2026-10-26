@@ -3803,7 +3803,7 @@ const shadow2t = {seen:0,selectedWs:0,selectedRpc:0,fallback:0,
   wsInvalid:0,rpcInvalid:0,wsRpcMismatch:0,errors:0,
   reasons:Object.create(null),threshold:Object.create(null),
   selectedSol:0,productionSol:0,positiveDeltaSol:0,negativeDeltaSol:0,
-  examples:[]};
+  examples:[],invalidEventDetails:Object.create(null),invalidEventSamples:[]};
 function phase2tCount(group,key){group[key]=(group[key]||0)+1;}
 function phase2tValidate(decoded,event,tx){
   if(!decoded||decoded.eventType!=="sell"||decoded.mint!==event.token_address||
@@ -3836,6 +3836,30 @@ function phase2tValidate(decoded,event,tx){
   if(closest*10000n>amount*200n)return {reason:"debit_gap_over_2pct"};
   return {reason:"validated",sol:Number(amount)/1e9,gapBps:Number(closest*10000n/amount)};
 }
+// Phase 2T.2: classify invalid_event without relaxing any selector guard.
+function phase2tInvalidDetail(decoded,event){
+  if(!decoded)return "decode_failed";
+  if(decoded.eventType!=="sell")return "direction_not_sell";
+  if(decoded.mint!==event?.token_address)return "mint_mismatch";
+  if(typeof decoded.solLamports!=="bigint")return "missing_lamports";
+  if(decoded.solLamports<=0n)return "zero_or_negative_lamports";
+  if(decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER))return "unsafe_lamports";
+  return "other_invalid_event";
+}
+function phase2tTrackInvalid(source,result,decoded,event,signature){
+  if(result.reason!=="invalid_event")return;
+  const detail=phase2tInvalidDetail(decoded,event);
+  phase2tCount(shadow2t.invalidEventDetails,source+":"+detail);
+  // Bounded samples; no raw payloads, token balances, or oversized tx objects.
+  if(shadow2t.invalidEventSamples.filter(x=>x.source===source&&x.detail===detail).length<2 &&
+     shadow2t.invalidEventSamples.length<16){
+    shadow2t.invalidEventSamples.push({signature,source,detail,
+      expectedMint:event?.token_address??null,decodedMint:decoded?.mint??null,
+      decodedDirection:decoded?.eventType??null,
+      payloadBytes:decoded?.payloadBytes??null,
+      solLamports:typeof decoded?.solLamports==="bigint"?decoded.solLamports.toString():null});
+  }
+}
 function phase2tRecord(signature,event,tx){
   if(!SHADOW_2T_ENABLED||event?.event_type!=="sell")return;
   shadow2t.seen++;
@@ -3848,6 +3872,7 @@ function phase2tRecord(signature,event,tx){
         wsResult=phase2tValidate(ws,event,tx);
       }else wsResult={reason:"ambiguous_ws"};
       if(wsResult.reason!=="validated")shadow2t.wsInvalid++;
+      phase2tTrackInvalid("ws",wsResult,ws,event,signature);
     }
     // Read already-hydrated logs only; never request an additional transaction.
     const payloads=[];
@@ -3863,6 +3888,7 @@ function phase2tRecord(signature,event,tx){
       rpcResult=phase2tValidate(rpc,event,tx);
     }else rpcResult={reason:payloads.length?"ambiguous_rpc":"missing_rpc"};
     if(rpcResult.reason!=="validated")shadow2t.rpcInvalid++;
+    phase2tTrackInvalid("rpc",rpcResult,rpc,event,signature);
     if(wsResult.reason==="validated"&&rpcResult.reason==="validated"&&
        (ws.solLamports!==rpc.solLamports||ws.tokenAmountRaw!==rpc.tokenAmountRaw))
       shadow2t.wsRpcMismatch++;
@@ -3895,12 +3921,14 @@ function phase2tRecord(signature,event,tx){
 }
 function phase2tSummary(){
   const round=n=>Number(n.toFixed(9));
-  return {version:"2T.1",mode:"shadow_only",enabled:SHADOW_2T_ENABLED,
+  return {version:"2T.2",mode:"shadow_only",enabled:SHADOW_2T_ENABLED,
     seen:shadow2t.seen,selectedWebsocket:shadow2t.selectedWs,
     recoveredRpc:shadow2t.selectedRpc,fallbackProduction:shadow2t.fallback,
     wsInvalid:shadow2t.wsInvalid,rpcInvalid:shadow2t.rpcInvalid,
     wsRpcValidatedMismatch:shadow2t.wsRpcMismatch,errors:shadow2t.errors,
     threshold:shadow2t.threshold,selectionFailures:shadow2t.reasons,
+    invalidEventDetails:shadow2t.invalidEventDetails,
+    invalidEventSamples:shadow2t.invalidEventSamples,
     selectedEventSol:round(shadow2t.selectedSol),
     productionOnSelectedSol:round(shadow2t.productionSol),
     positiveDifferenceSol:round(shadow2t.positiveDeltaSol),
@@ -20040,6 +20068,9 @@ const dbRttProbeHealth = {
 
         // Compact operational dashboard + current SELL validation only.
         // Legacy diagnostics remain collected internally but are not serialized.
+        // Phase 2T.2: intentionally compact Railway summary. Detailed historical
+        // diagnostic collectors still run, but their objects are not logged here.
+        const rpcTx = heliusRpcMethodHealth?.getTransaction || {};
         logInfo("Scanner stats", {
           time: nowIso(),
           scanner: {enabled:isPregradEnabled(),manualOverride:pregradControl.manual_override,
@@ -20056,16 +20087,26 @@ const dbRttProbeHealth = {
           filtering: {minSolAmount:effectiveMinSolAmount(),
             preRpcSkipped:stats.smallTradePreRpcSkipped,
             cleanCohort2Skipped:stats.cleanCohort2PreRpcSkipped},
-          rpc: {pacer:heliusOptimizationV1,methods:heliusRpcMethodHealth,
-            fetch:rpcFetchPerformance,attempts:rpcAttemptPerformance,
-            retries:stats.rpcRetries,rateLimitedRetries:stats.rpcRateLimitedRetries,
-            fetchErrors:stats.txFetchErrors},
-          database: {dispatcher:dbWriteDispatcher,write:dbWritePerformance,
-            pool:postgresPool,acquire:dbPoolAcquirePerformance,
-            execution:dbQueryExecutionPerformance,rtt:dbRttProbeHealth},
+          rpc: {pacer:{mode:heliusOptimizationV1?.mode,
+              suggestedRps:heliusOptimizationV1?.suggestedRps,
+              actualRps:heliusOptimizationV1?.actualRps,
+              rateLimitEvents:heliusOptimizationV1?.rateLimitEvents},
+            getTransaction:{starts:rpcTx.starts,http429:rpcTx.http429,
+              successfulResponses:rpcTx.successfulResponses,httpAvgMs:rpcTx.httpAvgMs},
+            fetchAvgMs:rpcFetchPerformance?.avgMs,
+            retries:stats.rpcRetries,fetchErrors:stats.txFetchErrors},
+          database: {dispatcher:{queueSize:dbWriteDispatcher?.queueSize,
+              inFlight:dbWriteDispatcher?.inFlight,
+              jobsCompleted:dbWriteDispatcher?.jobsCompleted,
+              jobsFailed:dbWriteDispatcher?.jobsFailed,
+              backpressureEvents:dbWriteDispatcher?.backpressureEvents},
+            writeAvgMs:dbWritePerformance?.avgMs,
+            pool:postgresPool,
+            rtt:{avgMs:dbRttProbeHealth?.avgMs,latestMs:dbRttProbeHealth?.latestMs,
+              maxMs:dbRttProbeHealth?.maxMs,errors:dbRttProbeHealth?.errors}},
           errors: {workers:stats.workerErrors,control:stats.controlFetchErrors,
             safetyEnrichment:stats.safetyEnrichmentErrors},
-          sellRecovery: phase2tSummary()
+          sellRecovery:phase2tSummary()
         });
         // ==========================================
         // UPDATE INTERVAL BASELINE

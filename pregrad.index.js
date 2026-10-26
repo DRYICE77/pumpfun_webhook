@@ -3267,6 +3267,139 @@ function phase2oSummary(){
     caution:"No verified IDL account-role assignment. Inner transfers are associated with outer instruction index, not proven CPI ancestry. Whole-transaction deltas cannot isolate individual swaps, fees, or net proceeds. No production changes."};
 }
 
+
+// ==================================================
+// PHASE 2P — SHADOW SELL CANDIDATE SELECTOR / VALIDATION
+// Event SOL is gross trade amount, not verified net proceeds.
+// Unique matching TradeEvent + target Pump instruction +
+// transaction-wide debit correlation are required to select.
+// Otherwise retain production amount as shadow fallback.
+// No RPC, SQL, filtering, production amount, or threshold changes.
+// ==================================================
+const SHADOW_2P_ENABLED = process.env.SHADOW_2P_ENABLED !== "false";
+const PHASE_2P_EXAMPLE_LIMIT = 16;
+const shadow2p = {
+  seen:0, selectedEvent:0, fallbackProduction:0, errors:0,
+  reasons:new Map(), layouts:new Map(), validation:new Map(),
+  threshold:new Map(), samples:[],
+  eventSelectedSol:0, productionSelectedSol:0,
+  candidateSelectedSol:0, deltaSelectedSol:0,
+  wouldAddSol:0, wouldRemoveSol:0,
+  maxPositiveDeltaSol:0, maxNegativeDeltaSol:0
+};
+function phase2pInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2pRecord(signature,event,tx){
+  if(!SHADOW_2P_ENABLED||event?.event_type!=="sell")return;
+  shadow2p.seen++;
+  try{
+    const prodRaw=event.sol_amount;
+    const prodNum=prodRaw==null?NaN:Number(prodRaw);
+    const production=Number.isFinite(prodNum)&&prodNum>0?prodNum:null;
+    const row=shadowProgramData2cPending.get(signature);
+    let reason="selected_event", layout=null, gapBps=null, eventSol=null;
+    let amount=null;
+    if(!row)reason="missing_capture";
+    else if(row.targetEventCount!==1||row.truncated)reason="ambiguous_capture";
+    else {
+      const decoded=decodePumpTradeEventShadow(row.payloadHex);
+      if(!decoded||decoded.eventType!=="sell"||
+         decoded.mint!==event.token_address||decoded.solLamports<=0n||
+         decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER))reason="invalid_event";
+      else {
+        amount=decoded.solLamports;
+        eventSol=Number(amount)/1e9;
+        const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+        const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+        if(!Array.isArray(pre)||!Array.isArray(post)||pre.length!==post.length||
+           keys.length<pre.length||!pre.every((v,i)=>Number.isSafeInteger(v)&&Number.isSafeInteger(post[i])))
+          reason="missing_balances";
+        else {
+          const deltas=new Map(keys.slice(0,pre.length).map((k,i)=>[k,BigInt(post[i])-BigInt(pre[i])]));
+          const resolve=v=>typeof v==="number"?keys[v]||null:
+            typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+          const candidates=[];
+          const inspect=ins=>{
+            const program=resolve(ins?.programIdIndex)||resolve(ins?.programId);
+            if(program!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+            const data=phase2mInstructionData(ins);
+            const disc=data?.length>=8?data.subarray(0,8).toString("hex"):null;
+            if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+            candidates.push({layout:disc+":"+(ins?.accounts||[]).length,
+              accounts:(ins?.accounts||[]).map(resolve)});
+          };
+          for(const ins of getInstructions(tx))inspect(ins);
+          for(const group of getInnerInstructions(tx))
+            for(const ins of group?.instructions||[])inspect(ins);
+          if(candidates.length!==1)reason=candidates.length?"multiple_target_instructions":"no_target_instruction";
+          else {
+            const candidate=candidates[0];layout=candidate.layout;
+            const gaps=candidate.accounts.map(key=>deltas.get(key)).filter(d=>d!=null&&d<0n)
+              .map(d=>{const debit=-d;return debit>amount?debit-amount:amount-debit;});
+            if(!gaps.length)reason="no_debit";
+            else {
+              const closest=gaps.reduce((a,b)=>a<b?a:b);
+              gapBps=Number(closest*10000n/amount);
+              // <=2% is CORRELATION only; it does not prove settlement or fees.
+              if(closest*10000n>amount*200n)reason="debit_gap_over_2pct";
+            }
+          }
+        }
+      }
+    }
+    const selected=reason==="selected_event"?eventSol:production;
+    phase2pInc(shadow2p.reasons,reason);
+    if(layout)phase2pInc(shadow2p.layouts,layout+":"+reason);
+    if(reason==="selected_event")shadow2p.selectedEvent++;
+    else shadow2p.fallbackProduction++;
+    const threshold=effectiveMinSolAmount();
+    const validThreshold=Number.isFinite(threshold)&&threshold>=0;
+    const productionKeep=validThreshold&&production!=null&&production>=threshold;
+    const candidateKeep=validThreshold&&selected!=null&&selected>=threshold;
+    const thresholdKey=!validThreshold?"invalid_threshold":
+      candidateKeep&&!productionKeep?"would_add":
+      !candidateKeep&&productionKeep?"would_remove":
+      candidateKeep?"both_keep":"both_small";
+    phase2pInc(shadow2p.threshold,thresholdKey);
+    if(reason==="selected_event"){
+      shadow2p.eventSelectedSol+=eventSol;
+      if(production!=null)shadow2p.productionSelectedSol+=production;
+      const diff=eventSol-(production??0);
+      shadow2p.deltaSelectedSol+=diff;
+      if(diff>0){shadow2p.wouldAddSol+=diff;shadow2p.maxPositiveDeltaSol=Math.max(shadow2p.maxPositiveDeltaSol,diff);}
+      else {shadow2p.wouldRemoveSol+=-diff;shadow2p.maxNegativeDeltaSol=Math.max(shadow2p.maxNegativeDeltaSol,-diff);}
+      phase2pInc(shadow2p.validation,gapBps===0?"debit_exact":gapBps<=100?"debit_within_1pct":"debit_1_to_2pct");
+    }
+    if(selected!=null)shadow2p.candidateSelectedSol+=selected;
+    if(shadow2p.samples.length<PHASE_2P_EXAMPLE_LIMIT&&
+       (reason!=="selected_event"||thresholdKey==="would_add"||thresholdKey==="would_remove")&&
+       shadow2p.samples.filter(s=>s.reason===reason).length<4){
+      shadow2p.samples.push({signature,reason,layout,gapBps,productionSol:production,
+        eventSol,shadowCandidateSol:selected,thresholdSol:validThreshold?threshold:null,
+        thresholdOutcome:thresholdKey});
+    }
+  }catch(_error){shadow2p.errors++;phase2pInc(shadow2p.reasons,"exception");}
+}
+function phase2pSummary(){
+  const top=(m,n=30)=>[...m].sort((a,b)=>b[1]-a[1]).slice(0,n)
+    .map(([key,count])=>({key,count}));
+  const round=n=>Number(n.toFixed(9));
+  return {enabled:SHADOW_2P_ENABLED,mode:"shadow_only",version:"2P.1",
+    seen:shadow2p.seen,selectedEvent:shadow2p.selectedEvent,
+    fallbackProduction:shadow2p.fallbackProduction,errors:shadow2p.errors,
+    reasons:top(shadow2p.reasons),layouts:top(shadow2p.layouts),
+    validation:top(shadow2p.validation),thresholdOutcomes:top(shadow2p.threshold),
+    totalsSol:{eventSelected:round(shadow2p.eventSelectedSol),
+      productionOnSelected:round(shadow2p.productionSelectedSol),
+      candidateAll:round(shadow2p.candidateSelectedSol),
+      candidateMinusProductionOnSelected:round(shadow2p.deltaSelectedSol),
+      positiveDifferences:round(shadow2p.wouldAddSol),
+      negativeDifferences:round(shadow2p.wouldRemoveSol),
+      maxPositiveDifference:round(shadow2p.maxPositiveDeltaSol),
+      maxNegativeDifference:round(shadow2p.maxNegativeDeltaSol)},
+    examples:shadow2p.samples,
+    caution:"Selected event is gross TradeEvent SOL, not verified wallet net proceeds. Debit is transaction-wide correlation, not proven account role or instruction settlement. Threshold outcomes are hypothetical; no production changes."};
+}
+
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -16556,6 +16689,7 @@ phase2lRecord(item.signature, event, tx);
 phase2mRecord(item.signature, event, tx);
 phase2nRecord(item.signature, event, tx);
 phase2oRecord(item.signature, event, tx);
+phase2pRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19617,6 +19751,7 @@ shadowPumpProgramData: {
   phase2m: phase2mSummary(),
   phase2n: phase2nSummary(),
   phase2o: phase2oSummary(),
+  phase2p: phase2pSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

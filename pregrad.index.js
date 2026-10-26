@@ -3401,6 +3401,143 @@ function phase2pSummary(){
 }
 
 // ==================================================
+// PHASE 2Q — SHADOW PRODUCTION-OVER-EVENT FORENSICS
+// Read-only: inspect the transfer(s) that cause the existing
+// transaction-wide max parser to exceed a validated SELL event.
+// Never change production amounts, filtering, RPC, or SQL.
+// ==================================================
+const SHADOW_2Q_ENABLED = process.env.SHADOW_2Q_ENABLED !== "false";
+const PHASE_2Q_EXAMPLE_LIMIT = 24;
+const shadow2q = {
+  seen:0,eligible:0,productionAbove:0,productionEqualOrBelow:0,
+  skipped:new Map(),layouts:new Map(),sources:new Map(),relationships:new Map(),
+  winningTransfers:0,missingWinner:0,errors:0,
+  excessSol:0,maxExcessSol:0,examples:[]
+};
+function phase2qInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2qRecord(signature,event,tx){
+  if(!SHADOW_2Q_ENABLED||event?.event_type!=="sell")return;
+  shadow2q.seen++;
+  try {
+    const row=shadowProgramData2cPending.get(signature);
+    if(!row||row.targetEventCount!==1||row.truncated){
+      phase2qInc(shadow2q.skipped,!row?"missing_capture":"ambiguous_capture");return;
+    }
+    const decoded=decodePumpTradeEventShadow(row.payloadHex);
+    if(!decoded||decoded.eventType!=="sell"||decoded.mint!==event.token_address||
+       decoded.solLamports<=0n||decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER)){
+      phase2qInc(shadow2q.skipped,"invalid_event");return;
+    }
+    const eventSol=Number(decoded.solLamports)/1e9;
+    const production=Number(event.sol_amount);
+    if(!Number.isFinite(production)||production<=0){
+      phase2qInc(shadow2q.skipped,"missing_production");return;
+    }
+    shadow2q.eligible++;
+    // One-lamport tolerance prevents floating-point classification noise.
+    if(production-eventSol<=1e-9){shadow2q.productionEqualOrBelow++;return;}
+    shadow2q.productionAbove++;
+    const excess=production-eventSol;
+    shadow2q.excessSol+=excess;
+    shadow2q.maxExcessSol=Math.max(shadow2q.maxExcessSol,excess);
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const resolve=v=>typeof v==="number"?keys[v]||null:
+      typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+    const targets=[];
+    const inspectTarget=(ins,outerIndex,origin)=>{
+      const program=resolve(ins?.programIdIndex)||resolve(ins?.programId);
+      if(program!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const data=phase2mInstructionData(ins);
+      const disc=data?.length>=8?data.subarray(0,8).toString("hex"):null;
+      if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+      const accounts=(ins?.accounts||[]).map(resolve);
+      // Official IDL positions (zero-based): sell=3, sell_v2=10, sell_v3=5.
+      // Keep null for unknown variants instead of assuming a role.
+      const curvePosition=disc==="33e685a4017f83ad"?3:
+        disc==="5df6823ce7e940b2"?10:
+        disc==="1c92de7726c469d5"?5:null;
+      targets.push({layout:disc+":"+accounts.length,origin,outerIndex,
+        bondingCurve:curvePosition!=null?accounts[curvePosition]||null:null,
+        curvePosition,accountCount:accounts.length});
+    };
+    const outer=getInstructions(tx);
+    outer.forEach((ins,i)=>inspectTarget(ins,i,"outer"));
+    const inner=getInnerInstructions(tx);
+    for(const group of inner)for(const ins of group?.instructions||[])
+      inspectTarget(ins,group?.index??null,"inner");
+    const target=targets.length===1?targets[0]:null;
+    phase2qInc(shadow2q.layouts,target?.layout||
+      (targets.length===0?"no_target":"multiple_targets"));
+    // Mirror extractSolAmount() exactly, retaining instruction provenance.
+    const transfers=[];
+    const scan=(ins,origin,outerIndex,innerIndex)=>{
+      const info=ins?.parsed?.info||{};
+      const program=resolve(ins?.programIdIndex)||resolve(ins?.programId)||ins?.program||null;
+      const add=(raw,kind)=>{
+        const sol=Number(raw);
+        if(!Number.isFinite(sol)||sol<=0)return;
+        transfers.push({sol,kind,origin,outerIndex,innerIndex,
+          program,source:info.source||info.authority||null,
+          destination:info.destination||null,
+          mint:info.mint||null,parsedType:ins?.parsed?.type||null});
+      };
+      if(info.mint==="So11111111111111111111111111111111111111112"){
+        const raw=info?.tokenAmount?.uiAmount??info?.uiAmount??
+          (info?.amount!=null&&info?.decimals===9?Number(info.amount)/1e9:null);
+        if(raw!=null)add(raw,"wsol");
+      }
+      if(info.lamports!=null)add(Number(info.lamports)/1e9,"native");
+    };
+    outer.forEach((ins,i)=>scan(ins,"outer",i,null));
+    for(const group of inner)(group?.instructions||[]).forEach((ins,i)=>
+      scan(ins,"inner",group?.index??null,i));
+    const maxSol=transfers.length?Math.max(...transfers.map(t=>t.sol)):null;
+    // Only call these winning if they reproduce the parser's production amount.
+    const winners=maxSol!=null&&Math.abs(maxSol-production)<=1e-9?
+      transfers.filter(t=>Math.abs(t.sol-maxSol)<=1e-9):[];
+    if(!winners.length)shadow2q.missingWinner++;
+    shadow2q.winningTransfers+=winners.length;
+    const annotate=t=>{
+      const sameGroup=target?.outerIndex!=null&&t.outerIndex===target.outerIndex;
+      const curve=target?.bondingCurve||null;
+      const relation=!curve?"unknown_curve":
+        t.source===curve?"source_is_curve":
+        t.destination===curve?"destination_is_curve":
+        sameGroup?"same_outer_group_not_curve":"outside_outer_group_not_curve";
+      return {...t,sameOuterGroup:sameGroup,relationship:relation};
+    };
+    const annotated=winners.map(annotate);
+    for(const w of annotated){
+      phase2qInc(shadow2q.sources,w.kind+":"+w.origin);
+      phase2qInc(shadow2q.relationships,w.relationship);
+    }
+    // Bounded, largest-excess examples, so large anomalies aren't lost
+    // to the first few observations after a deploy.
+    const example={signature,mint:decoded.mint,eventSol,productionSol:production,
+      excessSol:Number(excess.toFixed(9)),targetInstructionCount:targets.length,
+      target,winnerMatchesProduction:winners.length>0,
+      transferCount:transfers.length,winners:annotated.slice(0,4),
+      topTransfers:transfers.sort((a,b)=>b.sol-a.sol).slice(0,5).map(annotate)};
+    shadow2q.examples.push(example);
+    shadow2q.examples.sort((a,b)=>b.excessSol-a.excessSol);
+    if(shadow2q.examples.length>PHASE_2Q_EXAMPLE_LIMIT)shadow2q.examples.pop();
+  }catch(_error){shadow2q.errors++;phase2qInc(shadow2q.skipped,"exception");}
+}
+function phase2qSummary(){
+  const top=m=>[...m].sort((a,b)=>b[1]-a[1]).map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2Q_ENABLED,mode:"shadow_only",version:"2Q.1",
+    seen:shadow2q.seen,eligible:shadow2q.eligible,
+    productionAbove:shadow2q.productionAbove,
+    productionEqualOrBelow:shadow2q.productionEqualOrBelow,
+    skipped:top(shadow2q.skipped),layouts:top(shadow2q.layouts),
+    winnerSources:top(shadow2q.sources),winnerRelationships:top(shadow2q.relationships),
+    winningTransfers:shadow2q.winningTransfers,missingWinner:shadow2q.missingWinner,
+    errors:shadow2q.errors,excessSol:Number(shadow2q.excessSol.toFixed(9)),
+    maxExcessSol:Number(shadow2q.maxExcessSol.toFixed(9)),examples:shadow2q.examples,
+    caution:"Only captures parsed transfers mirrored from production parser. Matching an outer index does not prove CPI ancestry. Bonding curve account index is IDL-based but PDA and event-to-instruction linkage are not verified. No production changes."};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -16690,6 +16827,7 @@ phase2mRecord(item.signature, event, tx);
 phase2nRecord(item.signature, event, tx);
 phase2oRecord(item.signature, event, tx);
 phase2pRecord(item.signature, event, tx);
+phase2qRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19752,6 +19890,7 @@ shadowPumpProgramData: {
   phase2n: phase2nSummary(),
   phase2o: phase2oSummary(),
   phase2p: phase2pSummary(),
+  phase2q: phase2qSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

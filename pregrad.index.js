@@ -7,7 +7,7 @@ const WebSocket = require("ws");
 const { Pool } = require("pg");
 
 // ==================================================
-// 1. ENVIRONMENT
+// 1. ENVIRONMENTt
 // ==================================================
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;

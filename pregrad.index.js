@@ -1,14 +1,4 @@
-/ ==================================================
-// PRE-GRAD INDEX.JS — PRESERVED INGESTION VERSION
-// PART 1 OF 4
-//
-// Paste Parts 1–4 together in order.
-// Core philosophy:
-// • Preserve the proven ingestion path.
-// • Keep worker concurrency modest.
-// • Keep enrichment outside the ingestion critical path.
-// • Do not run schema migrations during live startup.
-// ==================================================
+
 
 require("dotenv").config();
 

@@ -3653,6 +3653,146 @@ function phase2rSummary(){
     caution:"RPC logs diagnose websocket capture gaps, not their root cause. Account-index curve roles are provisional; transfer endpoints and outer groups do not prove CPI settlement. Winner counts may exceed transactions. No production changes."};
 }
 
+
+// ==================================================
+// PHASE 2S — SHADOW RPC TRADE EVENT RECOVERY
+// Decode existing hydrated RPC Program data logs when the
+// websocket capture is absent. Strict mint/direction/unique
+// event checks; reuse Phase 2P's <=2% debit correlation test.
+// Compare RPC vs websocket when both are present.
+// NO extra RPC, SQL, filtering or production modifications.
+// ==================================================
+const SHADOW_2S_ENABLED = process.env.SHADOW_2S_ENABLED !== "false";
+const PHASE_2S_EXAMPLE_LIMIT = 18;
+const shadow2s = {seen:0,missingWs:0,wsPresent:0,rpcNoTarget:0,
+  rpcOneTarget:0,rpcMultipleTargets:0,rpcInvalid:0,rpcMismatch:0,
+  rpcEligible:0,rpcSelected:0,wsRpcComparable:0,wsRpcExact:0,
+  wsRpcMismatch:0,errors:0,reasons:new Map(),layouts:new Map(),
+  threshold:new Map(),gapBands:new Map(),examples:[],
+  selectedEventSol:0,productionOnSelectedSol:0,maxPositiveDelta:0};
+function phase2sInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2sRecord(signature,event,tx){
+  if(!SHADOW_2S_ENABLED||event?.event_type!=="sell")return;
+  shadow2s.seen++;
+  try{
+    const ws=shadowProgramData2cPending.get(signature);
+    if(ws)shadow2s.wsPresent++;else shadow2s.missingWs++;
+    const payloads=[];
+    for(const line of getLogMessages(tx)){
+      const match=String(line).match(/Program data:\s*([A-Za-z0-9+/=]+)/);
+      if(!match)continue;
+      const b64=match[1];
+      if(!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)||b64.length%4!==0){shadow2s.rpcInvalid++;continue;}
+      const bytes=Buffer.from(b64,"base64");
+      if(bytes.length>=8&&bytes.subarray(0,8).toString("hex")===
+          SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR)payloads.push(bytes.toString("hex"));
+    }
+    if(!payloads.length){shadow2s.rpcNoTarget++;phase2sInc(shadow2s.reasons,"no_rpc_target");return;}
+    if(payloads.length!==1){shadow2s.rpcMultipleTargets++;phase2sInc(shadow2s.reasons,"ambiguous_rpc_targets");return;}
+    shadow2s.rpcOneTarget++;
+    const decoded=decodePumpTradeEventShadow(payloads[0]);
+    if(!decoded||decoded.solLamports<=0n||decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER)){
+      shadow2s.rpcInvalid++;phase2sInc(shadow2s.reasons,"invalid_rpc_event");return;
+    }
+    if(decoded.eventType!=="sell"||decoded.mint!==event.token_address){
+      shadow2s.rpcMismatch++;phase2sInc(shadow2s.reasons,"rpc_mint_or_direction_mismatch");return;
+    }
+    shadow2s.rpcEligible++;
+    if(ws&&ws.targetEventCount===1&&!ws.truncated){
+      const w=decodePumpTradeEventShadow(ws.payloadHex);
+      if(w){
+        shadow2s.wsRpcComparable++;
+        if(w.eventType===decoded.eventType&&w.mint===decoded.mint&&
+           w.solLamports===decoded.solLamports&&w.tokenAmountRaw===decoded.tokenAmountRaw)
+          shadow2s.wsRpcExact++;
+        else shadow2s.wsRpcMismatch++;
+      }
+    }
+    // A missing WS capture is the recovery population. Existing
+    // captures are used only to cross-check the RPC decoder.
+    if(ws)return;
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+    let reason="selected_rpc_event",layout=null,gapBps=null;
+    if(!Array.isArray(pre)||!Array.isArray(post)||pre.length!==post.length||
+       keys.length<pre.length||!pre.every((v,i)=>Number.isSafeInteger(v)&&Number.isSafeInteger(post[i])))
+      reason="missing_balances";
+    else {
+      const deltas=new Map(keys.slice(0,pre.length).map((k,i)=>[k,BigInt(post[i])-BigInt(pre[i])]));
+      const resolve=v=>typeof v==="number"?keys[v]||null:
+        typeof v==="string"?v:v?.pubkey?.toString?.()||null;
+      const targets=[];
+      const inspect=ins=>{
+        const program=resolve(ins?.programIdIndex)||resolve(ins?.programId);
+        if(program!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+        const bytes=phase2mInstructionData(ins);
+        const disc=bytes?.length>=8?bytes.subarray(0,8).toString("hex"):null;
+        if(!PHASE_2N_TARGET_DISCS.has(disc))return;
+        targets.push({layout:disc+":"+(ins?.accounts||[]).length,
+          accounts:(ins?.accounts||[]).map(resolve)});
+      };
+      for(const ins of getInstructions(tx))inspect(ins);
+      for(const group of getInnerInstructions(tx))for(const ins of group?.instructions||[])inspect(ins);
+      if(targets.length!==1)reason=targets.length?"multiple_target_instructions":"no_target_instruction";
+      else {
+        const target=targets[0];layout=target.layout;
+        const amount=decoded.solLamports;
+        const gaps=target.accounts.map(key=>deltas.get(key)).filter(d=>d!=null&&d<0n)
+          .map(d=>{const debit=-d;return debit>amount?debit-amount:amount-debit;});
+        if(!gaps.length)reason="no_debit";
+        else {
+          const closest=gaps.reduce((a,b)=>a<b?a:b);
+          gapBps=Number(closest*10000n/amount);
+          if(closest*10000n>amount*200n)reason="debit_gap_over_2pct";
+        }
+      }
+    }
+    phase2sInc(shadow2s.reasons,reason);
+    if(layout)phase2sInc(shadow2s.layouts,layout+":"+reason);
+    if(reason==="selected_rpc_event"){
+      shadow2s.rpcSelected++;
+      phase2sInc(shadow2s.gapBands,gapBps===0?"exact":gapBps<=100?"within_1pct":"1_to_2pct");
+      const eventSol=Number(decoded.solLamports)/1e9;
+      const production=event.sol_amount==null?null:Number(event.sol_amount);
+      const validProduction=production!=null&&Number.isFinite(production)&&production>0?production:null;
+      shadow2s.selectedEventSol+=eventSol;
+      if(validProduction!=null)shadow2s.productionOnSelectedSol+=validProduction;
+      shadow2s.maxPositiveDelta=Math.max(shadow2s.maxPositiveDelta,eventSol-(validProduction??0));
+      const threshold=effectiveMinSolAmount();
+      const validThreshold=Number.isFinite(threshold)&&threshold>=0;
+      const eventKeep=validThreshold&&eventSol>=threshold;
+      const productionKeep=validThreshold&&validProduction!=null&&validProduction>=threshold;
+      const outcome=!validThreshold?"invalid_threshold":eventKeep&&!productionKeep?"would_add":
+        !eventKeep&&productionKeep?"would_remove":eventKeep?"both_keep":"both_small";
+      phase2sInc(shadow2s.threshold,outcome);
+      if(shadow2s.examples.length<PHASE_2S_EXAMPLE_LIMIT&&
+         (outcome==="would_add"||outcome==="would_remove"))
+        shadow2s.examples.push({signature,reason,layout,gapBps,eventSol,
+          productionSol:validProduction,thresholdOutcome:outcome});
+    }else if(shadow2s.examples.length<PHASE_2S_EXAMPLE_LIMIT&&
+             shadow2s.examples.filter(x=>x.reason===reason).length<2)
+      shadow2s.examples.push({signature,reason,layout,gapBps,
+        eventSol:Number(decoded.solLamports)/1e9});
+  }catch(_error){shadow2s.errors++;phase2sInc(shadow2s.reasons,"exception");}
+}
+function phase2sSummary(){
+  const top=m=>[...m].sort((a,b)=>b[1]-a[1]).map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2S_ENABLED,mode:"shadow_only",version:"2S.1",
+    seen:shadow2s.seen,missingWs:shadow2s.missingWs,wsPresent:shadow2s.wsPresent,
+    rpcNoTarget:shadow2s.rpcNoTarget,rpcOneTarget:shadow2s.rpcOneTarget,
+    rpcMultipleTargets:shadow2s.rpcMultipleTargets,rpcInvalid:shadow2s.rpcInvalid,
+    rpcMismatch:shadow2s.rpcMismatch,rpcEligible:shadow2s.rpcEligible,
+    rpcSelected:shadow2s.rpcSelected,wsRpcComparable:shadow2s.wsRpcComparable,
+    wsRpcExact:shadow2s.wsRpcExact,wsRpcMismatch:shadow2s.wsRpcMismatch,
+    errors:shadow2s.errors,reasons:top(shadow2s.reasons),layouts:top(shadow2s.layouts),
+    gapBands:top(shadow2s.gapBands),threshold:top(shadow2s.threshold),
+    selectedEventSol:Number(shadow2s.selectedEventSol.toFixed(9)),
+    productionOnSelectedSol:Number(shadow2s.productionOnSelectedSol.toFixed(9)),
+    maxPositiveDelta:Number(shadow2s.maxPositiveDelta.toFixed(9)),
+    examples:shadow2s.examples,
+    caution:"Recovery is diagnostic only. RPC logs can be ambiguous and the <=2% debit match is transaction-wide correlation, not proof of exact swap settlement. No production changes."};
+}
+
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -16945,6 +17085,7 @@ phase2oRecord(item.signature, event, tx);
 phase2pRecord(item.signature, event, tx);
 phase2qRecord(item.signature, event, tx);
 phase2rRecord(item.signature, event, tx);
+phase2sRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -20009,6 +20150,7 @@ shadowPumpProgramData: {
   phase2p: phase2pSummary(),
   phase2q: phase2qSummary(),
   phase2r: phase2rSummary(),
+  phase2s: phase2sSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

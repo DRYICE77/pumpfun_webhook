@@ -2858,6 +2858,148 @@ function phase2lSummary(){
 }
 
 // ==================================================
+// PHASE 2M — PUMP INSTRUCTION ACCOUNT-ROLE FORENSICS
+// Shadow-only; no RPC, SQL, filtering, or amount changes.
+// Instruction positions are interpreted ONLY when the
+// discriminator matches a known instruction definition.
+// ==================================================
+const SHADOW_2M_ENABLED = process.env.SHADOW_2M_ENABLED !== "false";
+const SHADOW_2M_MAX_EXAMPLES = 24;
+const shadow2m = {seen:0,withPumpInstructions:0,noPumpInstructions:0,
+  knownSell:0,unknownInstruction:0,missingData:0,missingBalances:0,
+  errors:0,byLayout:new Map(),byAccountCount:new Map(),
+  closestDebitByRole:new Map(),byTransferType:new Map(),examples:[]};
+const PUMP_LEGACY_SELL_ROLES = ["global","feeRecipient","mint",
+  "bondingCurve","associatedBondingCurve","associatedUser","user",
+  "systemProgram","creatorVault","tokenProgram","eventAuthority",
+  "program","feeConfig","feeProgram"];
+function phase2mInc(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2mBase58Decode(value){
+  if(typeof value!=="string"||!value)return null;
+  const abc="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let x=0n;
+  for(const c of value){const n=abc.indexOf(c);if(n<0)return null;x=x*58n+BigInt(n);}
+  let hex=x===0n?"":x.toString(16);
+  if(hex.length%2)hex="0"+hex;
+  const zeros=(value.match(/^1+/)||[""])[0].length;
+  return Buffer.concat([Buffer.alloc(zeros),hex?Buffer.from(hex,"hex"):Buffer.alloc(0)]);
+}
+function phase2mInstructionData(ins){
+  const data=ins?.data;
+  if(typeof data!=="string")return null;
+  // jsonParsed transactions can contain parsed instructions without raw data.
+  return phase2mBase58Decode(data);
+}
+const PHASE_2M_SELL_DISC = require("crypto").createHash("sha256")
+  .update("global:sell").digest().subarray(0,8).toString("hex");
+const PHASE_2M_BUY_DISC = require("crypto").createHash("sha256")
+  .update("global:buy").digest().subarray(0,8).toString("hex");
+function phase2mRecord(signature,event,tx){
+  if(!SHADOW_2M_ENABLED||event?.event_type!=="sell")return;
+  shadow2m.seen++;
+  try{
+    const keys=getAccountKeyRows(tx).map(k=>String(typeof k==="string"?k:(k?.pubkey||"")));
+    const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+    const balancesOK=Array.isArray(pre)&&Array.isArray(post)&&pre.length===post.length&&
+      keys.length>=pre.length&&pre.every((n,i)=>Number.isSafeInteger(n)&&Number.isSafeInteger(post[i]));
+    if(!balancesOK)shadow2m.missingBalances++;
+    const changes=new Map();
+    if(balancesOK)for(let i=0;i<pre.length;i++)
+      changes.set(keys[i],BigInt(post[i])-BigInt(pre[i]));
+    const resolve=a=>typeof a==="number"?keys[a]||null:
+      typeof a==="string"?a:a?.pubkey||null;
+    const captured=[];
+    const scan=(ins,origin)=>{
+      const program=resolve(ins?.programIdIndex) ||
+        (typeof ins?.programId==="string"?ins.programId:ins?.programId?.toString?.());
+      if(program!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+      const bytes=phase2mInstructionData(ins);
+      const disc=bytes&&bytes.length>=8?bytes.subarray(0,8).toString("hex"):null;
+      const layout=disc===PHASE_2M_SELL_DISC?"legacy_sell":
+        disc===PHASE_2M_BUY_DISC?"legacy_buy":"unknown";
+      const accounts=(ins?.accounts||[]).map(resolve);
+      const label=layout+":"+(disc||"no_discriminator")+":"+accounts.length;
+      phase2mInc(shadow2m.byLayout,label);
+      phase2mInc(shadow2m.byAccountCount,String(accounts.length));
+      if(layout==="legacy_sell")shadow2m.knownSell++;
+      else shadow2m.unknownInstruction++;
+      if(!disc)shadow2m.missingData++;
+      captured.push({origin,layout,discriminator:disc,accountCount:accounts.length,
+        accounts:accounts.map((key,pos)=>{
+          const delta=key?changes.get(key):null;
+          return {position:pos,role:layout==="legacy_sell"?
+            PUMP_LEGACY_SELL_ROLES[pos]||"extra_unknown":"unverified",
+            pubkey:key,deltaLamports:delta==null?null:delta.toString()};
+        })});
+    };
+    getInstructions(tx).forEach(i=>scan(i,"outer"));
+    for(const group of getInnerInstructions(tx))
+      for(const i of group?.instructions||[])scan(i,"inner");
+    if(!captured.length){shadow2m.noPumpInstructions++;return;}
+    shadow2m.withPumpInstructions++;
+    const row=shadowProgramData2cPending.get(signature);
+    const decoded=row?.targetEventCount===1&&!row?.truncated?
+      decodePumpTradeEventShadow(row.payloadHex):null;
+    const sol=decoded?.eventType==="sell"&&decoded.mint===event.token_address?
+      decoded.solLamports:null;
+    let best=null;
+    if(sol!=null&&sol>0n)for(const ins of captured)
+      for(const a of ins.accounts){
+        if(a.deltaLamports==null)continue;
+        const delta=BigInt(a.deltaLamports);
+        if(delta>=0n)continue;
+        const debit=-delta,gap=debit>sol?debit-sol:sol-debit;
+        if(!best||gap<best.gap)best={gap,origin:ins.origin,layout:ins.layout,
+          discriminator:ins.discriminator,position:a.position,role:a.role,
+          pubkey:a.pubkey,debitLamports:debit.toString(),
+          gapBps:Number(gap*10000n/sol)};
+      }
+    phase2mInc(shadow2m.closestDebitByRole,best?
+      `${best.layout}:${best.position}:${best.role}`:"none");
+    // Capture parsed native SOL transfers only when present. Compiled
+    // transfers require decoding, so absence is not evidence of no transfer.
+    const transfers=[];
+    const scanTransfer=(ins,origin)=>{
+      const parsed=ins?.parsed;
+      const type=parsed?.type;
+      const info=parsed?.info;
+      if((type==="transfer"||type==="transferWithSeed")&&
+         info?.lamports!=null){
+        phase2mInc(shadow2m.byTransferType,origin+":"+type);
+        if(transfers.length<12)transfers.push({origin,type,
+          source:info.source||null,destination:info.destination||null,
+          lamports:String(info.lamports)});
+      }
+    };
+    getInstructions(tx).forEach(i=>scanTransfer(i,"outer"));
+    for(const group of getInnerInstructions(tx))
+      for(const i of group?.instructions||[])scanTransfer(i,"inner");
+    const selected=best?best.layout+":"+best.position+":"+best.role:"none";
+    const same=shadow2m.examples.filter(x=>x.closestRole===selected).length;
+    if(shadow2m.examples.length<SHADOW_2M_MAX_EXAMPLES&&same<4)
+      shadow2m.examples.push({signature,mint:event.token_address,
+        productionSol:event.sol_amount,eventSol:sol==null?null:Number(sol)/1e9,
+        closestRole:selected,closestDebit:best?{...best,gap:best.gap.toString()}:null,
+        instructions:captured.slice(0,4),transfers,feeLamports:tx?.meta?.fee??null});
+  }catch(_err){shadow2m.errors++;}
+}
+function phase2mSummary(){
+  const top=(map,n=40)=>[...map].sort((a,b)=>b[1]-a[1])
+    .slice(0,n).map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2M_ENABLED,mode:"shadow_only",
+    knownLegacySellDiscriminator:PHASE_2M_SELL_DISC,
+    seen:shadow2m.seen,withPumpInstructions:shadow2m.withPumpInstructions,
+    noPumpInstructions:shadow2m.noPumpInstructions,knownSell:shadow2m.knownSell,
+    unknownInstruction:shadow2m.unknownInstruction,
+    missingData:shadow2m.missingData,missingBalances:shadow2m.missingBalances,
+    errors:shadow2m.errors,byLayout:top(shadow2m.byLayout),
+    byAccountCount:top(shadow2m.byAccountCount),
+    closestDebitByRole:top(shadow2m.closestDebitByRole),
+    byTransferType:top(shadow2m.byTransferType),examples:shadow2m.examples,
+    caution:"Only legacy sell discriminator is role-labeled; unknown layouts remain unverified. Transaction-wide lamport deltas may include fees and other instructions."};
+}
+
+// ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
 // Observation only. No additional database queries.
@@ -16143,6 +16285,7 @@ phase2iRecord(item.signature, event, tx);
 phase2jRecord(item.signature, event, tx);
 phase2kRecord(item.signature, event, tx);
 phase2lRecord(item.signature, event, tx);
+phase2mRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19201,6 +19344,7 @@ shadowPumpProgramData: {
   phase2j: phase2jSummary(),
   phase2k: phase2kSummary(),
   phase2l: phase2lSummary(),
+  phase2m: phase2mSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

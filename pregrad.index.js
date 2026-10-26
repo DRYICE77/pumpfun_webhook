@@ -2707,6 +2707,156 @@ function phase2kSummary(){
     note:"Closest Pump-instruction account debit is transaction-level evidence, not per-event proof; gap does not prove fee attribution."};
 }
 
+
+// ==================================================
+// PHASE 2L — SELL CANDIDATE SELECTION (SHADOW ONLY)
+//
+// Proposed strategy:
+//   A. Valid single SELL TradeEvent, matching classified mint
+//   B. Positive event SOL, matching a Pump-instruction account
+//      debit exactly or within 1% -> event SOL candidate
+//   C. Otherwise -> existing production SOL amount (fallback)
+//
+// No production event mutation, filtering, SQL or RPC changes.
+// A matching account debit is transaction-level corroboration,
+// not proof of trader proceeds or an identified fee.
+// ==================================================
+const SHADOW_2L_ENABLED = process.env.SHADOW_2L_ENABLED !== "false";
+const SHADOW_2L_EXAMPLE_LIMIT = 32;
+const shadow2l = {
+  seen:0, selectedEvent:0, fallbackProduction:0,
+  fallbackReasons:new Map(), selections:new Map(),
+  thresholdOutcomes:new Map(), selectionByOutcome:new Map(),
+  exact:0, near:0, zeroEvent:0, unmatched:0, noDebit:0,
+  missing:0, multi:0, invalid:0, mismatch:0,
+  missingBalances:0, unsafeBalances:0, errors:0,
+  examples:[]
+};
+function phase2lCount(map,key){map.set(key,(map.get(key)||0)+1);}
+function phase2lRecord(signature,event,tx){
+  if(!SHADOW_2L_ENABLED||event?.event_type!=="sell")return;
+  shadow2l.seen++;
+  try{
+    const production=Number(event.sol_amount);
+    const productionValid=event.sol_amount!=null&&Number.isFinite(production)&&production>=0;
+    const threshold=effectiveMinSolAmount();
+    const thresholdValid=Number.isFinite(threshold)&&threshold>=0;
+    let candidate=null, source="production_fallback", reason="unknown";
+    let eventSol=null, gapBps=null, pumpPosition=null;
+    const row=shadowProgramData2cPending.get(signature);
+    if(!row?.payloadHex){shadow2l.missing++;reason="missing_capture";}
+    else if(row.targetEventCount!==1||row.truncated){shadow2l.multi++;reason="multiple_events";}
+    else{
+      const decoded=decodePumpTradeEventShadow(row.payloadHex);
+      if(!decoded){shadow2l.invalid++;reason="invalid_event";}
+      else if(decoded.eventType!=="sell"||!event.token_address||
+              decoded.mint!==event.token_address){
+        shadow2l.mismatch++;reason="mint_or_direction_mismatch";
+      }else if(decoded.solLamports===0n){
+        shadow2l.zeroEvent++;reason="zero_event";
+      }else if(decoded.solLamports>BigInt(Number.MAX_SAFE_INTEGER)){
+        shadow2l.invalid++;reason="unsafe_event_lamports";
+      }else{
+        eventSol=Number(decoded.solLamports)/1e9;
+        const pre=tx?.meta?.preBalances,post=tx?.meta?.postBalances;
+        if(!Array.isArray(pre)||!Array.isArray(post)||!pre.length||
+           pre.length!==post.length){
+          shadow2l.missingBalances++;reason="missing_balances";
+        }else{
+          const keys=getAccountKeyRows(tx).map(k=>String(
+            typeof k==="string"?k:(k?.pubkey||"")));
+          if(keys.length<pre.length||pre.some((n,i)=>
+              !Number.isSafeInteger(n)||!Number.isSafeInteger(post[i]))){
+            shadow2l.unsafeBalances++;reason="unsafe_balances";
+          }else{
+            const debits=new Map();
+            for(let i=0;i<pre.length;i++){
+              if(keys[i]&&post[i]<pre[i])
+                debits.set(keys[i],BigInt(pre[i])-BigInt(post[i]));
+            }
+            let best=null, pumpAccountCount=0;
+            const scan=ins=>{
+              if(String(ins?.programId||"")!==PUMP_LAUNCHPAD_PROGRAM_ID)return;
+              for(const [pos,a] of (ins?.accounts||[]).entries()){
+                const name=typeof a==="number"?keys[a]:
+                  String(a?.pubkey||a||"");
+                if(!name)continue;
+                pumpAccountCount++;
+                const debit=debits.get(name);
+                if(!debit)continue;
+                const gap=decoded.solLamports>=debit?
+                  decoded.solLamports-debit:debit-decoded.solLamports;
+                if(!best||gap<best.gap)
+                  best={gap,debit,pos};
+              }
+            };
+            getInstructions(tx).forEach(scan);
+            for(const group of getInnerInstructions(tx))
+              for(const ins of group?.instructions||[])scan(ins);
+            if(!best){shadow2l.noDebit++;reason="no_pump_debit";}
+            else{
+              gapBps=Number(best.gap*10000n/decoded.solLamports);
+              pumpPosition=best.pos;
+              if(best.gap===0n){
+                shadow2l.exact++;source="event_exact_debit";
+              }else if(best.gap*100n<=decoded.solLamports){
+                shadow2l.near++;source="event_near_debit";
+              }else{
+                shadow2l.unmatched++;reason="debit_gap_above_1pct";
+              }
+              if(source!=="production_fallback"){
+                candidate=eventSol;
+                reason=source;
+              }
+            }
+          }
+        }
+      }
+    }
+    if(source==="production_fallback"){
+      shadow2l.fallbackProduction++;
+      phase2lCount(shadow2l.fallbackReasons,reason);
+      candidate=productionValid?production:null;
+    }else shadow2l.selectedEvent++;
+    phase2lCount(shadow2l.selections,source);
+    const oldKeep=thresholdValid&&productionValid&&production>=threshold;
+    const newKeep=thresholdValid&&candidate!==null&&candidate>=threshold;
+    const outcome=!thresholdValid?"invalid_threshold":
+      newKeep&&!oldKeep?"would_add":
+      !newKeep&&oldKeep?"would_remove":
+      newKeep?"both_keep":"both_small";
+    phase2lCount(shadow2l.thresholdOutcomes,outcome);
+    phase2lCount(shadow2l.selectionByOutcome,source+":"+outcome);
+    const groupCount=shadow2l.examples.filter(e=>e.source===source&&e.outcome===outcome).length;
+    if(shadow2l.examples.length<SHADOW_2L_EXAMPLE_LIMIT&&groupCount<4){
+      shadow2l.examples.push({signature,source,reason,outcome,
+        productionSol:productionValid?production:null,
+        eventSol,selectedSol:candidate,thresholdSol:threshold,
+        gapBps,pumpPosition});
+    }
+  }catch(_err){shadow2l.errors++;}
+}
+function phase2lSummary(){
+  const top=(map,n=30)=>[...map].sort((a,b)=>b[1]-a[1])
+    .slice(0,n).map(([key,count])=>({key,count}));
+  return {enabled:SHADOW_2L_ENABLED,mode:"shadow_only",
+    strategy:"validated positive SELL event amount if closest Pump-account debit is exact or within 1%; otherwise preserve production amount",
+    seen:shadow2l.seen,selectedEvent:shadow2l.selectedEvent,
+    fallbackProduction:shadow2l.fallbackProduction,
+    exact:shadow2l.exact,near:shadow2l.near,
+    zeroEvent:shadow2l.zeroEvent,unmatched:shadow2l.unmatched,
+    noDebit:shadow2l.noDebit,missing:shadow2l.missing,
+    multi:shadow2l.multi,invalid:shadow2l.invalid,
+    mismatch:shadow2l.mismatch,missingBalances:shadow2l.missingBalances,
+    unsafeBalances:shadow2l.unsafeBalances,errors:shadow2l.errors,
+    bySource:top(shadow2l.selections),
+    byFallbackReason:top(shadow2l.fallbackReasons),
+    thresholdOutcomes:top(shadow2l.thresholdOutcomes),
+    selectionByOutcome:top(shadow2l.selectionByOutcome),
+    examples:shadow2l.examples,
+    caution:"Account-balance matching is corroboration, not definitive per-event flow or fee proof; no production changes."};
+}
+
 // ==================================================
 // CONTENTION DEPTH PERFORMANCE DIAGNOSTICS
 //
@@ -15992,6 +16142,7 @@ phase2hRecord(item.signature, event, tx);
 phase2iRecord(item.signature, event, tx);
 phase2jRecord(item.signature, event, tx);
 phase2kRecord(item.signature, event, tx);
+phase2lRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
@@ -19049,6 +19200,7 @@ shadowPumpProgramData: {
   phase2i: phase2iSummary(),
   phase2j: phase2jSummary(),
   phase2k: phase2kSummary(),
+  phase2l: phase2lSummary(),
   phase2c: {
     ...shadowProgramData2cStats,
     pending: shadowProgramData2cPending.size,

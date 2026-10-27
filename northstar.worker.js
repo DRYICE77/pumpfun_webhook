@@ -1,5 +1,5 @@
 /**
- * NORTH STAR — VOLUME MINUTE WORKER v0.1
+ * NORTH STAR — VOLUME MINUTE WORKERR v0.1
  *
  * Separate Railway service:
  *   node northstar.worker.js

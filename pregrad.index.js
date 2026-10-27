@@ -3798,6 +3798,11 @@ function phase2sSummary(){
 // Prefer websocket TradeEvent, recover from existing RPC logs,
 // otherwise use production. No production filtering or writes change.
 // ==================================================
+// Phase 2U — opt-in production SELL amount safety. Default OFF for rollback.
+// Strict mode: unvalidated SELLs are excluded, never assigned a guessed SOL value.
+const PHASE_2U_PRODUCTION_ENABLED = process.env.PHASE_2U_PRODUCTION_ENABLED === "true";
+const phase2uStats = {seen:0,selectedWs:0,selectedRpc:0,rejected:0,
+  rejectedReasons:Object.create(null),wsRpcMismatch:0,errors:0};
 const SHADOW_2T_ENABLED = process.env.SHADOW_2T_ENABLED !== "false";
 const shadow2t = {seen:0,selectedWs:0,selectedRpc:0,fallback:0,
   wsInvalid:0,rpcInvalid:0,wsRpcMismatch:0,errors:0,
@@ -3918,6 +3923,65 @@ function phase2tRecord(signature,event,tx){
       shadow2t.examples.push({signature,source,outcome,chosenSol:chosen,productionSol:production,
         wsReason:wsResult.reason,rpcReason:rpcResult.reason});
   }catch(_error){shadow2t.errors++;phase2tCount(shadow2t.reasons,"exception");}
+}
+// Phase 2U uses the same validated candidate rules as 2T, but never
+// falls back to the production largest-transfer heuristic.
+// Reuses the already hydrated transaction and already captured WS payload.
+function phase2uSelectSell(signature,event,tx){
+  phase2uStats.seen++;
+  try {
+    const row=shadowProgramData2cPending.get(signature);
+    let ws=null,rpc=null;
+    let wsResult={reason:"missing_ws"},rpcResult={reason:"missing_rpc"};
+    if(row){
+      if(row.targetEventCount===1&&!row.truncated){
+        ws=decodePumpTradeEventShadow(row.payloadHex);
+        wsResult=phase2tValidate(ws,event,tx);
+      } else wsResult={reason:"ambiguous_ws"};
+    }
+    const payloads=[];
+    for(const line of getLogMessages(tx)){
+      const match=String(line).match(/Program data:\s*([A-Za-z0-9+/=]+)/);
+      if(!match||!(/^[A-Za-z0-9+/]+={0,2}$/).test(match[1])||match[1].length%4!==0)continue;
+      const bytes=Buffer.from(match[1],"base64");
+      if(bytes.length>=8&&bytes.subarray(0,8).toString("hex")===SHADOW_PROGRAM_DATA_TARGET_DISCRIMINATOR)
+        payloads.push(bytes.toString("hex"));
+    }
+    if(payloads.length===1){
+      rpc=decodePumpTradeEventShadow(payloads[0]);
+      rpcResult=phase2tValidate(rpc,event,tx);
+    } else rpcResult={reason:payloads.length?"ambiguous_rpc":"missing_rpc"};
+    // Fail closed if both sources validate but disagree.
+    if(wsResult.reason==="validated"&&rpcResult.reason==="validated"&&
+      (ws.solLamports!==rpc.solLamports||ws.tokenAmountRaw!==rpc.tokenAmountRaw)){
+      phase2uStats.wsRpcMismatch++;
+      phase2uStats.rejected++;
+      phase2tCount(phase2uStats.rejectedReasons,"ws_rpc_mismatch");
+      return null;
+    }
+    if(wsResult.reason==="validated"){
+      phase2uStats.selectedWs++;
+      return wsResult.sol;
+    }
+    if(rpcResult.reason==="validated"){
+      phase2uStats.selectedRpc++;
+      return rpcResult.sol;
+    }
+    phase2uStats.rejected++;
+    phase2tCount(phase2uStats.rejectedReasons,
+      "ws:"+wsResult.reason+"|rpc:"+rpcResult.reason);
+    return null;
+  } catch(_error){
+    phase2uStats.errors++;
+    phase2uStats.rejected++;
+    phase2tCount(phase2uStats.rejectedReasons,"exception");
+    return null;
+  }
+}
+function phase2uSummary(){
+  return {version:"2U.1",mode:PHASE_2U_PRODUCTION_ENABLED?"production_strict_sell":"disabled",
+    enabled:PHASE_2U_PRODUCTION_ENABLED,...phase2uStats,
+    note:"Validated SELLs only; unvalidated SELLs excluded; BUY path unchanged"};
 }
 function phase2tSummary(){
   const round=n=>Number(n.toFixed(9));
@@ -17268,6 +17332,23 @@ if (item.shadowCohort3Clean) {
   );
 }
 
+// PHASE 2U: production SELL amount selection (opt-in).
+// Runs AFTER legacy shadow observers so comparisons remain meaningful,
+// and BEFORE production filtering and DB dispatch.
+// Do not insert ambiguous/non-SOL SELLs with a guessed transfer amount.
+if(PHASE_2U_PRODUCTION_ENABLED && event.event_type==="sell"){
+  const validatedSellSol=phase2uSelectSell(item.signature,event,tx);
+  if(validatedSellSol===null){
+    stats.skippedSmallSolAmount++;
+    permanentlySeen=true;
+    return;
+  }
+  event.sol_amount=validatedSellSol;
+  const tokens=Number(event.token_amount);
+  event.price_per_token=Number.isFinite(tokens)&&tokens>0
+    ?validatedSellSol/tokens:null;
+}
+
 // SOL amount shadow: observation only, before minimum-SOL filtering.
 // The observer handles its own exceptions and opt-in flag.
 recordSolAmountShadow(
@@ -20106,7 +20187,8 @@ const dbRttProbeHealth = {
               maxMs:dbRttProbeHealth?.maxMs,errors:dbRttProbeHealth?.errors}},
           errors: {workers:stats.workerErrors,control:stats.controlFetchErrors,
             safetyEnrichment:stats.safetyEnrichmentErrors},
-          sellRecovery:phase2tSummary()
+          sellRecovery:phase2tSummary(),
+          productionSolSafety:phase2uSummary()
         });
         // ==========================================
         // UPDATE INTERVAL BASELINE

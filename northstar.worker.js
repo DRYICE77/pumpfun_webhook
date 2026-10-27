@@ -614,14 +614,15 @@ async function main() {
 
   const sql = loadMinuteSQL();
 
-  log('WORKER_START', {
-    mode: ENABLE_WRITES ? 'WRITE' : 'DRY_RUN',
-    pollMs: POLL_MS,
-    finalityDelayMinutes: FINALITY_DELAY_MINUTES,
-    overlapMinutes: OVERLAP_MINUTES,
-    maxMinutesPerCycle: MAX_MINUTES_PER_CYCLE,
-    statementTimeoutMs: STATEMENT_TIMEOUT_MS
-  });
+log('WORKER_START', {
+  jobName: JOB_NAME,
+  mode: ENABLE_WRITES ? 'WRITE' : 'DRY_RUN',
+  pollMs: POLL_MS,
+  finalityDelayMinutes: FINALITY_DELAY_MINUTES,
+  overlapMinutes: OVERLAP_MINUTES,
+  maxMinutesPerCycle: MAX_MINUTES_PER_CYCLE,
+  statementTimeoutMs: STATEMENT_TIMEOUT_MS
+});
 
   while (!shuttingDown) {
     try {

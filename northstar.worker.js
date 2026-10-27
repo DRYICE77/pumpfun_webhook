@@ -1,5 +1,5 @@
 /**
- * NORTH STAR — VOLUME MINUTE WORKERR v0.1
+ * NORTH STAR — VOLUME MINUTE WORKER v3R
  *
  * Separate Railway service:
  *   node northstar.worker.js
@@ -70,6 +70,44 @@ const STATEMENT_TIMEOUT_MS = positiveInteger(
 );
 
 const MINUTE_MS = 60 * 1000;
+
+const RUN_MODE = String(process.env.NORTHSTAR_RUN_MODE || 'test')
+  .trim().toLowerCase();
+if (!['test', 'research'].includes(RUN_MODE)) {
+  throw new Error('NORTHSTAR_RUN_MODE must be test or research');
+}
+
+function parseMinuteTimestamp(name) {
+  const raw = process.env[name];
+  if (!raw || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00(?:\.000)?Z$/.test(raw)) {
+    throw new Error(`${name} must be a UTC ISO minute timestamp (YYYY-MM-DDTHH:MM:00Z)`);
+  }
+  const value = new Date(raw);
+  if (!Number.isFinite(value.getTime()) ||
+      value.toISOString() !== (raw.endsWith('.000Z') ? raw : raw.replace(/Z$/, '.000Z'))) {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
+const RESEARCH_START = RUN_MODE === 'research'
+  ? parseMinuteTimestamp('NORTHSTAR_RESEARCH_START_AT') : null;
+const RESEARCH_END = RUN_MODE === 'research'
+  ? parseMinuteTimestamp('NORTHSTAR_RESEARCH_END_AT') : null;
+if (RUN_MODE === 'research') {
+  if (!ENABLE_WRITES) throw new Error('Research mode requires NORTHSTAR_ENABLE_MINUTE_WRITES=true');
+  if (JOB_NAME === 'volume_minutes' || !JOB_NAME.trim()) {
+    throw new Error('Research mode requires a dedicated NORTHSTAR_JOB_NAME');
+  }
+  if (RESEARCH_END.getTime() - RESEARCH_START.getTime() !== 7 * 24 * 60 * 60 * 1000) {
+    throw new Error('Research window must be exactly seven days (10080 minutes)');
+  }
+  if (String(process.env.NORTHSTAR_STOP_AFTER_ONE_COMMIT || '').toLowerCase() === 'true') {
+    throw new Error('Disable NORTHSTAR_STOP_AFTER_ONE_COMMIT for research mode');
+  }
+}
+
+
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -295,47 +333,27 @@ async function processOneMinute(sql) {
       `SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`
     );
 
-    // RESTART-SAFE TEST GATE
-    // Lock the gate before executing any aggregation SQL.
-    // The lock is held until COMMIT or ROLLBACK.
-    const gateResult = await client.query(
-      `
-        SELECT
-          max_commits,
-          commits_used
+    // Finite, restart-safe commit gate is retained for test mode only.
+    // Research mode uses an exclusive checkpoint row and fixed UTC boundary.
+    if (RUN_MODE === 'test') {
+      const gateResult = await client.query(`
+        SELECT max_commits, commits_used
         FROM public.northstar_worker_test_gate
-        WHERE job_name = $1
-        FOR UPDATE
-      `,
-      [JOB_NAME]
-    );
-
-    if (gateResult.rowCount !== 1) {
-      throw new Error(
-        'TEST_GATE_MISSING: refusing to write'
-      );
+        WHERE job_name = $1 FOR UPDATE
+      `, [JOB_NAME]);
+      if (gateResult.rowCount !== 1) {
+        throw new Error('TEST_GATE_MISSING: refusing to write');
+      }
+      const gate = gateResult.rows[0];
+      if (gate.commits_used >= gate.max_commits) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        log('TEST_LIMIT_REACHED', {
+          maxCommits: gate.max_commits, commitsUsed: gate.commits_used
+        });
+        return { processed: false, reason: 'TEST_LIMIT_REACHED' };
+      }
     }
-
-    const gate = gateResult.rows[0];
-
-    if (gate.commits_used >= gate.max_commits) {
-      await client.query('ROLLBACK');
-      transactionOpen = false;
-
-      log('TEST_LIMIT_REACHED', {
-        maxCommits: gate.max_commits,
-        commitsUsed: gate.commits_used
-      });
-
-      return {
-        processed: false,
-        reason: 'TEST_LIMIT_REACHED'
-      };
-    }
-
-    // Keep your existing checkpoint-locking code here.
-    // It begins with:
-    // const checkpointResult = await client.query(...);
 
     // Serialize worker instances through the checkpoint row.
     const checkpointResult = await client.query(
@@ -356,6 +374,29 @@ async function processOneMinute(sql) {
     }
 
     const checkpoint = checkpointResult.rows[0];
+    if (RUN_MODE === 'research') {
+      const bootstrapMs = new Date(checkpoint.bootstrap_at).getTime();
+      const checkpointMs = new Date(checkpoint.next_minute_at).getTime();
+      if (bootstrapMs !== RESEARCH_START.getTime() ||
+          checkpointMs < RESEARCH_START.getTime() ||
+          checkpointMs > RESEARCH_END.getTime() ||
+          checkpointMs % MINUTE_MS !== 0) {
+        throw new Error('RESEARCH_CHECKPOINT_MISMATCH: verify bootstrap and checkpoint');
+      }
+      if (checkpointMs === RESEARCH_END.getTime()) {
+        await client.query('COMMIT');
+        transactionOpen = false;
+        log('RESEARCH_COMPLETE', {
+          jobName: JOB_NAME,
+          researchStart: RESEARCH_START.toISOString(),
+          researchEnd: RESEARCH_END.toISOString(),
+          checkpoint: checkpoint.next_minute_at,
+          expectedMinutes: 10080,
+          note: 'Checkpoint complete; run independent coverage and raw-event reconciliation audits.'
+        });
+        return { processed: false, reason: 'RESEARCH_COMPLETE' };
+      }
+    }
     const databaseNow = await getDatabaseNow(client);
 
     const window = calculateWindow(
@@ -498,28 +539,20 @@ await client.query(
       );
     }
 
-    // RESTART-SAFE TEST GATE
-    // Consume the allowance in the same transaction as
-    // the minute upsert and checkpoint advancement.
-    const gateUpdate = await client.query(
-      `
+    if (RUN_MODE === 'test') {
+      // Consume test allowance atomically with minute writes and checkpoint.
+      const gateUpdate = await client.query(`
         UPDATE public.northstar_worker_test_gate
-        SET
-          commits_used = commits_used + 1,
-          updated_at = clock_timestamp()
-        WHERE job_name = $1
-          AND commits_used < max_commits
-      `,
-      [JOB_NAME]
-    );
-
-    if (gateUpdate.rowCount !== 1) {
-      throw new Error(
-        'TEST_GATE_UPDATE_FAILED: rolling back'
-      );
+        SET commits_used = commits_used + 1,
+            updated_at = clock_timestamp()
+        WHERE job_name = $1 AND commits_used < max_commits
+      `, [JOB_NAME]);
+      if (gateUpdate.rowCount !== 1) {
+        throw new Error('TEST_GATE_UPDATE_FAILED: rolling back');
+      }
     }
 
-    // Aggregation, checkpoint and test gate commit together.
+    // Aggregation and checkpoint commit together; test gate joins in test mode.
     await client.query('COMMIT');
     transactionOpen = false;
 
@@ -569,9 +602,11 @@ async function writeCycle(sql) {
       if (result.reason === 'TEST_LIMIT_REACHED') {
         log('TEST_GATE_EXHAUSTED', {
           message:
-            'One-commit test complete. No further writes permitted.'
+            'Finite test gate exhausted. No further writes permitted.'
         });
 
+        shuttingDown = true;
+      } else if (result.reason === 'RESEARCH_COMPLETE') {
         shuttingDown = true;
       } else {
         log('CYCLE_STOPPED', {
@@ -614,8 +649,25 @@ async function main() {
 
   const sql = loadMinuteSQL();
 
+  if (RUN_MODE === 'research') {
+    const client = await pool.connect();
+    try {
+      const checkpoint = await readCheckpoint(client);
+      if (new Date(checkpoint.bootstrap_at).getTime() !== RESEARCH_START.getTime() ||
+          new Date(checkpoint.next_minute_at).getTime() < RESEARCH_START.getTime() ||
+          new Date(checkpoint.next_minute_at).getTime() > RESEARCH_END.getTime()) {
+        throw new Error('Research checkpoint must be initialized at the research start');
+      }
+    } finally {
+      client.release();
+    }
+  }
+
 log('WORKER_START', {
   jobName: JOB_NAME,
+  runMode: RUN_MODE,
+  researchStart: RESEARCH_START?.toISOString() ?? null,
+  researchEnd: RESEARCH_END?.toISOString() ?? null,
   mode: ENABLE_WRITES ? 'WRITE' : 'DRY_RUN',
   pollMs: POLL_MS,
   finalityDelayMinutes: FINALITY_DELAY_MINUTES,

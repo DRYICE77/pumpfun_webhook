@@ -36,7 +36,8 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 
-const JOB_NAME = 'volume_minutes';
+const JOB_NAME =
+  process.env.NORTHSTAR_JOB_NAME || 'volume_minutes';
 
 const ENABLE_WRITES =
   String(

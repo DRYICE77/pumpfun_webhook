@@ -733,6 +733,7 @@ const stats = {
   // ==========================================
 
   skippedSmallSolAmount: 0,
+  skippedPhase2uValidation: 0,
   skippedMarketDataUpdate: 0,
   skippedIrrelevantLog: 0,
   skippedEmptyTx: 0,
@@ -3927,10 +3928,11 @@ function phase2tRecord(signature,event,tx){
 // Phase 2U uses the same validated candidate rules as 2T, but never
 // falls back to the production largest-transfer heuristic.
 // Reuses the already hydrated transaction and already captured WS payload.
-function phase2uSelectSell(signature,event,tx){
+function phase2uSelectSell(signature,event,tx,wsEvidence=null){
   phase2uStats.seen++;
   try {
-    const row=shadowProgramData2cPending.get(signature);
+    // Snapshot captured before the 2C observer removes the pending entry.
+    const row=wsEvidence;
     let ws=null,rpc=null;
     let wsResult={reason:"missing_ws"},rpcResult={reason:"missing_rpc"};
     if(row){
@@ -17296,6 +17298,11 @@ phase2rRecord(item.signature, event, tx);
 phase2sRecord(item.signature, event, tx);
 phase2tRecord(item.signature, event, tx);
 observePumpSolCandidate(item.signature, event);
+// Preserve WS evidence before 2C deletes its pending-map entry.
+// The snapshot remains local to this signature, including on early returns.
+const phase2uWsEvidence = PHASE_2U_PRODUCTION_ENABLED && event.event_type === "sell"
+  ? shadowProgramData2cPending.get(item.signature) || null
+  : null;
 recordProgramData2cHydratedOutcome(item.signature, event, tx);
 
 recordSmallTradeShadowOutcome(
@@ -17337,9 +17344,9 @@ if (item.shadowCohort3Clean) {
 // and BEFORE production filtering and DB dispatch.
 // Do not insert ambiguous/non-SOL SELLs with a guessed transfer amount.
 if(PHASE_2U_PRODUCTION_ENABLED && event.event_type==="sell"){
-  const validatedSellSol=phase2uSelectSell(item.signature,event,tx);
+  const validatedSellSol=phase2uSelectSell(item.signature,event,tx,phase2uWsEvidence);
   if(validatedSellSol===null){
-    stats.skippedSmallSolAmount++;
+    stats.skippedPhase2uValidation++;
     permanentlySeen=true;
     return;
   }
@@ -20162,6 +20169,7 @@ const dbRttProbeHealth = {
             queued:stats.queued,dequeued:stats.dequeued,processed:stats.processed,
             insertedEvents:stats.insertedEvents,insertedTokens:stats.insertedTokens,
             skippedSmallSolAmount:stats.skippedSmallSolAmount,
+            skippedPhase2uValidation:stats.skippedPhase2uValidation,
             droppedDuringPause:stats.droppedDuringPause,
             droppedQueueFull:stats.droppedQueueFull,droppedStale:stats.droppedStale,
             intakePausedCount:stats.intakePausedCount,intakeResumedCount:stats.intakeResumedCount},

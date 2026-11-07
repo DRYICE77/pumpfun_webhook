@@ -1,4 +1,4 @@
-"use strict";
+"use stricTt";
 
 // North Star Research WebSocket V1 — PumpSwap-only pilot.
 // Discovers signatures; the separate researchCollector.js worker fetches raw transactions.

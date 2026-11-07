@@ -6,7 +6,25 @@ require("dotenv").config();
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
 
-const RUN_ID = process.env.NORTHSTAR_RESEARCH_RUN_ID;
+
+const rawRunId = process.env.NORTHSTAR_RESEARCH_RUN_ID;
+const RUN_ID = rawRunId?.trim();
+
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+console.log("[RESEARCH ENV DIAGNOSTIC]", {
+  runIdPresent: rawRunId !== undefined,
+  runIdLength: rawRunId?.length ?? null,
+  trimmedLength: RUN_ID?.length ?? null,
+  validUUID: uuidPattern.test(RUN_ID || ""),
+  separatorCodePoints: RUN_ID
+    ? [...RUN_ID]
+        .filter(c => !/[0-9a-f]/i.test(c))
+        .map(c => c.codePointAt(0).toString(16))
+    : []
+});
+
 const DATABASE_URL = process.env.DATABASE_URL;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const RPC_URL = process.env.HELIUS_RPC_URL ||

@@ -1,7 +1,7 @@
 "use strict";
 
-// North Star Research Collector V1 — controlled batch / durable recovery worker.
-// This is NOT a live WebSocket collector yet. No production tables are modified.
+// North Star Research Collector V1.1 — durable batch and continuous RPC worker.
+// Does not subscribe to WebSockets or modify production tables.
 require("dotenv").config();
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
@@ -11,16 +11,31 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const RPC_URL = process.env.HELIUS_RPC_URL ||
   (HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null);
-const WORKERS = Math.max(1, Math.min(4, Number(process.env.RESEARCH_WORKERS || 2)));
-const MAX_ATTEMPTS = Math.max(1, Number(process.env.RESEARCH_MAX_ATTEMPTS || 12));
-const LEASE_SECONDS = 90;
-const FETCH_TIMEOUT_MS = 25000;
-const RPC_SPACING_MS = Math.max(0, Number(process.env.RESEARCH_RPC_SPACING_MS || 250));
 
-if (!RUN_ID || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(RUN_ID)) {
+function positiveInt(name, fallback, min, max) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+const WORKERS = positiveInt("RESEARCH_WORKERS", 2, 1, 4);
+const MAX_ATTEMPTS = positiveInt("RESEARCH_MAX_ATTEMPTS", 12, 1, 100);
+const RPC_SPACING_MS = positiveInt("RESEARCH_RPC_SPACING_MS", 250, 0, 60000);
+const POLL_MS = positiveInt("RESEARCH_POLL_MS", 2000, 100, 60000);
+const FETCH_TIMEOUT_MS = positiveInt("RESEARCH_FETCH_TIMEOUT_MS", 25000, 1000, 120000);
+const LEASE_SECONDS = positiveInt("RESEARCH_LEASE_SECONDS", 90, 30, 600);
+if (LEASE_SECONDS * 1000 <= FETCH_TIMEOUT_MS + 10000) {
+  throw new Error("RESEARCH_LEASE_SECONDS must exceed fetch timeout by more than 10 seconds");
+}
+
+if (!RUN_ID || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(RUN_ID)) {
   throw new Error("Set a valid NORTHSTAR_RESEARCH_RUN_ID");
 }
-if (!DATABASE_URL || !RPC_URL) throw new Error("Set DATABASE_URL and HELIUS_API_KEY (or HELIUS_RPC_URL)");
+if (!DATABASE_URL || !RPC_URL) {
+  throw new Error("Set DATABASE_URL and HELIUS_API_KEY (or HELIUS_RPC_URL)");
+}
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -28,26 +43,28 @@ const pool = new Pool({
   max: WORKERS + 2,
   connectionTimeoutMillis: 10000,
 });
+pool.on("error", (err) => console.error("Idle PostgreSQL connection error:", err.message));
 
+let stopping = false;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const shortError = (err) => String(err?.message || err).slice(0, 1500);
+const log = (data) => console.log(JSON.stringify({ at: new Date().toISOString(), ...data }));
 
-// Stable hash of JSONB-equivalent JSON (objects have sorted keys).
-// Hash represents canonicalized content, not original HTTP response bytes.
+// Hash a deterministic representation of the RPC response, not original HTTP bytes.
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
   }
   return JSON.stringify(value);
 }
 
 async function assertRunExists() {
   const { rows } = await pool.query(
-    "SELECT run_id, status FROM public.northstar_research_runs WHERE run_id=$1", [RUN_ID]
+    "SELECT status FROM public.northstar_research_runs WHERE run_id=$1", [RUN_ID]
   );
   if (!rows.length) throw new Error(`Research run not found: ${RUN_ID}`);
-  if (["completed", "failed"].includes(rows[0].status)) {
+  if (!["created", "running"].includes(rows[0].status)) {
     throw new Error(`Research run is ${rows[0].status}; refusing to process`);
   }
 }
@@ -58,45 +75,56 @@ function validSignature(sig) {
 
 async function enqueueSignatures(signatures) {
   let count = 0;
-  for (const signature of [...new Set(signatures)]) {
+  for (const signature of new Set(signatures)) {
     if (!validSignature(signature)) throw new Error(`Invalid base58 signature: ${signature}`);
     await pool.query(`
       INSERT INTO public.northstar_research_signatures
         (signature, first_run_id, first_observed_at, last_observed_at, status)
       VALUES ($1, $2, NOW(), NOW(), 'pending')
       ON CONFLICT (signature) DO UPDATE
-      SET last_observed_at = NOW(), updated_at = NOW()
+      SET last_observed_at=NOW(), updated_at=NOW()
     `, [signature, RUN_ID]);
     count++;
   }
   return count;
 }
 
-// Claim one eligible job. Expired leases are recoverable after a crash.
+// Finalize expired leases that have already used their last attempt.
+// Otherwise they would remain stuck as 'fetching' forever after a crash.
+async function finalizeExhaustedLeases() {
+  const { rowCount } = await pool.query(`
+    UPDATE public.northstar_research_signatures
+    SET status='failed', lease_expires_at=NULL, next_retry_at=NULL,
+        last_error=COALESCE(last_error, 'Worker lease expired after final permitted attempt'),
+        updated_at=NOW()
+    WHERE first_run_id=$1 AND status='fetching'
+      AND fetch_attempts >= $2 AND lease_expires_at <= NOW()
+  `, [RUN_ID, MAX_ATTEMPTS]);
+  if (rowCount) log({ event: "exhausted_leases_finalized", count: rowCount });
+}
+
+// PostgreSQL row lock makes claiming safe across multiple processes.
+// Attempt count acts as a fencing generation for reclaimed jobs.
 async function claimOne() {
   const { rows } = await pool.query(`
     WITH candidate AS (
       SELECT signature
       FROM public.northstar_research_signatures
-      WHERE first_run_id = $1
-        AND fetch_attempts < $2
+      WHERE first_run_id=$1 AND fetch_attempts < $2
         AND (
-          status = 'pending'
-          OR (status = 'retry' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
-          OR (status = 'fetching' AND lease_expires_at <= NOW())
+          status='pending'
+          OR (status='retry' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+          OR (status='fetching' AND lease_expires_at <= NOW())
         )
       ORDER BY first_observed_at, signature
       FOR UPDATE SKIP LOCKED
       LIMIT 1
     )
     UPDATE public.northstar_research_signatures s
-    SET status='fetching',
-        fetch_attempts=s.fetch_attempts+1,
+    SET status='fetching', fetch_attempts=s.fetch_attempts+1,
         last_attempt_at=NOW(),
         lease_expires_at=NOW()+($3 * INTERVAL '1 second'),
-        next_retry_at=NULL,
-        last_error=NULL,
-        updated_at=NOW()
+        next_retry_at=NULL, last_error=NULL, updated_at=NOW()
     FROM candidate c
     WHERE s.signature=c.signature
     RETURNING s.signature, s.fetch_attempts, s.first_observed_at
@@ -104,11 +132,17 @@ async function claimOne() {
   return rows[0] || null;
 }
 
+// Serialize RPC starts across workers, preserving a minimum spacing.
 let rpcTail = Promise.resolve();
+let nextRpcStartAt = 0;
 async function paceRpc() {
-  const next = rpcTail.then(() => delay(RPC_SPACING_MS));
-  rpcTail = next.catch(() => {});
-  await next;
+  const turn = rpcTail.then(async () => {
+    const wait = Math.max(0, nextRpcStartAt - Date.now());
+    if (wait) await delay(wait);
+    nextRpcStartAt = Date.now() + RPC_SPACING_MS;
+  });
+  rpcTail = turn.catch(() => {});
+  await turn;
 }
 
 async function getTransaction(signature) {
@@ -121,7 +155,9 @@ async function getTransaction(signature) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0", id: 1, method: "getTransaction",
-        params: [signature, { encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0 }]
+        params: [signature, {
+          encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0,
+        }],
       }),
       signal: controller.signal,
     });
@@ -129,6 +165,10 @@ async function getTransaction(signature) {
     const body = await response.json();
     if (body.error) throw new Error(`Helius RPC ${JSON.stringify(body.error)}`);
     if (!body.result) throw new Error("Helius returned null transaction (not available yet)");
+    const signatures = body.result.transaction?.signatures;
+    if (!Array.isArray(signatures) || signatures[0] !== signature) {
+      throw new Error("RPC transaction signature mismatch");
+    }
     return body.result;
   } finally {
     clearTimeout(timer);
@@ -140,15 +180,27 @@ async function archiveTransaction(job, payload) {
     throw new Error("Unexpected transaction payload shape");
   }
   if (!Number.isSafeInteger(payload.slot)) throw new Error("Missing or invalid slot");
+  if (!payload.meta || typeof payload.meta !== "object") {
+    throw new Error("Missing transaction metadata");
+  }
   const serialized = JSON.stringify(payload);
   const hash = crypto.createHash("sha256").update(canonicalJson(payload)).digest("hex");
-  const success = payload.meta?.err == null;
+  const success = payload.meta.err == null;
   const blockTime = Number.isFinite(payload.blockTime)
     ? new Date(payload.blockTime * 1000) : null;
   const version = payload.version == null ? null : String(payload.version);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Lock the inbox row before archive insertion so a superseded worker cannot write.
+    const lease = await client.query(`
+      SELECT signature FROM public.northstar_research_signatures
+      WHERE signature=$1 AND first_run_id=$2 AND status='fetching'
+        AND fetch_attempts=$3 AND lease_expires_at > NOW()
+      FOR UPDATE
+    `, [job.signature, RUN_ID, job.fetch_attempts]);
+    if (!lease.rowCount) throw new Error("Job lease expired or was superseded");
+
     const inserted = await client.query(`
       INSERT INTO public.northstar_research_raw_transactions
         (signature, run_id, slot, block_time, first_observed_at,
@@ -158,7 +210,8 @@ async function archiveTransaction(job, payload) {
       ON CONFLICT (signature) DO NOTHING
       RETURNING signature
     `, [job.signature, RUN_ID, payload.slot, blockTime, job.first_observed_at,
-        version, success, serialized, hash]);
+      version, success, serialized, hash]);
+
     if (!inserted.rowCount) {
       const existing = await client.query(`
         SELECT payload_sha256 FROM public.northstar_research_raw_transactions
@@ -168,14 +221,16 @@ async function archiveTransaction(job, payload) {
         throw new Error("Existing archived signature has a different payload hash");
       }
     }
+
     const updated = await client.query(`
       UPDATE public.northstar_research_signatures
       SET status='archived', archived_at=NOW(), lease_expires_at=NULL,
           next_retry_at=NULL, last_error=NULL, updated_at=NOW()
-      WHERE signature=$1 AND status='fetching' AND fetch_attempts=$2
+      WHERE signature=$1 AND first_run_id=$2 AND status='fetching'
+        AND fetch_attempts=$3 AND lease_expires_at > NOW()
       RETURNING signature
-    `, [job.signature, job.fetch_attempts]);
-    if (!updated.rowCount) throw new Error("Job lease was superseded before archival");
+    `, [job.signature, RUN_ID, job.fetch_attempts]);
+    if (!updated.rowCount) throw new Error("Lease expired before archival commit");
     await client.query("COMMIT");
     return { inserted: Boolean(inserted.rowCount), success };
   } catch (err) {
@@ -189,56 +244,86 @@ async function archiveTransaction(job, payload) {
 async function markFailure(job, err) {
   const terminal = job.fetch_attempts >= MAX_ATTEMPTS;
   const backoffSeconds = Math.min(3600, 5 * (2 ** Math.min(job.fetch_attempts - 1, 9)));
-  await pool.query(`
+  const { rowCount } = await pool.query(`
     UPDATE public.northstar_research_signatures
-    SET status=$3,
-        next_retry_at=CASE WHEN $3='retry' THEN NOW()+($4 * INTERVAL '1 second') ELSE NULL END,
-        lease_expires_at=NULL, last_error=$5, updated_at=NOW()
-    WHERE signature=$1 AND status='fetching' AND fetch_attempts=$2
-  `, [job.signature, job.fetch_attempts, terminal ? "failed" : "retry",
-      backoffSeconds, shortError(err)]);
+    SET status=$4,
+        next_retry_at=CASE WHEN $4='retry'
+          THEN NOW()+($5 * INTERVAL '1 second') ELSE NULL END,
+        lease_expires_at=NULL, last_error=$6, updated_at=NOW()
+    WHERE signature=$1 AND first_run_id=$2 AND status='fetching'
+      AND fetch_attempts=$3
+  `, [job.signature, RUN_ID, job.fetch_attempts,
+    terminal ? "failed" : "retry", backoffSeconds, shortError(err)]);
+  return { terminal, updated: Boolean(rowCount) };
 }
 
-async function worker(workerId) {
-  let processed = 0;
-  for (;;) {
+async function worker(workerId, continuous) {
+  let attempted = 0;
+  while (!stopping) {
     const job = await claimOne();
-    if (!job) break; // One batch pass: retry jobs become eligible in a future invocation.
+    if (!job) {
+      if (!continuous) break;
+      await delay(POLL_MS);
+      continue;
+    }
     try {
       const payload = await getTransaction(job.signature);
       const result = await archiveTransaction(job, payload);
-      console.log(JSON.stringify({ workerId, signature: job.signature,
-        status: "archived", inserted: result.inserted, transactionSuccess: result.success }));
+      log({ workerId, signature: job.signature, status: "archived",
+        inserted: result.inserted, transactionSuccess: result.success });
     } catch (err) {
-      await markFailure(job, err);
-      console.error(JSON.stringify({ workerId, signature: job.signature,
-        status: "retry_or_failed", attempt: job.fetch_attempts, error: shortError(err) }));
+      const failure = await markFailure(job, err);
+      log({ workerId, signature: job.signature,
+        status: failure.updated ? (failure.terminal ? "failed" : "retry") : "superseded",
+        attempt: job.fetch_attempts, error: shortError(err) });
     }
-    processed++;
+    attempted++;
   }
-  return processed;
+  return attempted;
+}
+
+async function recoverLoop() {
+  while (!stopping) {
+    await finalizeExhaustedLeases();
+    // Run frequently enough to make expired final attempts visible.
+    for (let i = 0; i < 15 && !stopping; i++) await delay(1000);
+  }
 }
 
 async function main() {
   const args = process.argv.slice(2);
   const command = args.shift();
-  if (!["enqueue", "work", "enqueue-and-work"].includes(command)) {
+  if (!["enqueue", "work", "enqueue-and-work", "run"].includes(command)) {
     console.log("Usage: node researchCollector.js enqueue <signature...>\n" +
       "       node researchCollector.js work\n" +
-      "       node researchCollector.js enqueue-and-work <signature...>");
+      "       node researchCollector.js enqueue-and-work <signature...>\n" +
+      "       node researchCollector.js run");
     return;
   }
   await assertRunExists();
-  if (command !== "work") {
+  if (command === "enqueue" || command === "enqueue-and-work") {
     if (!args.length) throw new Error("Supply at least one transaction signature");
-    const n = await enqueueSignatures(args);
-    console.log(`Persisted ${n} signature(s) to durable inbox`);
+    const count = await enqueueSignatures(args);
+    log({ event: "enqueued", count });
   }
-  if (command !== "enqueue") {
-    const results = await Promise.all(Array.from({ length: WORKERS }, (_, i) => worker(i + 1)));
-    console.log(`Batch finished. Attempted ${results.reduce((a, b) => a + b, 0)} signature(s).`);
+  if (command === "enqueue") return;
+  await finalizeExhaustedLeases();
+  const continuous = command === "run";
+  if (continuous) {
+    process.once("SIGTERM", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGTERM" }); });
+    process.once("SIGINT", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGINT" }); });
+    log({ event: "continuous_worker_started", runId: RUN_ID, workers: WORKERS, pollMs: POLL_MS });
+  }
+  const workers = Array.from({ length: WORKERS }, (_, i) => worker(i + 1, continuous));
+  if (continuous) {
+    await Promise.all([...workers, recoverLoop()]);
+  } else {
+    const results = await Promise.all(workers);
+    log({ event: "batch_finished", attempted: results.reduce((a, b) => a + b, 0) });
   }
 }
 
-main().catch((err) => { console.error(err); process.exitCode = 1; })
-  .finally(() => pool.end());
+main().catch((err) => {
+  console.error("Research collector fatal error:", shortError(err));
+  process.exitCode = 1;
+}).finally(async () => { await pool.end(); });

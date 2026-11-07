@@ -178,8 +178,10 @@ async function getTransaction(signature) {
       body: JSON.stringify({
         jsonrpc: "2.0", id: 1, method: "getTransaction",
         params: [signature, {
-          encoding: "jsonParsed", commitment: "confirmed", maxSupportedTransactionVersion: 0,
-        }],
+  encoding: "jsonParsed",
+  commitment: "confirmed",
+  maxSupportedTransactionVersion: 1,
+}],
       }),
       signal: controller.signal,
     });

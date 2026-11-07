@@ -1,6 +1,6 @@
 "use strict";
 
-// North Star Research Collector V1.2 — performance diagnostics — durable batch and continuous RPC worker.
+// North Star Research Collector V1.3 — indexed pending claims and scheduled recovery.
 // Does not subscribe to WebSockets or modify production tables.
 require("dotenv").config();
 const crypto = require("node:crypto");
@@ -47,6 +47,7 @@ const FETCH_TIMEOUT_MS = positiveInt("RESEARCH_FETCH_TIMEOUT_MS", 25000, 1000, 1
 const LEASE_SECONDS = positiveInt("RESEARCH_LEASE_SECONDS", 90, 30, 600);
 const PERF_REPORT_MS = positiveInt("RESEARCH_PERF_REPORT_MS", 30000, 5000, 300000);
 const PERF_SAMPLE_CAP = positiveInt("RESEARCH_PERF_SAMPLE_CAP", 10000, 100, 100000);
+const RECOVERY_INTERVAL_MS = positiveInt("RESEARCH_RECOVERY_INTERVAL_MS", 5000, 1000, 300000);
 if (LEASE_SECONDS * 1000 <= FETCH_TIMEOUT_MS + 10000) {
   throw new Error("RESEARCH_LEASE_SECONDS must exceed fetch timeout by more than 10 seconds");
 }
@@ -95,7 +96,7 @@ function recordPerf(name, durationMs) {
   if (entry.samples.length < PERF_SAMPLE_CAP) entry.samples.push(durationMs);
   else entry.samples[entry.count % PERF_SAMPLE_CAP] = durationMs;
 }
-const perfCounts = { claimed: 0, archived: 0, retried: 0, failed: 0, superseded: 0, idlePolls: 0 };
+const perfCounts = { claimed: 0, pendingClaims: 0, retryClaims: 0, leaseClaims: 0, archived: 0, retried: 0, failed: 0, superseded: 0, idlePolls: 0 };
 function reportPerf() {
   const elapsedSec = (performance.now() - perfStartedAt) / 1000;
   const timingsMs = {};
@@ -172,36 +173,42 @@ async function finalizeExhaustedLeases() {
   if (rowCount) log({ event: "exhausted_leases_finalized", count: rowCount });
 }
 
-// PostgreSQL row lock makes claiming safe across multiple processes.
-// Attempt count acts as a fencing generation for reclaimed jobs.
-async function claimOne() {
+// Each claim path is a separate indexed query. Never combine pending/retry/lease
+// with OR: that previously forced a million-row sequential scan.
+// The UPDATE and SELECT are atomic; SKIP LOCKED allows concurrent processes.
+// Recovery paths require the two companion indexes in research_collector_v1_3_indexes.sql.
+async function claimOne(kind = "pending") {
+  if (!["pending", "retry", "lease"].includes(kind)) throw new Error("Invalid claim kind");
   const startedAt = performance.now();
+  const predicate = kind === "pending"
+    ? "status='pending'"
+    : kind === "retry"
+      ? "status='retry' AND (next_retry_at IS NULL OR next_retry_at <= NOW())"
+      : "status='fetching' AND lease_expires_at <= NOW()";
   try {
-  const { rows } = await pool.query(`
-    WITH candidate AS (
-      SELECT signature
-      FROM public.northstar_research_signatures
-      WHERE first_run_id=$1 AND fetch_attempts < $2
-        AND (
-          status='pending'
-          OR (status='retry' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
-          OR (status='fetching' AND lease_expires_at <= NOW())
-        )
-      ORDER BY first_observed_at, signature
-      FOR UPDATE SKIP LOCKED
-      LIMIT 1
-    )
-    UPDATE public.northstar_research_signatures s
-    SET status='fetching', fetch_attempts=s.fetch_attempts+1,
-        last_attempt_at=NOW(),
-        lease_expires_at=NOW()+($3 * INTERVAL '1 second'),
-        next_retry_at=NULL, last_error=NULL, updated_at=NOW()
-    FROM candidate c
-    WHERE s.signature=c.signature
-    RETURNING s.signature, s.fetch_attempts, s.first_observed_at
-  `, [RUN_ID, MAX_ATTEMPTS, LEASE_SECONDS]);
-  return rows[0] || null;
-  } finally { recordPerf("dbClaim", performance.now() - startedAt); }
+    const { rows } = await pool.query(`
+      WITH candidate AS (
+        SELECT signature
+        FROM public.northstar_research_signatures
+        WHERE first_run_id=$1 AND fetch_attempts < $2
+          AND ${predicate}
+        ORDER BY first_observed_at, signature
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      UPDATE public.northstar_research_signatures s
+      SET status='fetching', fetch_attempts=s.fetch_attempts+1,
+          last_attempt_at=NOW(),
+          lease_expires_at=NOW()+($3 * INTERVAL '1 second'),
+          next_retry_at=NULL, last_error=NULL, updated_at=NOW()
+      FROM candidate c
+      WHERE s.signature=c.signature
+      RETURNING s.signature, s.fetch_attempts, s.first_observed_at
+    `, [RUN_ID, MAX_ATTEMPTS, LEASE_SECONDS]);
+    return rows[0] || null;
+  } finally {
+    recordPerf(kind === "pending" ? "dbClaimPending" : kind === "retry" ? "dbClaimRetry" : "dbClaimLease", performance.now() - startedAt);
+  }
 }
 
 // Serialize RPC starts across workers, preserving a minimum spacing.
@@ -341,11 +348,28 @@ async function markFailure(job, err) {
   return { terminal, updated: Boolean(rowCount) };
 }
 
+// Worker 1 periodically services recovery regardless of pending backlog.
+// Alternate retry and expired-lease attempts; each uses a separate index.
+// This guarantees recovery opportunities without letting expensive recovery
+// queries run on every pending claim.
+let nextRecoveryAt = 0;
+let nextRecoveryKind = "retry";
 async function worker(workerId, continuous) {
   let attempted = 0;
   while (!stopping) {
     const claimStartedAt = performance.now();
-    const job = await claimOne();
+    let kind = "pending";
+    if (workerId === 1 && Date.now() >= nextRecoveryAt) {
+      kind = nextRecoveryKind;
+      nextRecoveryKind = kind === "retry" ? "lease" : "retry";
+      nextRecoveryAt = Date.now() + RECOVERY_INTERVAL_MS;
+    }
+    let job = await claimOne(kind);
+    if (!job && kind !== "pending") {
+      // Don't waste a worker slot when no recovery candidate is due.
+      kind = "pending";
+      job = await claimOne("pending");
+    }
     if (!job) {
       perfCounts.idlePolls++;
       if (!continuous) break;
@@ -353,7 +377,9 @@ async function worker(workerId, continuous) {
       continue;
     }
     perfCounts.claimed++;
-    const jobStartedAt = claimStartedAt;
+    if (kind === "pending") perfCounts.pendingClaims++;
+    else if (kind === "retry") perfCounts.retryClaims++;
+    else perfCounts.leaseClaims++;
     try {
       const payload = await getTransaction(job.signature);
       const result = await archiveTransaction(job, payload);
@@ -371,7 +397,7 @@ async function worker(workerId, continuous) {
       log({ workerId, signature: job.signature,
         status, attempt: job.fetch_attempts, error: shortError(err) });
     } finally {
-      recordPerf("jobEndToEnd", performance.now() - jobStartedAt);
+      recordPerf("jobEndToEnd", performance.now() - claimStartedAt);
     }
     attempted++;
   }
@@ -408,7 +434,7 @@ async function main() {
   if (continuous) {
     process.once("SIGTERM", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGTERM" }); });
     process.once("SIGINT", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGINT" }); });
-    log({ event: "continuous_worker_started", runId: RUN_ID, workers: WORKERS, pollMs: POLL_MS, rpcSpacingMs: RPC_SPACING_MS, perfReportMs: PERF_REPORT_MS });
+    log({ event: "continuous_worker_started", runId: RUN_ID, workers: WORKERS, pollMs: POLL_MS, rpcSpacingMs: RPC_SPACING_MS, perfReportMs: PERF_REPORT_MS, recoveryIntervalMs: RECOVERY_INTERVAL_MS });
     perfReportTimer = setInterval(reportPerf, PERF_REPORT_MS);
   }
   const workers = Array.from({ length: WORKERS }, (_, i) => worker(i + 1, continuous));

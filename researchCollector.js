@@ -48,9 +48,13 @@ if (LEASE_SECONDS * 1000 <= FETCH_TIMEOUT_MS + 10000) {
   throw new Error("RESEARCH_LEASE_SECONDS must exceed fetch timeout by more than 10 seconds");
 }
 
-if (!RUN_ID || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(RUN_ID)) {
-  throw new Error("Set a valid NORTHSTAR_RESEARCH_RUN_ID");
+
+if (!uuidPattern.test(RUN_ID || "")) {
+  throw new Error(
+    "Set a valid NORTHSTAR_RESEARCH_RUN_ID"
+  );
 }
+
 if (!DATABASE_URL || !RPC_URL) {
   throw new Error("Set DATABASE_URL and HELIUS_API_KEY (or HELIUS_RPC_URL)");
 }

@@ -1,9 +1,10 @@
 "use strict";
 
-// North Star Research Collector V1.1 — durable batch and continuous RPC worker.
+// North Star Research Collector V1.2 — performance diagnostics — durable batch and continuous RPC worker.
 // Does not subscribe to WebSockets or modify production tables.
 require("dotenv").config();
 const crypto = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const { Pool } = require("pg");
 
 
@@ -44,6 +45,8 @@ const RPC_SPACING_MS = positiveInt("RESEARCH_RPC_SPACING_MS", 250, 0, 60000);
 const POLL_MS = positiveInt("RESEARCH_POLL_MS", 2000, 100, 60000);
 const FETCH_TIMEOUT_MS = positiveInt("RESEARCH_FETCH_TIMEOUT_MS", 25000, 1000, 120000);
 const LEASE_SECONDS = positiveInt("RESEARCH_LEASE_SECONDS", 90, 30, 600);
+const PERF_REPORT_MS = positiveInt("RESEARCH_PERF_REPORT_MS", 30000, 5000, 300000);
+const PERF_SAMPLE_CAP = positiveInt("RESEARCH_PERF_SAMPLE_CAP", 10000, 100, 100000);
 if (LEASE_SECONDS * 1000 <= FETCH_TIMEOUT_MS + 10000) {
   throw new Error("RESEARCH_LEASE_SECONDS must exceed fetch timeout by more than 10 seconds");
 }
@@ -71,6 +74,50 @@ let stopping = false;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const shortError = (err) => String(err?.message || err).slice(0, 1500);
 const log = (data) => console.log(JSON.stringify({ at: new Date().toISOString(), ...data }));
+
+// Process-local, rolling timing metrics. No SQL writes or transaction payloads.
+// All durations are milliseconds, measured with a monotonic clock.
+const perfMetrics = new Map();
+let perfStartedAt = performance.now();
+let perfReportTimer = null;
+function recordPerf(name, durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  let entry = perfMetrics.get(name);
+  if (!entry) {
+    entry = { count: 0, sum: 0, min: Infinity, max: 0, samples: [] };
+    perfMetrics.set(name, entry);
+  }
+  entry.count++;
+  entry.sum += durationMs;
+  entry.min = Math.min(entry.min, durationMs);
+  entry.max = Math.max(entry.max, durationMs);
+  // Keep a bounded, evenly spread sample for approximate p95.
+  if (entry.samples.length < PERF_SAMPLE_CAP) entry.samples.push(durationMs);
+  else entry.samples[entry.count % PERF_SAMPLE_CAP] = durationMs;
+}
+const perfCounts = { claimed: 0, archived: 0, retried: 0, failed: 0, superseded: 0, idlePolls: 0 };
+function reportPerf() {
+  const elapsedSec = (performance.now() - perfStartedAt) / 1000;
+  const timingsMs = {};
+  for (const [name, entry] of perfMetrics) {
+    const sorted = [...entry.samples].sort((a, b) => a - b);
+    const p95 = sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)];
+    timingsMs[name] = {
+      n: entry.count,
+      avg: Number((entry.sum / entry.count).toFixed(1)),
+      p95: Number(p95.toFixed(1)),
+      max: Number(entry.max.toFixed(1)),
+    };
+  }
+  log({ event: "research_collector_perf", windowSeconds: Number(elapsedSec.toFixed(1)),
+    workers: WORKERS, rpcSpacingMs: RPC_SPACING_MS, ...perfCounts,
+    archivedPerMinute: elapsedSec > 0 ? Number((perfCounts.archived * 60 / elapsedSec).toFixed(1)) : 0,
+    timingsMs });
+  perfMetrics.clear();
+  for (const key of Object.keys(perfCounts)) perfCounts[key] = 0;
+  perfStartedAt = performance.now();
+}
+
 
 // Hash a deterministic representation of the RPC response, not original HTTP bytes.
 function canonicalJson(value) {
@@ -128,6 +175,8 @@ async function finalizeExhaustedLeases() {
 // PostgreSQL row lock makes claiming safe across multiple processes.
 // Attempt count acts as a fencing generation for reclaimed jobs.
 async function claimOne() {
+  const startedAt = performance.now();
+  try {
   const { rows } = await pool.query(`
     WITH candidate AS (
       SELECT signature
@@ -152,23 +201,27 @@ async function claimOne() {
     RETURNING s.signature, s.fetch_attempts, s.first_observed_at
   `, [RUN_ID, MAX_ATTEMPTS, LEASE_SECONDS]);
   return rows[0] || null;
+  } finally { recordPerf("dbClaim", performance.now() - startedAt); }
 }
 
 // Serialize RPC starts across workers, preserving a minimum spacing.
 let rpcTail = Promise.resolve();
 let nextRpcStartAt = 0;
 async function paceRpc() {
+  const startedAt = performance.now();
   const turn = rpcTail.then(async () => {
     const wait = Math.max(0, nextRpcStartAt - Date.now());
     if (wait) await delay(wait);
     nextRpcStartAt = Date.now() + RPC_SPACING_MS;
   });
   rpcTail = turn.catch(() => {});
-  await turn;
+  try { await turn; }
+  finally { recordPerf("rpcPaceWait", performance.now() - startedAt); }
 }
 
 async function getTransaction(signature) {
   await paceRpc();
+  const fetchStartedAt = performance.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -195,6 +248,7 @@ async function getTransaction(signature) {
     }
     return body.result;
   } finally {
+    recordPerf("rpcFetch", performance.now() - fetchStartedAt);
     clearTimeout(timer);
   }
 }
@@ -207,13 +261,18 @@ async function archiveTransaction(job, payload) {
   if (!payload.meta || typeof payload.meta !== "object") {
     throw new Error("Missing transaction metadata");
   }
+  const serializationStartedAt = performance.now();
   const serialized = JSON.stringify(payload);
   const hash = crypto.createHash("sha256").update(canonicalJson(payload)).digest("hex");
+  recordPerf("jsonSerializeHash", performance.now() - serializationStartedAt);
   const success = payload.meta.err == null;
   const blockTime = Number.isFinite(payload.blockTime)
     ? new Date(payload.blockTime * 1000) : null;
   const version = payload.version == null ? null : String(payload.version);
+  const poolWaitStartedAt = performance.now();
   const client = await pool.connect();
+  recordPerf("dbPoolWait", performance.now() - poolWaitStartedAt);
+  const archiveStartedAt = performance.now();
   try {
     await client.query("BEGIN");
     // Lock the inbox row before archive insertion so a superseded worker cannot write.
@@ -261,6 +320,7 @@ async function archiveTransaction(job, payload) {
     await client.query("ROLLBACK");
     throw err;
   } finally {
+    recordPerf("dbArchiveTransaction", performance.now() - archiveStartedAt);
     client.release();
   }
 }
@@ -284,22 +344,34 @@ async function markFailure(job, err) {
 async function worker(workerId, continuous) {
   let attempted = 0;
   while (!stopping) {
+    const claimStartedAt = performance.now();
     const job = await claimOne();
     if (!job) {
+      perfCounts.idlePolls++;
       if (!continuous) break;
       await delay(POLL_MS);
       continue;
     }
+    perfCounts.claimed++;
+    const jobStartedAt = claimStartedAt;
     try {
       const payload = await getTransaction(job.signature);
       const result = await archiveTransaction(job, payload);
+      perfCounts.archived++;
       log({ workerId, signature: job.signature, status: "archived",
         inserted: result.inserted, transactionSuccess: result.success });
     } catch (err) {
+      const failureStartedAt = performance.now();
       const failure = await markFailure(job, err);
+      recordPerf("dbMarkFailure", performance.now() - failureStartedAt);
+      const status = failure.updated ? (failure.terminal ? "failed" : "retry") : "superseded";
+      if (status === "retry") perfCounts.retried++;
+      else if (status === "failed") perfCounts.failed++;
+      else perfCounts.superseded++;
       log({ workerId, signature: job.signature,
-        status: failure.updated ? (failure.terminal ? "failed" : "retry") : "superseded",
-        attempt: job.fetch_attempts, error: shortError(err) });
+        status, attempt: job.fetch_attempts, error: shortError(err) });
+    } finally {
+      recordPerf("jobEndToEnd", performance.now() - jobStartedAt);
     }
     attempted++;
   }
@@ -336,15 +408,18 @@ async function main() {
   if (continuous) {
     process.once("SIGTERM", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGTERM" }); });
     process.once("SIGINT", () => { stopping = true; log({ event: "shutdown_requested", signal: "SIGINT" }); });
-    log({ event: "continuous_worker_started", runId: RUN_ID, workers: WORKERS, pollMs: POLL_MS });
+    log({ event: "continuous_worker_started", runId: RUN_ID, workers: WORKERS, pollMs: POLL_MS, rpcSpacingMs: RPC_SPACING_MS, perfReportMs: PERF_REPORT_MS });
+    perfReportTimer = setInterval(reportPerf, PERF_REPORT_MS);
   }
   const workers = Array.from({ length: WORKERS }, (_, i) => worker(i + 1, continuous));
   if (continuous) {
     await Promise.all([...workers, recoverLoop()]);
   } else {
     const results = await Promise.all(workers);
+    reportPerf();
     log({ event: "batch_finished", attempted: results.reduce((a, b) => a + b, 0) });
   }
+  if (perfReportTimer) { clearInterval(perfReportTimer); perfReportTimer = null; reportPerf(); }
 }
 
 main().catch((err) => {
